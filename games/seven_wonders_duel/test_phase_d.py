@@ -770,9 +770,17 @@ def _scripted_gate(decision: str, sizes: list[int] | None = None):
     return gate
 
 
-def test_strict_gate_is_the_backward_compatible_default():
-    assert PhaseDConfig(run_dir="unused").selfplay_generator_mode == "strict_gate"
+def test_soft_gate_is_the_default_lifecycle():
+    # Was strict_gate for backward compatibility with runs 01-02. cloud2 ran
+    # soft_gate and it is now the house methodology, so a run that names no
+    # mode gets the rolling learner rather than gate-every-candidate.
+    assert PhaseDConfig(run_dir="unused").selfplay_generator_mode == "soft_gate"
     assert PhaseDConfig(run_dir="unused").bootstrap_policy == "gate"
+
+
+def test_strict_gate_is_still_selectable():
+    config = PhaseDConfig(run_dir="unused", selfplay_generator_mode="strict_gate")
+    assert config.selfplay_generator_mode == "strict_gate"
 
 
 def test_soft_gate_bootstrap_ratchets_learner_forward(tmp_path, monkeypatch):

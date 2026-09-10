@@ -465,13 +465,13 @@ def _deterministic_adapter(payload):
     return out
 
 
-def _self_play(workers, wait_ms, coalesce=True):
+def _self_play(workers, wait_ms, coalesce=True, stop_after_moves=0, games=8):
     import seven_wonders_rust as swr
 
     from .control_table import ensure_rust_table
 
     ensure_rust_table()
-    seeds = [2026090950 + index for index in range(8)]
+    seeds = [2026090950 + index for index in range(games)]
     return swr.self_play_many_flat_net(
         adapter=_deterministic_adapter,
         games=rust_games_for_self_play(
@@ -493,6 +493,7 @@ def _self_play(workers, wait_ms, coalesce=True):
         max_moves=256,
         inference_wait_ms=wait_ms,
         inference_coalesce=coalesce,
+        stop_after_moves=stop_after_moves,
     )
 
 
@@ -947,3 +948,45 @@ def test_cuda_bf16_composition_changes_trajectories_and_that_is_not_new():
             "and the change needs its own justification rather than an appeal "
             "to an existing knob."
         )
+
+
+# --------------------------------------------------------------------------
+# stop_after_moves: the clean stop W7 S2b reanalysis runs on
+# --------------------------------------------------------------------------
+
+
+def test_stop_after_moves_retires_a_job_at_the_move_it_asked_for():
+    """One-move jobs are how a few hundred INDEPENDENT positions share batches.
+
+    `max_moves` cannot express this -- breaching it is an error ("exceeded
+    max_moves without completing"), so a job that stopped would come back as a
+    failed run rather than a truncated record.
+    """
+
+    records, _metrics = _self_play(2, 0.0, stop_after_moves=1)
+    assert records, "the scheduler returned no records"
+    for record in records:
+        assert len(record["moves"]) == 1
+        move = record["moves"][0]
+        # The search still ran to a full result; only the game stopped.
+        assert move["visits"]
+        assert move["policy_target"]
+        assert move["root_value"] is not None
+        # A truncated game has no outcome, and must not invent one.
+        assert record["winner"] is None
+        assert record["victory_type"] is None
+
+
+def test_stop_after_moves_zero_still_plays_the_game_out():
+    """The default must be unchanged behaviour, not merely equivalent."""
+
+    records, _metrics = _self_play(2, 0.0, stop_after_moves=0)
+    assert records
+    for record in records:
+        assert len(record["moves"]) > 1
+        assert record["winner"] is not None or record["victory_type"] is not None
+
+
+def test_stop_after_moves_beyond_max_moves_is_refused():
+    with pytest.raises(ValueError, match="stop_after_moves cannot exceed max_moves"):
+        _self_play(1, 0.0, stop_after_moves=1000)

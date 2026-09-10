@@ -261,6 +261,8 @@ fn make_self_play_config(
         conflict_free_waves,
         round_robin_candidates,
         specialist_by_net: [None, None],
+        // Self-play plays to the end; only reanalysis sets this.
+        stop_after_moves: 0,
     }
 }
 
@@ -2671,7 +2673,7 @@ fn self_play_many_net(
     cheap_round_robin_candidates=None, specialist_lambda=0.0,
     specialist_victory=None, specialist_symmetric=false,
     specialist_class_id=0, specialist_net=1, inference_wait_ms=0.0,
-    inference_coalesce=true))]
+    inference_coalesce=true, stop_after_moves=0))]
 fn self_play_many_flat_net(
     py: Python<'_>,
     adapter: Py<PyAny>,
@@ -2749,6 +2751,10 @@ fn self_play_many_flat_net(
     // false restores one-request-per-forward, for a same-box A/B of the
     // coalescer against itself. See `eval::spawn_py_flat_worker`.
     inference_coalesce: bool,
+    // Retire each job after this many recorded moves; 0 plays every game out.
+    // W7 S2b drives reanalysis through here as one-move jobs so a few hundred
+    // independent searches share this boundary's batches.
+    stop_after_moves: usize,
 ) -> PyResult<(Vec<Py<PyDict>>, Py<PyDict>)> {
     if specialist_net > 1 {
         return Err(PyValueError::new_err("specialist_net must be 0 or 1"));
@@ -2927,6 +2933,7 @@ fn self_play_many_flat_net(
         };
         cfg.bot_exploration = bot_exploration;
         cfg.bot_policy_iterations = bot_policy_iterations;
+        cfg.stop_after_moves = stop_after_moves;
     }
     if specialist.is_some() && per_game_nets.is_none() && specialist_net != 0 {
         return Err(PyValueError::new_err(

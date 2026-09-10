@@ -743,6 +743,60 @@ Off by default because it is an arm of the S5 pilot, not a setting: whether
 attack transfer earns its search compute is the one question the seat
 arrangement cannot answer by itself.
 
+### `--reanalysis-backend`
+
+**Default:** `rust_coalesced`. **Choices:** `rust_coalesced`, `rust`, `python`
+
+Which searcher re-searches S2b positions. Only relevant with
+`--specialist-reanalysis`.
+
+Measured on a laptop 3070, per position at 192 sims and a PUCT root:
+
+| backend | ms/position | note |
+| --- | --- | --- |
+| `python` | 2539 | the tree walk runs in Python |
+| `rust` | 1822 | tree walk in Rust; **98.2% of it is inside the evaluator** |
+| `rust_coalesced` | 74.8 | every position searched in one scheduler run |
+
+The middle row is the finding worth carrying: moving the tree walk to Rust is
+worth only 1.4x, because the tree walk was never the cost. A lone search makes
+~215 SEQUENTIAL batch-1 forward passes, and on the same net batch-1 measured 144
+rows/s against 3,781 at batch-128. The win has to come from batching leaves
+ACROSS positions, which is what `rust_coalesced` does: each position becomes a
+one-move job (`stop_after_moves = 1`) on the ordinary self-play scheduler, so
+their leaves fill the same batches generation's do.
+
+### `--reanalysis-slots`
+
+**Default:** `256`. **Constraint:** positive
+
+How many positions the coalesced backend searches concurrently. Deliberately not
+`--rust-slots`: that is sized for generation, where a slot holds a whole game and
+competes with everything else, whereas reanalysis runs alone inside training and
+each slot holds one `--full-sims-max` search. More slots is simply more leaves to
+coalesce. Swept over 304 real positions at 192 sims, batch cap 512, zero wait:
+
+| slots | ms/position | rows/forward |
+| --- | --- | --- |
+| 64 | 77.3 | 33.7 |
+| 128 | 51.2 | 56.8 |
+| 256 | 41.6 | 101.1 |
+
+**Do not add `--rust-inference-wait-ms` here.** Waiting widens the batch and
+still loses: 2 ms raised rows/forward to 162.7 but slowed the pass to 49.3
+ms/position, because the forward cost is already flat by ~128 rows. Zero wait
+already coalesces everything queued; it just never blocks for more.
+
+`rust` and `python` search one position at a time and agree **bit for bit**
+(`test_reanalysis_backends_agree`), which makes `rust` the debugging path.
+`rust_coalesced` does not, and is not meant to: the scheduler derives each search
+seed from its job RNG rather than accepting one, so a position draws a different
+seed than it would through `closed_search_net`. Agreement is therefore
+statistical -- measured over 111 real positions, mean policy total-variation
+0.019 and argmax agreement 106/111. What *is* preserved is the property
+reanalysis needs: seeds derive from `--seed`, the record and the move index, so a
+resume re-derives the same targets.
+
 ## Search and Training-Target Quality
 
 ### `--cheap-sims-min`, `--cheap-sims-max`

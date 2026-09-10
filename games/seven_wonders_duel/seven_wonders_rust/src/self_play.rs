@@ -279,6 +279,21 @@ pub struct SelfPlayConfig {
     /// `LeafBias::NONE`, every route is the one today's `policy_excluded`
     /// implies, and no outlook is ever demanded of an evaluator.
     pub specialist_by_net: [Option<SpecialistSpec>; 2],
+    /// Retire the slot cleanly after this many recorded moves; `0` plays on to
+    /// the end of the game.
+    ///
+    /// W7 S2b reanalysis needs a few hundred INDEPENDENT positions searched at
+    /// a full budget, not games played. Expressing that as one-move jobs lets
+    /// it reuse this scheduler -- and therefore the cross-position coalescer,
+    /// which is the whole reason reanalysis is worth moving here: a lone search
+    /// evaluates one leaf per forward pass, and the batch-1 forward costs
+    /// almost as much as a batch-128 one.
+    ///
+    /// Deliberately NOT `max_moves`, which is an upper bound whose breach is an
+    /// error ("exceeded max_moves without completing"). This is a clean stop:
+    /// the record it emits is a legitimate truncated game, and `into_record`
+    /// knows the difference.
+    pub stop_after_moves: usize,
 }
 
 impl SelfPlayConfig {
@@ -343,6 +358,11 @@ impl SelfPlayConfig {
         {
             return Err(PyValueError::new_err(
                 "leaf_batch, top_k, and max_moves must be positive",
+            ));
+        }
+        if self.stop_after_moves > self.max_moves {
+            return Err(PyValueError::new_err(
+                "stop_after_moves cannot exceed max_moves",
             ));
         }
         if !(0.0..=1.0).contains(&self.dirichlet_epsilon)
@@ -1150,6 +1170,12 @@ pub fn run<E: Eval>(
 
     while state.phase != Phase::Complete {
         let i = moves.len();
+        // The serial path honours the same clean stop as the scheduler, so a
+        // caller cannot get a truncated record from one and an error from the
+        // other. Zero -- every self-play job -- never trips it.
+        if cfg.stop_after_moves > 0 && i >= cfg.stop_after_moves {
+            break;
+        }
         if i >= cfg.max_moves {
             return Err(PyRuntimeError::new_err(format!(
                 "self-play exceeded max_moves={} without completing",
@@ -1267,8 +1293,13 @@ pub fn run<E: Eval>(
             sample_policy(&legal, &selection, temperature(i), &mut rng)
         };
         trajectory.update(&state);
-        chance_log.extend(actual_chance_outcomes(&state, action, i)?);
-        state.apply_action(&decode_action(&state, action));
+        // See `complete_move`: the last move of a stopped-short job is recorded
+        // but not played, so an injected position never has to supply the
+        // `library_draws` entry applying it would demand.
+        if !(cfg.stop_after_moves > 0 && i + 1 >= cfg.stop_after_moves) {
+            chance_log.extend(actual_chance_outcomes(&state, action, i)?);
+            state.apply_action(&decode_action(&state, action));
+        }
         moves.push(MoveRecord {
             i,
             actor,
@@ -2270,6 +2301,14 @@ impl GameSlot {
         all_full_game(&self.cfg)
     }
 
+    /// Has this slot recorded the moves it was asked for and no more?
+    ///
+    /// False whenever `stop_after_moves` is 0, which is every self-play job:
+    /// the scheduler's behaviour there is unchanged, not merely equivalent.
+    fn stopped_short(&self) -> bool {
+        self.cfg.stop_after_moves > 0 && self.moves.len() >= self.cfg.stop_after_moves
+    }
+
     fn make_search_meta(&mut self) -> PyResult<SearchMeta> {
         let move_index = self.moves.len();
         if move_index >= self.cfg.max_moves {
@@ -2751,11 +2790,23 @@ impl GameSlot {
         let digest_started = Instant::now();
         self.trajectory.update(&self.state);
         self.record_ns += digest_started.elapsed().as_nanos() as u64;
-        let chance_started = Instant::now();
-        self.chance_log
-            .extend(actual_chance_outcomes(&self.state, action, i)?);
-        self.state.apply_action(&decode_action(&self.state, action));
-        self.chance_ns += chance_started.elapsed().as_nanos() as u64;
+        // The LAST move of a stopped-short job is not played. Nothing downstream
+        // reads the post-move state -- the caller wants this search's root
+        // outputs -- and applying it would demand things an injected position
+        // cannot supply: `actual_chance_outcomes` needs a pre-locked
+        // `library_draws` entry for a Great Library build, which a position
+        // reconstructed by `RustGame::from_state` deliberately carries none of
+        // (the searcher supplies one per descent instead). Reanalysis hit that
+        // as a hard error on the first position that could reach the Library.
+        let final_move = self.cfg.stop_after_moves > 0
+            && i + 1 >= self.cfg.stop_after_moves;
+        if !final_move {
+            let chance_started = Instant::now();
+            self.chance_log
+                .extend(actual_chance_outcomes(&self.state, action, i)?);
+            self.state.apply_action(&decode_action(&self.state, action));
+            self.chance_ns += chance_started.elapsed().as_nanos() as u64;
+        }
         let record_started = Instant::now();
         self.moves.push(MoveRecord {
             i,
@@ -2809,7 +2860,7 @@ impl GameSlot {
             solver_nodes: overlay.as_ref().map_or(0, |o| o.nodes),
             solver_masked: overlay.is_some_and(|o| o.masked),
         });
-        self.stage = if self.state.phase == Phase::Complete {
+        self.stage = if self.state.phase == Phase::Complete || self.stopped_short() {
             SlotStage::Complete
         } else {
             SlotStage::NeedRoot(self.make_search_meta()?)
@@ -2829,11 +2880,15 @@ impl GameSlot {
         let digest_started = Instant::now();
         self.trajectory.update(&self.state);
         self.record_ns += digest_started.elapsed().as_nanos() as u64;
-        let chance_started = Instant::now();
-        self.chance_log
-            .extend(actual_chance_outcomes(&self.state, action, i)?);
-        self.state.apply_action(&decode_action(&self.state, action));
-        self.chance_ns += chance_started.elapsed().as_nanos() as u64;
+        // Same rule as `complete_move`, so the two move kinds cannot behave
+        // differently under a stop.
+        if !(self.cfg.stop_after_moves > 0 && i + 1 >= self.cfg.stop_after_moves) {
+            let chance_started = Instant::now();
+            self.chance_log
+                .extend(actual_chance_outcomes(&self.state, action, i)?);
+            self.state.apply_action(&decode_action(&self.state, action));
+            self.chance_ns += chance_started.elapsed().as_nanos() as u64;
+        }
         self.moves.push(MoveRecord {
             i,
             actor: meta.actor,
@@ -2875,7 +2930,7 @@ impl GameSlot {
             solver_nodes: 0,
             solver_masked: false,
         });
-        self.stage = if self.state.phase == Phase::Complete {
+        self.stage = if self.state.phase == Phase::Complete || self.stopped_short() {
             SlotStage::Complete
         } else {
             SlotStage::NeedRoot(self.make_search_meta()?)
@@ -2913,7 +2968,10 @@ impl GameSlot {
     }
 
     fn into_record(mut self) -> PyResult<GameRecord> {
-        if self.state.phase != Phase::Complete || !matches!(self.stage, SlotStage::Complete) {
+        let truncated = self.stopped_short();
+        if (self.state.phase != Phase::Complete && !truncated)
+            || !matches!(self.stage, SlotStage::Complete)
+        {
             return Err(PyRuntimeError::new_err(
                 "scheduler attempted to emit an incomplete game",
             ));

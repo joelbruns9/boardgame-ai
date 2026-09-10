@@ -1369,3 +1369,333 @@ def rust_batched_net_adapter(evaluator):
         ]
 
     return adapter
+
+
+# --------------------------------------------------------------------------
+# Rust-backed closed search over an arbitrary position (W7 S2b reanalysis)
+# --------------------------------------------------------------------------
+
+
+class RustClosedSearchResult:
+    """The three fields ``reanalysis_examples`` reads off a search result.
+
+    Rust returns visits and the policy target as vectors in LEGAL order; the
+    Python searcher returns dicts keyed by action index. Keying them here keeps
+    ``reanalysis_examples`` backend-agnostic, and makes a legal-order
+    disagreement a ``ValueError`` rather than a silently transposed target.
+    """
+
+    __slots__ = ("root_value", "visits", "policy_target", "action_index", "sims")
+
+    def __init__(self, root_value, visits, policy_target, action_index, sims):
+        self.root_value = root_value
+        self.visits = visits
+        self.policy_target = policy_target
+        self.action_index = action_index
+        self.sims = sims
+
+
+class RustClosedSearch:
+    """``.search(game)`` on Rust's closed searcher, at lambda = 0.
+
+    Built for reanalysis, which re-searches a few hundred arbitrary positions
+    per iteration.  The Python searcher walks the tree in Python and crosses
+    into the net once per leaf from Python; this walks the tree in Rust and
+    crosses once per leaf from Rust, which is the whole of the speedup.
+
+    **The evaluation is still serial.**  ``closed_search_batched_net`` batches
+    the TREE (`leaf_batch` paths per wave) but drives ``eval::PyEval``, a SCALAR
+    adapter -- one Python call per leaf either way.  So ``leaf_batch`` is worth
+    ~1.0x-1.07x here, exactly as ``rust_batched_net_adapter`` documents, and the
+    remaining win needs a cross-position coalescer that fills one forward pass
+    from many positions at once.  Do not read a large ``leaf_batch`` here as
+    batched inference.
+
+    **Root selection follows the run's own mode**, because the two produce
+    DIFFERENT targets -- PUCT trains on visit counts, Gumbel on completed Q (see
+    ``SearchConfig.root_selection``).  Reanalysis targets land in the same
+    buffer as generation's, so a mismatch here would mix target kinds silently.
+    ``closed_search_batched_net`` hard-codes ``puct_root: false``, so a PUCT run
+    takes ``closed_search_net`` instead and forgoes the tree batching it could
+    not have used anyway.
+    """
+
+    def __init__(
+        self,
+        adapter,
+        *,
+        sims: int,
+        top_k: int,
+        seed: int,
+        force: bool = True,
+        puct_root: bool = False,
+        leaf_batch: int = 1,
+        c_puct: float = 1.5,
+        c_visit: float = 50.0,
+        c_scale: float = 0.1,
+    ):
+        self._adapter = adapter
+        self._sims = int(sims)
+        self._top_k = int(top_k)
+        self._seed = int(seed) & 0xFFFF_FFFF_FFFF_FFFF
+        self._force = bool(force)
+        self._puct_root = bool(puct_root)
+        self._leaf_batch = max(1, int(leaf_batch))
+        self._c_puct = float(c_puct)
+        self._c_visit = float(c_visit)
+        self._c_scale = float(c_scale)
+
+    def search(self, game):
+        legal = [int(action) for action in legal_action_indices(game)]
+        state = rust_game_from_state(game)
+        if self._puct_root:
+            result = state.closed_search_net(
+                self._adapter,
+                self._sims,
+                self._top_k,
+                self._seed,
+                self._c_puct,
+                self._c_visit,
+                self._c_scale,
+                self._force,
+                True,  # puct_root
+                False,  # conflict_free_waves
+                False,  # round_robin_candidates
+            )
+        else:
+            result = state.closed_search_batched_net(
+                self._adapter,
+                self._leaf_batch,
+                self._sims,
+                self._top_k,
+                self._seed,
+                self._c_puct,
+                self._c_visit,
+                self._c_scale,
+                self._force,
+                False,  # conflict_free_waves
+                False,  # round_robin_candidates
+            )
+        visits = list(result[3])
+        target = list(result[4])
+        if len(visits) != len(legal) or len(target) != len(legal):
+            raise ValueError(
+                "rust search returned "
+                f"{len(visits)} visits / {len(target)} target entries for "
+                f"{len(legal)} legal actions; legal orders disagree"
+            )
+        return RustClosedSearchResult(
+            root_value=float(result[2]),
+            visits={action: int(v) for action, v in zip(legal, visits)},
+            policy_target={action: float(p) for action, p in zip(legal, target)},
+            action_index=int(result[0]),
+            sims=int(result[6]),
+        )
+
+
+def rust_closed_search_factory(
+    evaluator,
+    *,
+    sims: int,
+    top_k: int,
+    force: bool = True,
+    puct_root: bool = False,
+    leaf_batch: int = 1,
+):
+    """``seed -> RustClosedSearch`` sharing one scalar adapter.
+
+    One adapter for the whole pass: it installs the control table and closes
+    over the evaluator, and rebuilding it per position would repeat that work a
+    few hundred times per iteration for nothing.
+    """
+
+    adapter = rust_scalar_net_adapter(evaluator)
+
+    def factory(seed: int) -> RustClosedSearch:
+        return RustClosedSearch(
+            adapter,
+            sims=sims,
+            top_k=top_k,
+            seed=seed,
+            force=force,
+            puct_root=puct_root,
+            leaf_batch=leaf_batch,
+        )
+
+    return factory
+
+
+def rust_coalesced_reanalysis(
+    evaluator,
+    positions,
+    *,
+    sims: int,
+    top_k: int,
+    force: bool = True,
+    puct_root: bool = False,
+    leaf_batch: int = 1,
+    global_batch_cap: int = 512,
+    scheduler_workers: int = 1,
+    max_active_slots: int = 64,
+    max_inflight_batches: int = 2,
+    inference_wait_ms: float = 0.0,
+):
+    """Search many INDEPENDENT positions at lambda zero, sharing one boundary.
+
+    ``positions`` is ``[(game, seed), ...]``. Returns
+    ``(results, coalescing)``: one :class:`RustClosedSearchResult` per position
+    in the same order, and the boundary's own rows-per-forward counters.
+
+    **Why this exists.** A lone search evaluates one leaf per forward pass, and
+    a batch-1 forward costs almost as much as a batch-128 one -- measured on the
+    laptop's 3070 at 144 rows/s against 3,781. So a per-position Rust search is
+    98% evaluator-bound and only 1.4x faster than the Python searcher it
+    replaced: the tree walk was never the cost. The fix has to batch leaves
+    ACROSS positions, which is exactly what the self-play scheduler already
+    does across game slots.
+
+    **How.** Each position becomes a one-move job (``stop_after_moves=1``) with
+    ``full_search_fraction = 1.0``, so every slot runs one full-budget search
+    and retires. The scheduler pools their leaves through
+    ``spawn_py_flat_worker`` -- the same coalescer generation uses -- and the
+    record it emits carries the root visits, policy target and value the search
+    produced. No new search code: the only Rust addition is the clean stop.
+
+    **Targets differ from the per-position path, and must.** The scheduler
+    derives each search seed from its job RNG rather than taking one, so the
+    same position re-searched here draws a different seed than through
+    ``closed_search_net``. The property reanalysis actually needs is preserved
+    -- deterministic in the run's own seed, so a resume re-derives the same
+    targets -- but do not expect bit-equality across backends. Compare them
+    statistically (`test_coalesced_reanalysis_agrees_in_distribution`).
+    """
+
+    import seven_wonders_rust
+
+    prepared = [
+        (*prepare_reanalysis_position(game), seed) for game, seed in positions
+    ]
+    return rust_coalesced_reanalysis_prepared(
+        evaluator,
+        prepared,
+        sims=sims,
+        top_k=top_k,
+        force=force,
+        puct_root=puct_root,
+        leaf_batch=leaf_batch,
+        global_batch_cap=global_batch_cap,
+        scheduler_workers=scheduler_workers,
+        max_active_slots=max_active_slots,
+        max_inflight_batches=max_inflight_batches,
+        inference_wait_ms=inference_wait_ms,
+    )
+
+
+def prepare_reanalysis_position(game):
+    """``(rust_game, legal)`` captured from a position the replay is passing.
+
+    Taken eagerly because ``buffer.replay`` hands out its ONE live game and then
+    mutates it: keeping the Python object would leave every collected position
+    pointing at the end of the record.
+    """
+
+    return (
+        rust_game_from_state(game),
+        [int(action) for action in legal_action_indices(game)],
+    )
+
+
+def rust_coalesced_reanalysis_prepared(
+    evaluator,
+    prepared,
+    *,
+    sims: int,
+    top_k: int,
+    force: bool = True,
+    puct_root: bool = False,
+    leaf_batch: int = 1,
+    global_batch_cap: int = 512,
+    scheduler_workers: int = 1,
+    max_active_slots: int = 64,
+    max_inflight_batches: int = 2,
+    inference_wait_ms: float = 0.0,
+):
+    """:func:`rust_coalesced_reanalysis` over ``(rust_game, legal, seed)`` triples."""
+
+    import seven_wonders_rust
+
+    prepared = list(prepared)
+    if not prepared:
+        return [], {}
+
+    games = [entry[0] for entry in prepared]
+    legals = [entry[1] for entry in prepared]
+    seeds = [int(entry[2]) & 0xFFFF_FFFF_FFFF_FFFF for entry in prepared]
+    adapter = rust_flat_batch_adapter(evaluator)
+
+    records, metrics = seven_wonders_rust.self_play_many_flat_net(
+        adapter,
+        games,
+        seeds,
+        global_batch_cap,
+        leaf_batch,
+        # Cheap sims are never drawn: `full_search_fraction = 1.0` makes every
+        # move full. They must still be positive and <= their full counterparts.
+        sims,
+        sims,
+        sims,
+        sims,
+        1.0,  # full_search_fraction -- one full-budget search per position
+        top_k,
+        0.0,  # draft_prior: the Python searcher applied none here
+        max_active_slots=max_active_slots,
+        max_inflight_batches=max_inflight_batches,
+        scheduler_workers=scheduler_workers,
+        force=force,
+        puct_root=puct_root,
+        # One move per job, so nothing below the root is ever played out.
+        stop_after_moves=1,
+        # lambda zero, by construction: this is the whole point of S2b.
+        specialist_lambda=0.0,
+        inference_wait_ms=inference_wait_ms,
+    )
+
+    # Surfaced, not discarded: a coalescer that is configured, reported and
+    # not actually merging is the failure this codebase keeps finding. Rows per
+    # forward is the number that catches it -- 1.0 means every leaf went alone.
+    forwards = int(metrics.get("boundary_forwards", 0) or 0)
+    rows = int(metrics.get("boundary_forward_rows", 0) or 0)
+    coalescing = {
+        "boundary_forwards": forwards,
+        "boundary_forward_rows": rows,
+        "rows_per_forward": (rows / forwards) if forwards else 0.0,
+        "worker_requests": int(metrics.get("worker_requests", 0) or 0),
+    }
+
+    out = []
+    for index, record in enumerate(records):
+        moves = record["moves"]
+        if not moves:
+            raise RuntimeError(
+                f"reanalysis job {index} emitted no move; the position was "
+                "probably already terminal"
+            )
+        move = moves[0]
+        legal = legals[index]
+        visits = list(move["visits"])
+        target = list(move["policy_target"] or [])
+        if len(visits) != len(legal) or len(target) != len(legal):
+            raise ValueError(
+                f"rust returned {len(visits)} visits / {len(target)} target "
+                f"entries for {len(legal)} legal actions; legal orders disagree"
+            )
+        out.append(
+            RustClosedSearchResult(
+                root_value=float(move["root_value"]),
+                visits={a: int(v) for a, v in zip(legal, visits)},
+                policy_target={a: float(p) for a, p in zip(legal, target)},
+                action_index=int(move["action"]),
+                sims=int(move["sims"]),
+            )
+        )
+    return out, coalescing

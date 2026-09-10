@@ -1273,6 +1273,113 @@ def test_reanalysis_produces_general_rows_from_the_specialists_positions(
     assert_no_shaped_bootstrap(extra, GENERAL_ROUTE)
 
 
+def test_coalesced_reanalysis_agrees_in_distribution(tmp_path: Path):
+    """The coalesced backend must search the same positions to the same answers.
+
+    NOT bit-for-bit: the scheduler derives each search seed from its job RNG
+    rather than accepting one, so the same position draws a different seed here
+    than through `closed_search_net`. What must hold is that this is the same
+    search -- same positions, same count, normalised targets, and agreement at
+    the level seed-to-seed noise allows. Measured on the laptop over 111 real
+    positions at 192 sims: mean policy total-variation 0.019, argmax agreement
+    106/111. A backend that searched differently would miss by far more.
+    """
+
+    loop, records = _biased_run(tmp_path, specialist_reanalysis=True)
+    loop.config.reanalysis_backend = "rust"
+    single, single_stats = loop.reanalysis_for_general(
+        records, 21, general_inflow=400
+    )
+    if single_stats["positions"] == 0:
+        pytest.skip("no position in this sample moved the valuation far enough")
+
+    loop.config.reanalysis_backend = "rust_coalesced"
+    coalesced, coalesced_stats = loop.reanalysis_for_general(
+        records, 21, general_inflow=400
+    )
+
+    # The SELECTION is backend-independent; only the search differs.
+    assert coalesced_stats["positions"] == single_stats["positions"]
+    assert len(coalesced) == len(single)
+    for mine, theirs in zip(single, coalesced):
+        # Same position: the legal set is a property of the state, not the seed.
+        assert list(mine.legal) == list(theirs.legal)
+        assert theirs.policy_target.sum() == pytest.approx(1.0, abs=1e-6)
+        assert (theirs.policy_target >= 0.0).all()
+        assert -1.0 <= theirs.root_value <= 1.0
+        assert theirs.reanalysis is True
+        assert theirs.derived_for == GENERAL_ROUTE
+        assert theirs.search_lambda == 0.0
+        assert theirs.root_value_shaped is False
+    assert_no_shaped_bootstrap(coalesced, GENERAL_ROUTE)
+
+
+def test_coalesced_reanalysis_is_deterministic(tmp_path: Path):
+    """A resume must re-derive the same targets, so the same call must repeat.
+
+    The scheduler picks its own search seeds, but it picks them from the job
+    seed this run supplies -- `config.seed`, the record and the move index. If
+    anything wall-clock or arrival-order leaked into a target, two identical
+    calls in one process would already disagree.
+    """
+
+    loop, records = _biased_run(tmp_path, specialist_reanalysis=True)
+    loop.config.reanalysis_backend = "rust_coalesced"
+    first, stats = loop.reanalysis_for_general(records, 21, general_inflow=400)
+    if stats["positions"] == 0:
+        pytest.skip("no position in this sample moved the valuation far enough")
+    second, _ = loop.reanalysis_for_general(records, 21, general_inflow=400)
+
+    assert len(second) == len(first)
+    for mine, theirs in zip(first, second):
+        assert mine.policy_target == pytest.approx(theirs.policy_target, abs=0.0)
+        assert mine.root_value == pytest.approx(theirs.root_value, abs=0.0)
+
+
+@pytest.mark.parametrize("root", ["gumbel", "puct"])
+def test_reanalysis_backends_agree(tmp_path: Path, root: str):
+    """The Rust searcher must re-derive the Python searcher's targets exactly.
+
+    `reanalysis_backend` is a SPEED choice, not a search choice: the same
+    positions, seeds and net go in, so the same targets must come out. Both root
+    selections are covered because they take different Rust entry points --
+    `closed_search_batched_net` hard-codes a Gumbel root, so PUCT goes through
+    `closed_search_net` instead.
+    """
+
+    loop, records = _biased_run(
+        tmp_path,
+        specialist_reanalysis=True,
+        selfplay_search_mode=root,
+        cheap_search_mode="gumbel" if root == "puct" else "same",
+        eval_search_mode=root,
+        leaf_batch=1,
+    )
+    loop.config.reanalysis_backend = "python"
+    python_rows, python_stats = loop.reanalysis_for_general(
+        records, 21, general_inflow=400
+    )
+    if python_stats["positions"] == 0:
+        pytest.skip("no position in this sample moved the valuation far enough")
+
+    loop.config.reanalysis_backend = "rust"
+    rust_rows, rust_stats = loop.reanalysis_for_general(
+        records, 21, general_inflow=400
+    )
+
+    assert rust_stats["positions"] == python_stats["positions"]
+    assert rust_stats["examples"] == python_stats["examples"]
+    assert rust_stats["specialist_move_visited_fraction"] == pytest.approx(
+        python_stats["specialist_move_visited_fraction"]
+    )
+    assert len(rust_rows) == len(python_rows)
+    for mine, theirs in zip(python_rows, rust_rows):
+        assert mine.policy_target.shape == theirs.policy_target.shape
+        assert mine.policy_target == pytest.approx(theirs.policy_target, abs=1e-6)
+        assert mine.root_value == pytest.approx(theirs.root_value, abs=1e-6)
+        assert list(mine.legal) == list(theirs.legal)
+
+
 def test_outcomes_are_reported_by_opponent_class_not_as_one_aggregate():
     """"Did we beat the science attacker" and "did we beat the archive" are
     different questions; pooling them hides both."""

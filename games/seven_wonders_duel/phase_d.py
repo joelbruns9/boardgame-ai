@@ -73,6 +73,7 @@ from .buffer import (
     GameRecorder,
     check_target_versions,
     read_records,
+    replay,
     resolve_opponent_type,
     to_json_line,
 )
@@ -729,7 +730,51 @@ class PhaseDConfig:
     # so the bot suite -- the only opponent set outside the self-play
     # distribution -- went unmeasured for the whole run.
     anchor_every_iterations: int = 0
-    selfplay_generator_mode: str = "strict_gate"
+    # soft_gate since the cloud2 methodology became the house default: a
+    # cumulative rolling learner gated every `promotion_every` iterations,
+    # with probation/revert counters, rather than strict_gate's
+    # gate-every-candidate. strict_gate remains selectable for old runs.
+    selfplay_generator_mode: str = "soft_gate"
+    reanalysis_slots: int = 256
+    """Concurrent positions the coalesced reanalysis backend searches at once.
+
+    Deliberately NOT `rust_slots`. That number is sized for generation, where a
+    slot holds a whole game and runs alongside everything else; reanalysis runs
+    alone inside training, each slot holds one `full_sims_max` search, and more
+    slots is simply more leaves to coalesce. Swept on the laptop over 304 real
+    positions (192 sims, batch cap 512, zero wait):
+
+    | slots | ms/position | rows/forward |
+    | --- | --- | --- |
+    | 64 | 77.3 | 33.7 |
+    | 128 | 51.2 | 56.8 |
+    | 256 | 41.6 | 101.1 |
+
+    Running the soak's `rust_slots` of 24 here would give up most of the win.
+
+    Note that WAITING for wider batches is counterproductive: 2 ms of
+    `rust_inference_wait_ms` raised rows/forward to 162.7 but slowed the pass to
+    49.3 ms/position, because the forward cost is already flat by ~128 rows.
+    """
+
+    reanalysis_backend: str = "rust_coalesced"
+    """Which searcher re-searches S2b positions.
+
+    Measured on the laptop's 3070, per position at 192 sims:
+
+    * ``python`` -- 2539 ms. The tree walk is in Python.
+    * ``rust`` -- 1822 ms, and 98.2% of that is inside the evaluator. Moving the
+      tree walk to Rust is worth only 1.4x because the tree walk was never the
+      cost: the search makes ~215 SEQUENTIAL batch-1 forward passes.
+    * ``rust_coalesced`` -- every position searched in one scheduler run, so
+      their leaves fill shared batches. Batch-1 measured 144 rows/s against
+      3,781 at batch-128 on the same net, which is the size of the prize.
+
+    ``rust`` keeps a per-position path for debugging, and reproduces the Python
+    searcher's targets exactly (`test_reanalysis_backends_agree`).
+    ``rust_coalesced`` does not, and is not meant to -- see
+    ``rust_coalesced_reanalysis``.
+    """
     bootstrap_policy: str = "gate"
     init_checkpoint: str = ""
     promotion_every: int = 4
@@ -1308,6 +1353,12 @@ class PhaseDConfig:
                 "evaluation runs a PUCT root, so a leaf batch above 1 needs "
                 "--virtual-loss-root (evaluation follows --leaf-batch unless "
                 "--eval-leaf-batch overrides it)"
+            )
+        if self.reanalysis_slots <= 0:
+            raise ValueError("reanalysis_slots must be positive")
+        if self.reanalysis_backend not in ("rust_coalesced", "rust", "python"):
+            raise ValueError(
+                "reanalysis_backend must be rust_coalesced, rust or python"
             )
         if self.cheap_leaf_batch < 0:
             raise ValueError("cheap_leaf_batch must be non-negative (0 = follow leaf_batch)")
@@ -4861,25 +4912,59 @@ class PhaseDLoop:
         # `latest.pt` for many iterations without a promotion, and teaching the
         # general from a checkpoint it has already moved past is a stale target.
         model = self.load_model(teacher if teacher is not None else self.current_best)
+        # The coalesced backend fills batches from every position at once, so its
+        # evaluator is sized for the FLAT boundary the way generation's is.
+        # `inference_batch` (64) is a per-leaf number and would reject the first
+        # coalesced batch outright.
+        max_batch = (
+            self.config.rust_global_batch_cap
+            if self.config.reanalysis_backend == "rust_coalesced"
+            else self.config.inference_batch
+        )
         evaluator = Evaluator(
             model,
             self.config.device,
-            self.config.inference_batch,
+            max_batch,
             precision=self.config.precision,
             value_source=self.config.value_source,
         )
+        puct_root = self.config.selfplay_search_mode == "puct"
+
+        def seed_for(record: GameRecord, move_index: int) -> int:
+            # Deterministic per (game, move): a resume must re-derive the same
+            # targets, and two positions in one game must not share a seed.
+            return (
+                self.config.seed
+                + 611_953 * (record.seed & 0xFFFF)
+                + 7 * move_index
+                + iteration
+            )
+
+        # The Rust searcher walks the tree in Rust and crosses into the net once
+        # per leaf from there; the Python one walks it in Python. Same search,
+        # same targets -- `test_reanalysis_backends_agree` pins that -- so the
+        # backend is a speed choice, and `python` stays available to fall back
+        # to if a position ever fails to cross the state boundary.
+        rust_factory = None
+        if self.config.reanalysis_backend == "rust":
+            from .rust_bridge import rust_closed_search_factory
+
+            rust_factory = rust_closed_search_factory(
+                evaluator,
+                sims=self.config.full_sims_max,
+                top_k=self.config.top_k,
+                force=self.config.force_root_chance,
+                puct_root=puct_root,
+                leaf_batch=1,
+            )
 
         def factory_for(record: GameRecord):
             def factory(move_index: int):
-                # Deterministic per (game, move): a resume must re-derive the
-                # same targets, and two positions in one game must not share a
-                # search seed.
-                seed = (
-                    self.config.seed
-                    + 611_953 * (record.seed & 0xFFFF)
-                    + 7 * move_index
-                    + iteration
-                )
+                seed = seed_for(record, move_index)
+                if replayer is not None:
+                    return replayer
+                if rust_factory is not None:
+                    return rust_factory(seed)
                 return GumbelMCTS(
                     evaluator,
                     SearchConfig(
@@ -4887,11 +4972,7 @@ class PhaseDLoop:
                         top_k=self.config.top_k,
                         mode="closed",
                         seed=seed,
-                        root_selection=(
-                            "puct"
-                            if self.config.selfplay_search_mode == "puct"
-                            else "gumbel"
-                        ),
+                        root_selection="puct" if puct_root else "gumbel",
                         force_expand_root_chance=self.config.force_root_chance,
                         # No bias, by construction: this is the whole point.
                         specialist_lambda=0.0,
@@ -4899,6 +4980,53 @@ class PhaseDLoop:
                 )
 
             return factory
+
+        # The coalesced backend searches every position in ONE scheduler run, so
+        # it needs the positions before `reanalysis_examples` walks them. Pass 1
+        # replays each record and captures them; pass 2 replays identically and
+        # hands the precomputed result back in the same order. Both passes apply
+        # the same `move.i in wanted` filter over the same `zip(records,
+        # selected)`, so the orders cannot drift.
+        replayer = None
+        coalescing: dict[str, Any] = {}
+        if self.config.reanalysis_backend == "rust_coalesced":
+            from .rust_bridge import (
+                prepare_reanalysis_position,
+                rust_coalesced_reanalysis_prepared,
+            )
+
+            prepared: list[tuple] = []
+            for record, indices in zip(records, selected):
+                if not indices:
+                    continue
+                wanted = set(indices)
+
+                def collect(game, move, _wanted=wanted, _record=record):
+                    if move.i not in _wanted:
+                        return
+                    prepared.append(
+                        (
+                            *prepare_reanalysis_position(game),
+                            seed_for(_record, move.i),
+                        )
+                    )
+
+                replay(record, on_state=collect)
+            searched, coalescing = rust_coalesced_reanalysis_prepared(
+                evaluator,
+                prepared,
+                sims=self.config.full_sims_max,
+                top_k=self.config.top_k,
+                force=self.config.force_root_chance,
+                puct_root=puct_root,
+                leaf_batch=self.config.leaf_batch,
+                global_batch_cap=self.config.rust_global_batch_cap,
+                scheduler_workers=self.config.rust_scheduler_workers,
+                max_active_slots=self.config.reanalysis_slots,
+                max_inflight_batches=self.config.rust_max_inflight_batches,
+                inference_wait_ms=self.config.rust_inference_wait_ms,
+            )
+            replayer = _PrecomputedSearch(searched)
 
         out: list[Example] = []
         visited = 0
@@ -4929,12 +5057,23 @@ class PhaseDLoop:
             ),
             "coverage_positions": covered,
             "seconds": time.monotonic() - started,
+            "backend": self.config.reanalysis_backend,
+            # Rows per forward: 1.0 would mean the coalescer merged nothing and
+            # every leaf crossed alone, which is the whole cost this backend
+            # exists to remove.
+            "coalescing": coalescing,
         }
         self.phase_seconds["reanalysis"] = stats["seconds"]
+        rows_per_forward = coalescing.get("rows_per_forward")
         print(
             f"iteration {iteration}: S2b reanalysis -- {len(out)} general "
             f"examples from {positions} positions "
             f"({stats['share']:.1%} of policy inflow, cap {cap:.0%})"
+            + (
+                f" [{rows_per_forward:.1f} rows/forward]"
+                if rows_per_forward
+                else ""
+            )
         )
         return out, stats
 
@@ -6322,6 +6461,37 @@ class PhaseDLoop:
                     print(f"WARNING: buffer save failed: {exc}")
 
 
+class _PrecomputedSearch:
+    """Hands back searches already run, in the order they were asked for.
+
+    The coalesced backend searches every reanalysis position in one scheduler
+    run, but `reanalysis_examples` wants a searcher it can call per position.
+    This bridges the two: pass 2's replay walks the same positions in the same
+    order pass 1 collected them, so popping in order is the identity, and a
+    miscount is an IndexError here rather than a silently transposed target.
+    """
+
+    __slots__ = ("_results", "_next")
+
+    def __init__(self, results):
+        self._results = list(results)
+        self._next = 0
+
+    def search(self, game):
+        del game  # already searched; the position is fixed by the order
+        if self._next >= len(self._results):
+            raise IndexError(
+                "coalesced reanalysis ran out of precomputed searches: pass 2 "
+                "asked for more positions than pass 1 collected"
+            )
+        result = self._results[self._next]
+        self._next += 1
+        return result
+
+    def exhausted(self) -> bool:
+        return self._next == len(self._results)
+
+
 class _PhaseDRunStore:
     """Adapts the run manifest + training log to the controller's RunStore."""
 
@@ -6680,6 +6850,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="leaf batch for gates, arena and anchors (0 = follow --leaf-batch). "
         "Evaluation must match the ADVISOR, which is PUCT-root, or the "
         "advisor's numbers stop meaning what the gate's mean.",
+    )
+    parser.add_argument(
+        "--reanalysis-slots",
+        type=int,
+        default=256,
+        help="concurrent positions the coalesced reanalysis backend searches. "
+        "Not --rust-slots: reanalysis runs alone inside training, so more slots "
+        "is simply more leaves to coalesce (measured 64 -> 256 slots: 77.3 -> "
+        "41.6 ms/position).",
+    )
+    parser.add_argument(
+        "--reanalysis-backend",
+        choices=("rust_coalesced", "rust", "python"),
+        default="rust_coalesced",
+        help="searcher used for S2b reanalysis. rust_coalesced searches every "
+        "position in one scheduler run so their leaves share batches; rust and "
+        "python search one position at a time and agree bit for bit.",
     )
     parser.add_argument(
         "--virtual-loss-root",
@@ -7060,7 +7247,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--selfplay-generator-mode",
         choices=tuple(mode.value for mode in GeneratorMode),
-        default="strict_gate",
+        default="soft_gate",
         help="strict_gate = legacy gate-every-candidate lifecycle; soft_gate = "
         "cumulative rolling learner with promotion protection",
     )
@@ -7488,6 +7675,8 @@ def main(argv=None) -> int:
         full_sims_schedule=args.full_sims_schedule,
         eval_leaf_batch=args.eval_leaf_batch,
         virtual_loss_root=args.virtual_loss_root,
+        reanalysis_backend=args.reanalysis_backend,
+        reanalysis_slots=args.reanalysis_slots,
         cheap_conflict_free_waves=args.cheap_conflict_free_waves,
         cheap_round_robin_candidates=args.cheap_round_robin_candidates,
         conflict_free_waves=args.conflict_free_waves,
