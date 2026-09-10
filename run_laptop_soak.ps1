@@ -1,138 +1,234 @@
 # Overnight laptop soak for the 7WD stack (PowerShell).
 #
-# A FUNCTIONAL soak, not a strength run: the net is 5.2M params on a 3070, so
-# nothing here measures playing strength. What it tests is whether specialists,
-# reanalysis, the endgame solver, the evaluator coalescer and the hierarchical
-# value head all survive ten hours together -- and whether the specialist
-# accept/REVERT cycle works when given enough iterations to revert.
+# A FUNCTIONAL soak, not a strength run: the net is ~5M params on a 3070, so
+# nothing here measures playing strength. What it tests is whether every
+# mechanism the RENTED BOX will run survives running together.
 #
-#   .\run_laptop_soak.ps1            # start
-#   .\run_laptop_soak.ps1 -Resume    # continue from the run dir
+#   .\run_laptop_soak.ps1                      # start
+#   .\run_laptop_soak.ps1 -Resume              # continue from the run dir
+#   .\run_laptop_soak.ps1 -RunDir runs/...     # somewhere else
 #
-# Resume with an active specialist league was exercised for real on 2026-09-10:
-# a Windows update rebooted the box at 01:31 after 8 iterations, and the run
-# resumed cleanly from the training log.
+# WHY 20 ITERATIONS AND NOT 150. Under the soft gate a gate runs every
+# `--promotion-every` iterations, and the lifecycle counters are counted in GATE
+# CHECKS, not iterations (`training_control.py`). So the schedule is:
 #
-# MEASURED sizing, replacing the estimate that shipped with this file. That
-# estimate said ~236s/iteration on the assumption that --promotion-every 5
-# gated every fifth iteration; under the strict_gate lifecycle it did not (it
-# only fed revert suppression), so all 400 gate games ran EVERY iteration and
-# reanalysis added ~1000s more. Real cost was ~25 min/iteration -- 150
-# iterations would have taken 60 hours, not 10.
+#   iter 3   specialists seeded, league opens (--specialist-bootstrap-games)
+#   iter 5   first soft gate
+#   iter 10  the military specialist is first drawn (ONE class per iteration)
+#   iter 15  third gate -- --revert-reset-after 3 can fire
+#   iter 20  fourth gate -- --probation-reset-after 4 can fire
 #
-# Under the soft gate --promotion-every 5 IS the gate cadence, and the
-# coalesced reanalysis backend took S2b from ~1000s to ~30s (34x, measured
-# 2539 -> 74.8 ms/position). Budget per iteration, measured on this laptop:
+# Everything after iteration 20 repeats mechanisms already exercised, and both
+# counters have direct unit coverage in `test_az_loop_controller.py`. ~20
+# iterations is roughly 3 hours here, short enough to read the result and run it
+# again the same day.
 #
-#   generation  ~160s   gate ~320s   train ~24s   replay ~15s   reanalysis ~30s
+# WHAT CHANGED, AND WHY IT IS THE POINT. The first soak (2026-09-09, killed by a
+# Windows reboot at iteration 8) passed ~50 fewer flags than the cloud launcher
+# assembles, and several were whole MECHANISMS rather than values: virtual-loss
+# leaf batching, the pooled-readout/reply-head architecture, Dirichlet noise,
+# forced playouts, the value bootstrap, the self-anchor, curriculum annealing
+# and the gate-side scheduler geometry. A long run of a configuration the box
+# will not use is worth less than a short run of the one it will. Diff this
+# file's flags against `bash setup_dryrun.sh` before changing either.
 #
-# so roughly 9-10 min/iteration and ~65 iterations in a 10-hour night. Note
-# --iterations is how many MORE to run on a resume, not a target total.
+# The VALUES are laptop-scale; the MECHANISM SET is meant to match the box.
 #
-# NOTE: hof-start-games is 300 here so specialists actually play within the
-# run. The box uses 10,000. Do not carry this number over.
+# Deliberately NOT matched to the box, with reasons:
+#   --hof-start-games 300 / --specialist-bootstrap-games 300  (box: 50,000 /
+#     10,000) so the league actually plays inside a 2,000-game run.
+#   sims, d-model, slots, solver budget -- laptop hardware.
+#
+# A resume is REFUSED across a commit change (W6.5) and across a generator-mode
+# change, so a code change means a new run directory, not -Resume.
+#
+# --iterations is how many MORE iterations to run on a resume, not a target
+# total.
 
-param([switch]$Resume)
+param(
+    [switch]$Resume,
+    # Build and validate the config, then exit without training. The cloud
+    # launcher does this before it detaches; a flag combination that Phase D
+    # refuses should cost a second here, not the first iteration of a run.
+    [switch]$ValidateOnly,
+    [string]$RunDir = "runs/seven_wonders_duel/laptop_soak2"
+)
 
 $ErrorActionPreference = "Stop"
 Set-Location -Path $PSScriptRoot
 
-$RunDir = "runs/seven_wonders_duel/laptop_soak"
-$Seed = "$RunDir/seed/seed_256x6.pt"
-
-if (-not $Resume) {
-    if (-not (Test-Path $Seed)) {
-        Write-Error "seed checkpoint missing: $Seed"
-        exit 1
-    }
-}
+# No --init-checkpoint, because the box does not use one either: it starts from
+# a random initialisation plus --seed-games of curriculum play, and
+# --bootstrap-policy auto_first_trained promotes the first trained net. The old
+# seed checkpoint also predates --pooled-readout/--reply-head, so loading it
+# here would fail the model contract check rather than seed anything.
 
 # An array, splatted -- PowerShell parses `--flag` in an expression as a unary
 # operator, so a bash-style multi-line invocation is a parse error here.
 $a = @(
     "-m", "games.seven_wonders_duel.phase_d",
     "--run-dir", $RunDir,
-    "--iterations", "150",
+    "--iterations", "20",
     "--games-per-iteration", "100",
+
+    # ---- Architecture. The box trains THIS model; a soak on a different one
+    # ---- exercises different parameters and a different checkpoint contract.
     "--d-model", "256",
     "--layers", "6",
+    # 256/4 = 64 per head, the same head width as the box's 384/6.
+    "--heads", "4",
+    "--pooled-readout",
+    "--reply-head",
     "--hierarchical-value",
     "--hier-value-weight", "0.3",
-    # W7. Lambda 3 is the measured peak of the pursuit curve (S0a).
-    "--specialists", "science:0.15:3,military:0.10:3",
-    "--specialist-bootstrap-games", "300",
-    "--specialist-floor-every", "5",
-    # S2b, off by default and never exercised. The likeliest thing to fail
-    # early; drop this one flag if protecting the soak matters more than
-    # testing it.
-    "--specialist-reanalysis",
-    # Must be <= specialist-bootstrap-games, or the league seeds and never
-    # plays. PhaseDConfig.validate refuses the inversion.
-    "--hof-start-games", "300",
-    "--hof-opponent-fraction", "0.15",
+
+    # ---- Search. cloud2's split: PUCT on recorded moves, Gumbel on cheap ones.
+    "--selfplay-search-mode", "puct",
+    "--cheap-search-mode", "gumbel",
+    "--eval-search-mode", "puct",
+    # Root exploration. Both default to off, and the box turns both on.
+    "--dirichlet-epsilon", "0.25",
+    "--dirichlet-alpha", "1.8",
+    # KataGo forced playouts; needs a PUCT root, and is inert without one.
+    "--forced-playout-k", "1.0",
+    # Leaf batching under virtual loss. A DIFFERENT root algorithm, and on full
+    # moves the root's visit distribution IS the policy target -- so this is
+    # here because the box runs it, not because it is free.
+    "--leaf-batch", "6",
+    "--virtual-loss-root",
+    # The cheap root is Gumbel and batches by conflict-free waves instead. The
+    # waves/round-robin pair is mandatory: without it every wave is cut back to
+    # width 1 and the cheap batch is inert.
+    "--cheap-leaf-batch", "16",
+    "--cheap-conflict-free-waves",
+    "--cheap-round-robin-candidates",
+    "--eval-leaf-batch", "16",
     "--cheap-sims-min", "32",
     "--cheap-sims-max", "48",
     "--full-sims-min", "128",
     "--full-sims-max", "192",
-    # cloud2's search split: PUCT for the full search and the gates, Gumbel for
-    # the cheap search. A PUCT root cannot run under leaf batching -- it would
-    # select against virtual loss, which is a different algorithm, not a slower
-    # one -- so --leaf-batch drops to 1 below. cloud2 ran leaf_batch 1 too.
-    "--selfplay-search-mode", "puct",
-    "--cheap-search-mode", "gumbel",
-    "--eval-search-mode", "puct",
-    "--rust-slots", "24",
-    "--rust-scheduler-workers", "2",
-    "--rust-global-batch-cap", "512",
-    "--solver-threads", "2",
-    "--endgame-solver-max-nodes", "200000",
+    "--full-search-fraction", "0.25",
+    "--full-search-every-games", "25",
+    "--top-k", "16",
+    "--age-deal-samples", "32",
+    "--cheap-double-reveal-offsets", "3",
+
+    # ---- Training.
     "--train-steps", "100",
-    "--weight-decay", "0.0",
-    # 1, not 4: PhaseDConfig.validate refuses a PUCT root above 1.
-    "--leaf-batch", "1",
-    # ...but the CHEAP root is Gumbel, so it can still batch. Cheap moves are
-    # `policy_excluded` -- their visit distributions are never policy targets --
-    # so widening them costs no target fidelity, and they are ~76% of moves.
-    # The waves/round-robin pair is mandatory: without it every wave is cut back
-    # to width 1 and the cheap batch is inert.
-    "--cheap-leaf-batch", "4",
-    "--cheap-conflict-free-waves",
-    "--cheap-round-robin-candidates",
-    "--promotion-every", "5",
-    # Soft gate (now the default, named here so the log records the choice).
-    # Under this lifecycle --promotion-every really is the gate cadence; under
-    # strict_gate it only fed revert suppression and every iteration gated.
+    "--train-warmup-steps", "33",
+    "--train-batch-size", "512",
+    "--learning-rate", "5e-5",
+    "--weight-decay", "0.5",
+    # The setting that makes a shaped root dangerous, and therefore the one that
+    # lets W7's `assert_no_shaped_bootstrap` fail at all.
+    "--value-bootstrap", "0.5",
+    "--action-policy-weight", "0",
+    # Action sampling. Defaults anneal to a hard argmax; the box holds a floor,
+    # so its games carry exploration this one would not have had.
+    "--temperature-floor", "0.35",
+    "--temperature-anneal-moves", "30",
+
+    # ---- Schedules. The games basis, with the knots pulled in so each one is
+    # ---- actually CROSSED inside ~2,000 games instead of never firing.
+    "--schedule-basis", "games",
+    "--seed-games", "5000",
+    "--curriculum-anneal-games", "1000",
+    "--draft-prior-games", "800",
+    "--opponent-fraction", "0",
+    "--intervention-window-games", "2000",
+    "--replay-window-coefficient", "1000",
+    "--replay-window-exponent", "0.6",
+    "--replay-window-cap-games", "2000",
+
+    # ---- Specialist league (W7).
+    # Lambda 3 is the measured peak of the pursuit curve (S0a).
+    "--specialists", "science:0.15:3,military:0.10:3",
+    # Must be <= specialist-bootstrap-games, or the league seeds and never
+    # plays. PhaseDConfig.validate refuses the inversion.
+    "--specialist-bootstrap-games", "300",
+    "--specialist-floor-every", "5",
+    "--specialist-reanalysis",
+    "--reanalysis-backend", "rust_coalesced",
+    "--reanalysis-slots", "256",
+    "--hof-start-games", "300",
+    "--hof-opponent-fraction", "0.15",
+
+    # ---- Anchors. The box leaves the bot-suite gate off and relies on the SELF
+    # ---- anchor, so this does too -- scaled to fire ~5 times in 2,000 games
+    # ---- rather than never.
+    "--anchor-gate-every-promotions", "0",
+    # Inert while the gate above is 0, exactly as on the box. Named so the flag
+    # diff against `setup_dryrun.sh` stays empty and stays worth reading.
+    "--anchor-games", "40",
+    "--self-anchor-games", "40",
+    "--self-anchor-lag-games", "400",
+    "--self-anchor-every-games", "400",
+
+    # ---- Lifecycle. cloud2's methodology.
     "--selfplay-generator-mode", "soft_gate",
     "--bootstrap-policy", "auto_first_trained",
-    # The probation/revert counters cloud2 ran. They default to 0 (disabled),
-    # so a soft-gate run without them never resets the learner.
+    "--promotion-every", "5",
+    # These default to 0, i.e. disabled -- a soft-gate run without them never
+    # resets the learner however badly it does.
     "--revert-reset-after", "3",
     "--probation-reset-after", "4",
     "--promotion-min-lcb", "0.50",
     "--revert-max-ucb", "0.48",
-    "--gate-ladder-games", "60",
+    # Two rungs so the ladder can actually step up, which one rung cannot test.
+    "--gate-ladder-games", "60", "200",
+    "--gate-ladder-step-up-after", "2",
+    "--gate-ladder-floor-games", "1000",
     "--gate-sims", "48",
-    "--replay-window", "6",
-    "--replay-window-cap-games", "2000",
-    # Conservative: four processes were OOM-killed on this machine today.
+    # Gate-side scheduler geometry, deliberately separate from generation's.
+    "--gate-slots", "48",
+    "--gate-global-batch-cap", "512",
+
+    # ---- Endgame solver.
+    "--endgame-solver-max-nodes", "200000",
+    "--endgame-solver-max-secs", "10",
+    "--solver-threads", "2",
+    "--endgame-cost-model", "games/seven_wonders_duel/endgame_cost_model.json",
+    "--solver-fallback-research",
+
+    # ---- Backends and scheduler geometry.
+    "--generation-backend", "rust",
+    "--gate-backend", "rust",
+    "--derive-backend", "rust",
+    "--rust-slots", "24",
+    "--rust-scheduler-workers", "2",
+    "--rust-global-batch-cap", "512",
+    "--rust-max-inflight-batches", "1",
+    "--pack-threads", "0",
+    # CPU parallelism for seed generation and the Python fallback paths. Lower
+    # than the box's 8/16 because this is a 16-thread laptop that is also the
+    # machine you are using.
+    "--workers", "4",
+    "--process-workers", "8",
+
+    # ---- Memory. Conservative: four processes were OOM-killed on this machine.
     "--example-cache-gb", "1.5",
     "--memory-budget-gb", "9",
     "--memory-headroom-gb", "1",
+    "--vram-budget-gb", "0",
     "--min-games-to-train", "20",
     "--min-buffer-positions", "200",
     "--buffer-autosave-every", "5",
+
     "--device", "cuda",
     "--precision", "bf16"
 )
 
-if (-not $Resume) {
-    $a += @("--init-checkpoint", $Seed)
+if ($ValidateOnly) {
+    $a += "--validate-config"
+    Write-Host "==> validating the launch configuration only"
+    python @a
+    exit $LASTEXITCODE
 }
 
 # No tee and no 2>&1: --run-log already writes <run-dir>/run.log, and in
 # Windows PowerShell 5.1 redirecting a native executable's stderr wraps every
 # line in an ErrorRecord and sets $? to false even on a clean exit.
-Write-Host "==> $(if ($Resume) {'resuming'} else {'starting'}) soak; transcript at $RunDir/run.log"
+Write-Host "==> $(if ($Resume) {'resuming'} else {'starting'}) soak in $RunDir; transcript at $RunDir/run.log"
 $started = Get-Date
 python @a
 $code = $LASTEXITCODE
