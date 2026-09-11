@@ -41,7 +41,7 @@ import json
 import math
 from pathlib import Path
 
-from .solver_corpus import price
+from .solver_corpus import admission_ceiling, price
 
 #: Multiples of the attempt bar to consider as timeouts.
 #:
@@ -66,8 +66,17 @@ def candidates(
 ) -> list[dict]:
     """Every (bar, timeout) pair worth pricing, priced."""
 
+    ceiling = admission_ceiling(corpus, model)
     out = []
+    dropped = []
     for bar in bars:
+        if bar > ceiling * (1.0 + 1e-9):
+            # Not an error and not a zero result: the corpus simply has no rows
+            # for what this bar would admit, because the run that produced it
+            # refused them. Pricing it anyway would report the collecting bar's
+            # numbers under a wider label.
+            dropped.append(bar)
+            continue
         for multiple in multiples:
             out.append(
                 price(
@@ -78,6 +87,20 @@ def candidates(
                     games=games,
                 )
             )
+    if dropped:
+        print(
+            "not priceable from this corpus (above its admission ceiling of "
+            f"{ceiling:,.0f} nodes, so the positions such a bar would admit are "
+            "absent rather than expensive): "
+            + ", ".join(f"{bar:,.0f}" for bar in dropped),
+            flush=True,
+        )
+    if not out:
+        raise SystemExit(
+            f"every candidate bar is above this corpus's admission ceiling of "
+            f"{ceiling:,.0f} nodes. Lower --bars, or build a corpus from a run "
+            "that attempted more than this one did."
+        )
     return out
 
 

@@ -20,11 +20,17 @@ MODEL = {
 }
 
 
-def _corpus(costs):
-    """`None` cost means the position never completed at any budget measured."""
+def _corpus(costs, *, collecting_attempt_nodes: int | None = 1_000_000_000):
+    """`None` cost means the position never completed at any budget measured.
+
+    The collecting bar defaults WIDE so these fixtures exercise pricing rather
+    than the admission ceiling; the ceiling tests set it deliberately. Pass
+    `None` to get a corpus that has to infer it.
+    """
 
     return {
         "feature_names": ["f0", "f1"],
+        "collecting_attempt_nodes": collecting_attempt_nodes,
         "rows": [
             {"features": [0.0, 0.0], "true_nodes": c, "declined": c is None}
             for c in costs
@@ -172,3 +178,69 @@ def test_the_clock_stays_slack_against_the_node_budget():
     assert reachable > chosen["max_nodes"], (
         "the wall clock would stop the solve before the node budget does"
     )
+
+
+# --- what a corpus can and cannot see --------------------------------------
+#
+# A corpus holds the positions a run ATTEMPTED. Everything its bar refused is
+# absent -- not recorded as expensive, absent -- so a wider candidate bar prices
+# identically to the collecting one and reads as "widening buys nothing". The
+# truth is "this corpus cannot see what widening would buy".
+
+
+def test_a_bar_above_the_corpus_ceiling_is_refused_not_priced():
+    from .solver_corpus import price
+
+    corpus = _corpus([1e5])
+    corpus["collecting_attempt_nodes"] = 5_000_000
+    with pytest.raises(ValueError, match="admission ceiling"):
+        price(corpus, MODEL, attempt_nodes=10_000_000, max_nodes=1e9, games=1)
+
+
+def test_the_ceiling_is_read_rather_than_inferred_when_recorded():
+    """Inference lands just BELOW the true bar, because the largest prediction
+    in a corpus approaches the collecting bar without reaching it. On cloud2
+    that inferred 39,975,202 against a true 40,000,000 -- excluding the run's
+    own settings, which is the one candidate that must always be priceable."""
+
+    from .solver_corpus import admission_ceiling
+
+    corpus = _corpus([1e5], collecting_attempt_nodes=None)
+    inferred = admission_ceiling(corpus, MODEL)
+    corpus["collecting_attempt_nodes"] = 40_000_000
+    assert admission_ceiling(corpus, MODEL) == 40_000_000
+    assert inferred != 40_000_000, "the fixture must exercise the difference"
+
+
+def test_the_collecting_runs_own_settings_are_always_priceable():
+    """The status quo is what every other candidate is compared against."""
+
+    from .solver_corpus import price
+
+    corpus = _corpus([1e5, 1e7])
+    corpus["collecting_attempt_nodes"] = 40_000_000
+    out = price(corpus, MODEL, attempt_nodes=40_000_000, max_nodes=40_000_000, games=1)
+    assert out["attempts"] == 2
+
+
+def test_unpriceable_bars_are_dropped_with_a_reason_not_silently():
+    """Dropping them silently would leave a grid whose top end simply vanished,
+    which looks identical to a grid that was never asked for."""
+
+    from .solver_sizing import candidates
+
+    corpus = _corpus([1e5])
+    corpus["collecting_attempt_nodes"] = 5_000_000
+    rows = candidates(corpus, MODEL, games=1, bars=(5_000_000, 50_000_000))
+    assert rows, "the priceable bar was dropped too"
+    assert all(row["attempt_nodes"] == 5_000_000 for row in rows)
+
+
+def test_a_grid_entirely_above_the_ceiling_stops_rather_than_returning_nothing():
+    from .solver_sizing import size
+
+    corpus = _corpus([1e5])
+    corpus["collecting_attempt_nodes"] = 1_000_000
+    with pytest.raises(SystemExit, match="above this corpus"):
+        size(corpus, MODEL, rate=1e6, threads=4, generation_wall_seconds=100,
+             games=1, target_share=0.8, bars=(50_000_000,))

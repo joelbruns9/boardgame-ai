@@ -45,7 +45,12 @@ from pathlib import Path
 SCHEMA = "solver_corpus/1"
 
 
-def build(buffer_path: Path, study_path: Path | None) -> dict:
+def build(
+    buffer_path: Path,
+    study_path: Path | None,
+    *,
+    collecting_attempt_nodes: int | None = None,
+) -> dict:
     """Replay a buffer and price every position a solve was attempted at.
 
     No solving happens here: the costs are already recorded (or supplied by the
@@ -117,6 +122,10 @@ def build(buffer_path: Path, study_path: Path | None) -> dict:
         "schema": SCHEMA,
         "source_buffer": str(buffer_path),
         "source_study": str(study_path) if study_path else None,
+        # The bar the COLLECTING run used. `admission_ceiling` needs it exactly:
+        # inferring it from the rows lands just under the true value and
+        # excludes the run's own settings from being priced.
+        "collecting_attempt_nodes": collecting_attempt_nodes,
         "feature_names": list(swr.endgame_cost_model_features()),
         "positions": len(rows),
         "declined": sum(1 for row in rows if row["declined"]),
@@ -150,6 +159,34 @@ def predictions(corpus: dict, model: dict) -> list[float]:
     ]
 
 
+def admission_ceiling(corpus: dict, model: dict) -> float:
+    """The largest attempt bar this corpus can HONESTLY price, in nodes.
+
+    A corpus holds the positions a run ATTEMPTED, and a run attempts a position
+    only when it clears that run's own bar. Everything the bar refused is
+    therefore absent -- not recorded as expensive, absent -- so a candidate bar
+    wider than the collecting run's admits positions the corpus has no rows for.
+
+    Priced naively, such a candidate reports exactly the same proofs and nodes as
+    the collecting bar, which reads as "widening buys nothing". The truth is
+    "this corpus cannot see what widening would buy", and those are opposite
+    conclusions: the first is a measurement, the second is missing data.
+
+    RECORDED when the build knew it, because inferring it is off by exactly the
+    amount that matters. The inference is `10**(max(prediction) + margin)` -- the
+    smallest bar admitting every row present -- and the largest prediction in a
+    corpus approaches the collecting bar from BELOW without reaching it. On
+    cloud2 that inferred 39,975,202 against a true bar of 40,000,000, which
+    excluded the run's own settings: the one candidate that must always be
+    priceable, since it is the status quo every other option is compared to.
+    """
+
+    recorded = corpus.get("collecting_attempt_nodes")
+    if recorded:
+        return float(recorded)
+    return 10.0 ** (max(predictions(corpus, model)) + float(model["margin_decades"]))
+
+
 def price(
     corpus: dict,
     model: dict,
@@ -175,6 +212,15 @@ def price(
     """
 
     margin = float(model["margin_decades"])
+    ceiling = admission_ceiling(corpus, model)
+    if attempt_nodes > ceiling * (1.0 + 1e-9):
+        raise ValueError(
+            f"attempt_nodes {attempt_nodes:,.0f} is above this corpus's "
+            f"admission ceiling of {ceiling:,.0f}: the collecting run refused "
+            "everything more expensive, so those positions are absent and a "
+            "wider bar cannot be priced from here. Build a corpus from a run "
+            "that used at least this bar."
+        )
     bar = math.log10(attempt_nodes) - margin
     proofs = attempts = 0
     nodes = wasted = 0.0
@@ -215,9 +261,56 @@ def main(argv: list[str] | None = None) -> int:
         "records only a floor on its cost.",
     )
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help="the collecting run's run_manifest.json. Supplies the attempt bar "
+        "that run used, which bounds what this corpus can price -- inferring it "
+        "from the rows lands just below the true value and excludes the run's "
+        "own settings.",
+    )
+    parser.add_argument(
+        "--collecting-attempt-nodes",
+        type=int,
+        default=None,
+        help="override, when there is no manifest to read it from.",
+    )
     args = parser.parse_args(argv)
 
-    corpus = build(args.buffer, args.study)
+    bar = args.collecting_attempt_nodes
+    if bar is None and args.manifest is not None:
+        manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
+
+        def find(node, key):
+            if isinstance(node, dict):
+                if key in node:
+                    return node[key]
+                for value in node.values():
+                    found = find(value, key)
+                    if found is not None:
+                        return found
+            elif isinstance(node, list):
+                for value in node:
+                    found = find(value, key)
+                    if found is not None:
+                        return found
+            return None
+
+        # A run predating the split recorded only one number, and it served as
+        # both -- so the timeout IS that run's attempt bar.
+        bar = find(manifest, "endgame_solver_attempt_nodes") or find(
+            manifest, "endgame_solver_max_nodes"
+        )
+    if bar is None:
+        print(
+            "WARNING: no collecting bar recorded. It will be INFERRED from the "
+            "rows, which lands just below the true value and will refuse to "
+            "price the collecting run's own settings.",
+            flush=True,
+        )
+
+    corpus = build(args.buffer, args.study, collecting_attempt_nodes=bar)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(corpus), encoding="utf-8")
     print(
