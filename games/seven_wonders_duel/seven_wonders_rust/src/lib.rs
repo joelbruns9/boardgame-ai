@@ -265,6 +265,8 @@ fn make_self_play_config(
         specialist_by_net: [None, None],
         // Self-play plays to the end; only reanalysis sets this.
         stop_after_moves: 0,
+        // Set per job by the flat entry point, like `stop_after_moves`.
+        exclude_parked_from_budget: false,
     }
 }
 
@@ -1948,6 +1950,7 @@ fn scheduler_result_to_py(
     metrics.set_item("ready_slot_ns", m.ready_slot_ns)?;
     metrics.set_item("waiting_slot_ns", m.waiting_slot_ns)?;
     metrics.set_item("parked_slot_ns", m.parked_slot_ns)?;
+    metrics.set_item("parked_off_budget_events", m.parked_off_budget_events)?;
     metrics.set_item("idle_slot_ns", m.idle_slot_ns)?;
     metrics.set_item("max_live_slots", m.max_live_slots)?;
     metrics.set_item("max_active_slots", m.max_active_slots)?;
@@ -2681,7 +2684,8 @@ fn self_play_many_net(
     cheap_round_robin_candidates=None, specialist_lambda=0.0,
     specialist_victory=None, specialist_symmetric=false,
     specialist_class_id=0, specialist_net=1, inference_wait_ms=0.0,
-    inference_coalesce=true, stop_after_moves=0, double_reveal_offsets=0))]
+    inference_coalesce=true, stop_after_moves=0, double_reveal_offsets=0,
+    exclude_parked_from_budget=false))]
 fn self_play_many_flat_net(
     py: Python<'_>,
     adapter: Py<PyAny>,
@@ -2766,6 +2770,9 @@ fn self_play_many_flat_net(
     // Offsets on pure double card-reveal edges for FULL searches; 0 is
     // exhaustive. The cheap counterpart is `cheap_double_reveal_offsets`.
     double_reveal_offsets: usize,
+    // Let a slot parked on an endgame solve release its budget token, so
+    // another game searches in its place. Changes what max_active_slots MEANS.
+    exclude_parked_from_budget: bool,
 ) -> PyResult<(Vec<Py<PyDict>>, Py<PyDict>)> {
     if specialist_net > 1 {
         return Err(PyValueError::new_err("specialist_net must be 0 or 1"));
@@ -2946,6 +2953,7 @@ fn self_play_many_flat_net(
         cfg.bot_policy_iterations = bot_policy_iterations;
         cfg.stop_after_moves = stop_after_moves;
         cfg.double_reveal_offsets = double_reveal_offsets;
+        cfg.exclude_parked_from_budget = exclude_parked_from_budget;
     }
     if specialist.is_some() && per_game_nets.is_none() && specialist_net != 0 {
         return Err(PyValueError::new_err(

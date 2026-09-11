@@ -312,6 +312,18 @@ pub struct SelfPlayConfig {
     /// the record it emits is a legitimate truncated game, and `into_record`
     /// knows the difference.
     pub stop_after_moves: usize,
+    /// Let a slot parked on an endgame solve give its budget token back, so
+    /// another game searches in its place.
+    ///
+    /// A parked slot yields no evaluation group until its solve returns, so
+    /// under the historical behaviour it holds capacity the GPU is not being
+    /// fed from -- and it also raises `active_count`, which TIGHTENS every
+    /// working slot's `forced_row_limit`. Measured with `parked_slot_ns`.
+    ///
+    /// Off by default: this changes what `max_active_slots` MEANS, from
+    /// concurrent games to concurrent SEARCHING games, so a slot count measured
+    /// under one is not comparable under the other.
+    pub exclude_parked_from_budget: bool,
 }
 
 impl SelfPlayConfig {
@@ -1465,6 +1477,13 @@ pub struct SchedulerMetrics {
     /// its budget token and its place in `active_count`, so this is capacity
     /// the GPU is not being fed from.
     pub parked_slot_ns: u64,
+    /// Times a parked slot handed its borrowed activation back, so another game
+    /// could search in its place. Zero unless `exclude_parked_from_budget`.
+    ///
+    /// An EVENT count, not a peak: whether the released token is actually taken
+    /// up depends on a refill happening while the solve is outstanding, which is
+    /// a timing question. Whether the release HAPPENED is not.
+    pub parked_off_budget_events: u64,
     pub idle_slot_ns: u64,
     pub max_live_slots: usize,
     /// The activation ceiling this run was given (globally, across shards).
@@ -1622,6 +1641,7 @@ impl SchedulerMetrics {
             ready_slot_ns: _,
             waiting_slot_ns: _,
             parked_slot_ns: _,
+            parked_off_budget_events: _,
             idle_slot_ns: _,
             max_live_slots: _,
             max_active_slots: _,
@@ -1717,6 +1737,7 @@ impl SchedulerMetrics {
         self.ready_slot_ns += other.ready_slot_ns;
         self.waiting_slot_ns += other.waiting_slot_ns;
         self.parked_slot_ns += other.parked_slot_ns;
+        self.parked_off_budget_events += other.parked_off_budget_events;
         self.idle_slot_ns += other.idle_slot_ns;
         // Both are global figures every shard already reports identically:
         // taking the max keeps them global rather than summing shard peaks that
@@ -1829,6 +1850,11 @@ impl Occupancy {
         self.parked = parked;
         self.idle = capacity.saturating_sub(live);
         metrics.max_live_slots = metrics.max_live_slots.max(live);
+        // Carried on the pool, surfaced here so a shard's releases reach the
+        // merged metrics without a second plumbing path.
+        metrics.parked_off_budget_events = metrics
+            .parked_off_budget_events
+            .max(pool.parked_off_budget_events);
         metrics.arena_nodes_live_peak = metrics.arena_nodes_live_peak.max(live_nodes);
 
         // Deep byte accounting walks a whole arena, so sample one entry per
@@ -1853,6 +1879,7 @@ impl Occupancy {
 /// one reserved activation — without it a shard could be permanently starved and
 /// the run would deadlock — and competes for the remainder through `spare`.
 pub struct SlotBudget {
+    overdraft: std::sync::atomic::AtomicUsize,
     spare: std::sync::atomic::AtomicUsize,
     /// Games active across *all* shards, and its high-water mark. Summing each
     /// shard's own peak would overstate concurrency, because shard peaks need
@@ -1873,6 +1900,7 @@ impl SlotBudget {
             )));
         }
         Ok(Self {
+            overdraft: std::sync::atomic::AtomicUsize::new(0),
             spare: std::sync::atomic::AtomicUsize::new(max_active_slots - shards),
             live: std::sync::atomic::AtomicUsize::new(0),
             peak_live: std::sync::atomic::AtomicUsize::new(0),
@@ -1903,6 +1931,21 @@ impl SlotBudget {
         Self::new(max_active_slots.max(1), 1)
     }
 
+    /// Take an activation that MUST succeed.
+    ///
+    /// A slot resuming from a solve held an activation before it parked, and
+    /// refusing it would strand a solve outcome with nowhere to go. So this
+    /// overdraws rather than fails. The overshoot is bounded by the number of
+    /// simultaneously parked slots, which the solver pool already bounds, and
+    /// a parked slot holds no arena -- `SolvePending` carries no `session` --
+    /// so the extra concurrency costs a `GameState`, not a tree.
+    fn take_forced(&self) {
+        if !self.try_take() {
+            self.overdraft
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
     fn try_take(&self) -> bool {
         use std::sync::atomic::Ordering;
         self.spare
@@ -1913,8 +1956,25 @@ impl SlotBudget {
     }
 
     fn give_back(&self) {
-        self.spare
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        use std::sync::atomic::Ordering;
+        // Repay an overdraft BEFORE adding spare, or every overshoot would
+        // permanently raise the effective cap instead of being borrowed.
+        if self
+            .overdraft
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return;
+        }
+        self.spare.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Activations currently borrowed past `total`. Zero unless slots are
+    /// parked off-budget.
+    pub fn overdraft_for_test(&self) -> usize {
+        self.overdraft.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn total(&self) -> usize {
@@ -1963,6 +2023,18 @@ struct SlotPool {
     entries: Vec<SlotEntry>,
     next_queued: usize,
     active_count: usize,
+    /// Active slots that have given their activation back while parked on a
+    /// solve. `exclude_parked_from_budget` only.
+    parked_count: usize,
+    /// Releases so far, for the metric. See `parked_off_budget_events`.
+    parked_off_budget_events: u64,
+    /// Which active slots are currently off-budget, so the transition is
+    /// detected once rather than every cycle. Indexed like `entries`.
+    parked_off_budget: Vec<bool>,
+    /// Opt-in: a parked slot releases its budget token so another game can
+    /// search in its place. Off restores the historical behaviour exactly --
+    /// a parked slot holds its token until the solve returns.
+    exclude_parked_from_budget: bool,
     holds_reserved: bool,
     budget_held: usize,
     finished: usize,
@@ -1972,13 +2044,22 @@ struct SlotPool {
 
 impl SlotPool {
     fn new(jobs: Vec<(GameState, SelfPlayConfig)>) -> Self {
+        let exclude = jobs
+            .first()
+            .map(|(_, cfg)| cfg.exclude_parked_from_budget)
+            .unwrap_or(false);
+        let count = jobs.len();
         Self {
+            parked_off_budget: vec![false; count],
+            exclude_parked_from_budget: exclude,
             entries: jobs
                 .into_iter()
                 .map(|job| SlotEntry::Queued(Box::new(job)))
                 .collect(),
             next_queued: 0,
             active_count: 0,
+            parked_count: 0,
+            parked_off_budget_events: 0,
             holds_reserved: false,
             budget_held: 0,
             finished: 0,
@@ -2054,6 +2135,47 @@ impl SlotPool {
             activated += 1;
         }
         Ok(activated)
+    }
+
+    /// Release a parked slot's activation so another game can search in its
+    /// place. No-op unless `exclude_parked_from_budget`.
+    ///
+    /// Only a BORROWED token is released. The shard's own reservation is its
+    /// deadlock guard -- every shard keeps one so it cannot be starved -- and
+    /// moving it would trade a throughput gain for a liveness risk.
+    fn park_off_budget(&mut self, index: usize, budget: &SlotBudget) {
+        if !self.exclude_parked_from_budget
+            || self.parked_off_budget.get(index).copied().unwrap_or(true)
+            || self.budget_held == 0
+        {
+            return;
+        }
+        self.budget_held -= 1;
+        budget.give_back();
+        self.parked_off_budget[index] = true;
+        self.parked_count += 1;
+        self.parked_off_budget_events += 1;
+    }
+
+    /// Take the activation back before a parked slot resumes. Cannot fail --
+    /// see `SlotBudget::take_forced`.
+    fn unpark_onto_budget(&mut self, index: usize, budget: &SlotBudget) {
+        if !self.parked_off_budget.get(index).copied().unwrap_or(false) {
+            return;
+        }
+        budget.take_forced();
+        self.budget_held += 1;
+        self.parked_off_budget[index] = false;
+        self.parked_count -= 1;
+    }
+
+    /// Active slots that can actually produce evaluation rows.
+    ///
+    /// `active_count` includes slots parked on a solve, and dividing the batch
+    /// cap by it TIGHTENS every working slot's row allowance on account of
+    /// slots that contribute none.
+    fn producing_count(&self) -> usize {
+        self.active_count.saturating_sub(self.parked_count)
     }
 
     /// Give back one activation: the shared token if this slot borrowed one,
@@ -3119,7 +3241,10 @@ pub fn run_many<E: Eval>(
 
         let mut groups = Vec::new();
         let mut retire = Vec::new();
-        let forced_row_limit = (global_batch_cap / pool.active_count().max(1)).max(1);
+        // `producing_count`, not `active_count`: a slot parked on a solve
+        // contributes no rows, so charging it a share of the cap tightens the
+        // allowance of the slots that do.
+        let forced_row_limit = (global_batch_cap / pool.producing_count().max(1)).max(1);
         for slot_index in pool.active_indices() {
             let outcome = pool
                 .slot_mut(slot_index)
@@ -3129,7 +3254,7 @@ pub fn run_many<E: Eval>(
                 Ok(Some(group)) => groups.push(group),
                 // No group means the game is over -- UNLESS the slot is parked on
                 // a solve, which yields nothing and is emphatically not finished.
-                Ok(None) if parked => {}
+                Ok(None) if parked => pool.park_off_budget(slot_index, &budget),
                 Ok(None) => retire.push(slot_index),
                 Err(err) => {
                     pool.abort(&budget);
@@ -3281,12 +3406,18 @@ fn collect_ready_groups(
     global_batch_cap: usize,
     finished: &mut Vec<usize>,
     mut solver: Option<&mut SolverPool>,
+    budget: &SlotBudget,
 ) -> PyResult<usize> {
     let mut collected = 0;
     let active = pool.active_indices();
+    // Neither outstanding NOR parked: a slot waiting on a solve produces no
+    // rows, so counting it here tightens the allowance of the slots that do.
     let ready = active
         .iter()
         .filter(|index| !outstanding[**index])
+        .filter(|index| {
+            pool.slot_mut(**index).map(|s| !s.is_parked()).unwrap_or(false)
+        })
         .count()
         .max(1);
     let forced_row_limit = (global_batch_cap / ready).max(1);
@@ -3304,7 +3435,9 @@ fn collect_ready_groups(
                 collected += 1;
             }
             // Parked on a solve yields no group and is not a finished game.
-            None if pool.slot_mut(slot_index)?.is_parked() => {}
+            None if pool.slot_mut(slot_index)?.is_parked() => {
+                pool.park_off_budget(slot_index, budget)
+            }
             None => finished.push(slot_index),
         }
     }
@@ -3402,6 +3535,7 @@ pub fn run_many_pipelined(
             global_batch_cap,
             &mut finished,
             solver.as_mut(),
+            &budget,
         ) {
             pool.abort(&budget);
             return Err(err);
@@ -3426,6 +3560,7 @@ pub fn run_many_pipelined(
             let mut blocked_ns: u64 = 0;
             loop {
                 for outcome in active_solver.harvest() {
+                    pool.unpark_onto_budget(outcome.slot, &budget);
                     let slot = match pool.slot_mut(outcome.slot) {
                         Ok(slot) => slot,
                         Err(err) => {
@@ -3456,6 +3591,7 @@ pub fn run_many_pipelined(
                     global_batch_cap,
                     &mut resumed,
                     Some(&mut *active_solver),
+                    &budget,
                 ) {
                     pool.abort(&budget);
                     return Err(err);
@@ -3480,6 +3616,7 @@ pub fn run_many_pipelined(
                 let Some(outcome) = waited else {
                     break;
                 };
+                pool.unpark_onto_budget(outcome.slot, &budget);
                 let slot = match pool.slot_mut(outcome.slot) {
                     Ok(slot) => slot,
                     Err(err) => {
@@ -3508,6 +3645,7 @@ pub fn run_many_pipelined(
                     global_batch_cap,
                     &mut more,
                     Some(&mut *active_solver),
+                    &budget,
                 ) {
                     pool.abort(&budget);
                     return Err(err);
@@ -3743,6 +3881,83 @@ mod budget_tests {
     }
 
     #[test]
+    fn an_overdraft_is_repaid_before_spare_grows() {
+        // The bug this guards: if `give_back` added spare while an overdraft
+        // was outstanding, every parked-slot overshoot would permanently RAISE
+        // the effective cap instead of borrowing against it.
+        let budget = SlotBudget::new(4, 1).expect("valid budget");
+        assert_eq!(budget.spare_for_test(), 3);
+
+        while budget.try_take() {}
+        assert_eq!(budget.spare_for_test(), 0);
+
+        budget.take_forced();
+        assert_eq!(budget.overdraft_for_test(), 1, "forced take must overdraw");
+
+        budget.give_back();
+        assert_eq!(budget.overdraft_for_test(), 0, "overdraft repaid first");
+        assert_eq!(budget.spare_for_test(), 0, "and spare must NOT have grown");
+
+        budget.give_back();
+        assert_eq!(budget.spare_for_test(), 1);
+    }
+
+    #[test]
+    fn a_forced_take_uses_spare_when_there_is_any() {
+        // Overdrawing while spare exists would understate available capacity
+        // for every other shard.
+        let budget = SlotBudget::new(4, 1).expect("valid budget");
+        budget.take_forced();
+        assert_eq!(budget.overdraft_for_test(), 0);
+        assert_eq!(budget.spare_for_test(), 2);
+    }
+
+    #[test]
+    fn parking_releases_only_a_borrowed_token_never_the_reservation() {
+        // Each shard keeps one reservation so it cannot be starved into a
+        // deadlock. Releasing THAT while parked would trade a throughput gain
+        // for a liveness risk.
+        let budget = SlotBudget::new(4, 1).expect("valid budget");
+        let mut pool = pool_with(0);
+        pool.exclude_parked_from_budget = true;
+        pool.parked_off_budget = vec![false; 2];
+
+        // Slot 0 holds the shard's reservation, and must keep it.
+        pool.holds_reserved = true;
+        pool.park_off_budget(0, &budget);
+        assert!(pool.holds_reserved, "the reservation was released");
+        assert_eq!(pool.parked_count, 0);
+
+        // Slot 1 holds a borrowed token, which IS released.
+        assert!(budget.try_take());
+        pool.budget_held = 1;
+        let spare_before = budget.spare_for_test();
+        pool.park_off_budget(1, &budget);
+        assert_eq!(pool.parked_count, 1);
+        assert_eq!(budget.spare_for_test(), spare_before + 1);
+
+        // ...and taken back on resume, without fail.
+        pool.unpark_onto_budget(1, &budget);
+        assert_eq!(pool.parked_count, 0);
+        assert_eq!(pool.budget_held, 1);
+        assert_eq!(budget.spare_for_test(), spare_before);
+    }
+
+    #[test]
+    fn parking_is_inert_unless_the_flag_is_set() {
+        let budget = SlotBudget::new(4, 1).expect("valid budget");
+        let mut pool = pool_with(0);
+        pool.parked_off_budget = vec![false; 1];
+        assert!(budget.try_take());
+        pool.budget_held = 1;
+        let spare_before = budget.spare_for_test();
+
+        pool.park_off_budget(0, &budget);
+        assert_eq!(pool.parked_count, 0, "parking acted with the flag off");
+        assert_eq!(budget.spare_for_test(), spare_before);
+    }
+
+    #[test]
     fn spare_starts_at_total_minus_one_reservation_per_shard() {
         let budget = SlotBudget::new(8, 3).expect("valid budget");
         assert_eq!(budget.spare_for_test(), 5);
@@ -3822,6 +4037,9 @@ mod budget_tests {
 
     pub(super) fn sample_config(game_seed: u64) -> SelfPlayConfig {
         SelfPlayConfig {
+            specialist_by_net: [None, None],
+            stop_after_moves: 0,
+            exclude_parked_from_budget: false,
             solve_endgames: true,
             solver_fallback_research: false,
             cheap_puct_root: None,

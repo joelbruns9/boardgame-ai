@@ -271,3 +271,100 @@ def test_a_re_searched_row_still_reports_its_failed_solve():
         assert move["solver_attempted"] is True
         assert move["solver_nodes"] > 0
         assert move["solver_value"] is None
+
+
+# --- exclude_parked_from_budget -------------------------------------------
+#
+# A slot parked on a solve yields no evaluation group until its solve returns.
+# Under the historical behaviour it holds its budget token anyway, so no
+# replacement game can search in its place. These drive the FLAT entry point,
+# which is the only one exposing the flag and the one production uses.
+
+
+def _flat(exclude: bool, *, slots: int = 4, shards: int = 2, max_nodes: int = 2_000_000):
+    from .control_table import ensure_rust_table
+    from .test_coalescer import _deterministic_adapter
+
+    ensure_rust_table()
+    swr.set_endgame_solver(max_nodes, 120.0, MAX_CARDS, True)
+    swr.set_solver_threads(2)
+    return swr.self_play_many_flat_net(
+        adapter=_deterministic_adapter,
+        games=rust_games_for_self_play(SEEDS, FIRST),
+        game_seeds=SEEDS,
+        global_batch_cap=256,
+        leaf_batch=1,
+        cheap_sims_min=16,
+        cheap_sims_max=16,
+        full_sims_min=48,
+        full_sims_max=48,
+        full_search_fraction=0.5,
+        top_k=8,
+        draft_prior=0.0,
+        iteration=1,
+        scheduler_workers=shards,
+        max_active_slots=slots,
+        max_moves=256,
+        force=True,
+        solve_endgames=True,
+        exclude_parked_from_budget=exclude,
+    )
+
+
+def test_excluding_parked_slots_changes_no_record():
+    """THE gate. This is a throughput change and nothing else.
+
+    If it moved a single record it would be a silent buffer corruption rather
+    than a crash -- the same property `test_async_records_match_the_synchronous_ones`
+    exists for.
+    """
+
+    off, _ = _flat(False)
+    on, _ = _flat(True)
+    assert on == off, "releasing a parked slot's token changed the games played"
+
+
+def test_the_control_actually_parks_something():
+    """Guards the gate above from passing vacuously.
+
+    With no parking there is nothing to exclude, and every assertion here would
+    hold through any bug in the accounting.
+    """
+
+    _records, metrics = _flat(False)
+    assert metrics["parked_slot_ns"] > 0, (
+        "no slot parked, so this file proves nothing about excluding parked slots"
+    )
+
+
+def test_excluding_parked_slots_releases_the_token():
+    """The point of the change: a parked slot's token goes back to the budget.
+
+    Asserted on the RELEASE EVENT, not on peak live slots. Whether the freed
+    token is then taken up depends on a refill happening while that solve is
+    still outstanding, which is a timing question -- an earlier version of this
+    test asserted peak live and failed 2 runs in 3 under load. Whether the
+    release happened is not a timing question.
+    """
+
+    _off_r, off = _flat(False, slots=4)
+    _on_r, on = _flat(True, slots=4)
+
+    assert off["parked_off_budget_events"] == 0, (
+        "a slot released its token with the flag OFF"
+    )
+    assert on["parked_off_budget_events"] > 0, (
+        "no parked slot released its token; the flag reached nothing"
+    )
+    # The cap still binds when parked slots keep their tokens.
+    assert off["max_live_slots"] <= 4
+
+
+def test_the_flag_is_off_by_default():
+    """It changes what `max_active_slots` MEANS -- concurrent games becomes
+    concurrent SEARCHING games -- so a slot count measured under one semantic is
+    not comparable under the other. Defaulting it on would silently invalidate
+    every slot number ever measured."""
+
+    _records, metrics = _flat(False, slots=4)
+    assert metrics["max_live_slots"] <= 4

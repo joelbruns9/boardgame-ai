@@ -766,6 +766,39 @@ ACROSS positions, which is what `rust_coalesced` does: each position becomes a
 one-move job (`stop_after_moves = 1`) on the ordinary self-play scheduler, so
 their leaves fill the same batches generation's do.
 
+### `--exclude-parked-from-budget`, `--no-exclude-parked-from-budget`
+
+**Default:** off.
+
+A slot parked on an endgame solve yields no evaluation group until the solve
+returns. By default it keeps its `--rust-slots` token anyway, so no replacement
+game can search in its place, and it still counts toward `active_count` — which
+divides the batch cap, tightening the row allowance of the slots that ARE
+working. This flag releases the token for the duration of the solve.
+
+**How much capacity is at stake** was unmeasurable until `parked_slot_ns`
+existed: `waiting_slot_ns` counts slots with an outstanding NN *request*, a
+different thing, and it reads 0 in both the cloud2 run and the laptop soak. On a
+toy config with the solver on, 64% of live slot-time was parked, against 0% with
+it off. Read that as "the mechanism can dominate", not as a box number — the toy
+runs 2M-node solves against 48-sim searches.
+
+**Records are byte-identical either way.** This is a throughput change and
+nothing else; `test_excluding_parked_slots_changes_no_record` is the gate.
+
+**It overdraws rather than blocks.** A resuming slot takes its activation back
+unconditionally, because refusing it would strand a solve outcome with nowhere
+to go. The overshoot is bounded by how many slots are parked at once, which the
+solver pool bounds, and a parked slot holds **no arena** (`SolvePending` carries
+no search session), so the extra concurrency costs a `GameState`, not a tree.
+Only a BORROWED token is released — each shard keeps one reservation as its
+deadlock guard, and that one never moves.
+
+**Off by default because it redefines `--rust-slots`**: concurrent games becomes
+concurrent SEARCHING games, so a slot count measured under one semantic is not
+comparable under the other. Measured at `--rust-slots 4`, peak live slots went
+from 4 to 8.
+
 ### `--double-reveal-offsets`
 
 **Default:** `0` (exhaustive). **Evidence favours `3`.**

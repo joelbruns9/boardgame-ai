@@ -2274,7 +2274,9 @@ mod forced_terminal_tests {
             &mut arena,
             vec![terminal_id, ordinary_id],
             &mut settled_count,
-        );
+            &LeafBias::NONE,
+        )
+        .expect("settling a terminal forced child cannot fail here");
         assert_eq!(settled_count, 1, "the settled child must be counted, not silent");
 
         assert_eq!(
@@ -2285,7 +2287,8 @@ mod forced_terminal_tests {
         let settled = &arena.nodes[terminal_id];
         assert_eq!(settled.visits, 1, "the edge's Q needs the child to count once");
         assert_eq!(settled.value_sum_p0, terminal_value_p0(&finished));
-        let (value, priors) = settled
+        // The third element is W4's outlook, added after this test was written.
+        let (value, priors, _outlook) = settled
             .cached_evaluation
             .as_ref()
             .expect("finalize_forced rejects a forced child with no evaluation");
@@ -2308,7 +2311,9 @@ mod forced_terminal_tests {
             .collect();
 
         let mut settled = 0;
-        assert!(settle_terminal_forced(&mut arena, ids, &mut settled).is_empty());
+        assert!(settle_terminal_forced(&mut arena, ids, &mut settled, &LeafBias::NONE)
+            .expect("settling cannot fail here")
+            .is_empty());
         assert_eq!(settled, 5, "every settled child must be counted");
     }
 }

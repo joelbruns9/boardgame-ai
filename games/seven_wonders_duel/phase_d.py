@@ -945,6 +945,21 @@ class PhaseDConfig:
     force_root_chance: bool = True
     age_deal_samples: int = 32
     cheap_double_reveal_offsets: int = 0
+    exclude_parked_from_budget: bool = False
+    """Let a slot parked on an endgame solve release its `--rust-slots` token.
+
+    A parked slot yields no evaluation group until its solve returns, so under
+    the default it holds capacity the GPU is not being fed from -- and it also
+    raises `active_count`, which tightens every working slot's row allowance.
+    Measured with the `parked_slot_ns` counter.
+
+    OFF by default because it changes what `--rust-slots` MEANS: concurrent
+    games becomes concurrent SEARCHING games, so a slot count measured under one
+    is not comparable under the other. Records are byte-identical either way
+    (`test_excluding_parked_slots_changes_no_record`); this is a throughput
+    change and nothing else.
+    """
+
     double_reveal_offsets: int = 0
     """Offsets per first-reveal stratum on pure double card-reveal edges, FULL
     searches. 0 is exhaustive.
@@ -4280,6 +4295,7 @@ class PhaseDLoop:
                 self.config.cheap_double_reveal_offsets
             ),
             double_reveal_offsets=self.config.double_reveal_offsets,
+            exclude_parked_from_budget=self.config.exclude_parked_from_budget,
             max_inflight_batches=self.config.rust_max_inflight_batches,
             scheduler_workers=self.config.rust_scheduler_workers,
             max_active_slots=self.config.rust_slots,
@@ -7104,6 +7120,15 @@ def build_parser() -> argparse.ArgumentParser:
         "it puts most of the noise mass on one arbitrary move.",
     )
     parser.add_argument(
+        "--exclude-parked-from-budget",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="let a slot parked on an endgame solve release its --rust-slots "
+        "token so another game searches in its place. Changes what --rust-slots "
+        "means (concurrent games -> concurrent SEARCHING games), so slot counts "
+        "are not comparable across the two. Measure with parked_slot_ns.",
+    )
+    parser.add_argument(
         "--double-reveal-offsets",
         type=int,
         default=0,
@@ -7752,6 +7777,7 @@ def main(argv=None) -> int:
         dirichlet_alpha=args.dirichlet_alpha,
         cheap_double_reveal_offsets=args.cheap_double_reveal_offsets,
         double_reveal_offsets=args.double_reveal_offsets,
+        exclude_parked_from_budget=args.exclude_parked_from_budget,
         anchor_gate_every_promotions=args.anchor_gate_every_promotions,
         anchor_games=args.anchor_games,
         anchor_every_iterations=args.anchor_every_iterations,
