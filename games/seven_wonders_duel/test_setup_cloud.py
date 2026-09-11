@@ -2681,3 +2681,42 @@ def test_the_target_share_is_a_knob_with_headroom(setup_text):
     )
     assert match, "the target share is not a knob"
     assert 0.0 < float(match.group(1)) <= 1.0
+
+
+def test_the_rehearsal_covers_the_solver_sizing_stage(rehearsal_text, setup_text):
+    """Stage 8c is the newest thing the launcher does, and the rehearsal exists
+    to prove the box's pipeline on a laptop first. It must measure the rate the
+    way stage 6b does -- CONTENDED -- because the single-thread figure measured
+    1.77x higher here, and a budget sized off it is optimistic by that factor."""
+
+    assert "measure_node_rate_contended" in rehearsal_text, (
+        "the rehearsal measures an uncontended rate the box does not use"
+    )
+    assert "games.seven_wonders_duel.solver_sizing" in rehearsal_text
+    # Against the SHIPPED corpus, or the artifact that actually travels to the
+    # box is the one thing never tested.
+    assert "solver_corpus.json" in rehearsal_text
+    del setup_text
+
+
+def test_the_rehearsal_checks_the_clock_cannot_bind(rehearsal_text):
+    """If the wall clock stops a solve before the node budget does, a
+    node-censored decline becomes a load-dependent one and the buffer stops
+    being a function of its seeds."""
+
+    assert "rate_for_check" in rehearsal_text
+    assert "depend on machine load" in rehearsal_text
+
+
+def test_the_unexercised_wait_axis_reports_the_actionable_cause(rehearsal_text):
+    """A positive wait is dropped at one shard by construction, so when the
+    geometry stage picks a single shard the batching stage runs its whole wait
+    axis at 0. A bare `len(waits) < 2` check ahead of that diagnosis swallows
+    it and reports a grid the operator got wrong instead of a re-run flag."""
+
+    assert "REHEARSE_WORKERS_CSV=2,4" in rehearsal_text
+    specific = rehearsal_text.index("the wait axis was not exercised")
+    generic = rehearsal_text.index("coalescing wait did not vary")
+    assert specific < generic, (
+        "the generic branch runs first and swallows the specific diagnosis"
+    )

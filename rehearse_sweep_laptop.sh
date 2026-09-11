@@ -23,6 +23,10 @@
 #   │   the winner, and `swept_axes` carrying "stage A measured the split"     │
 #   │   through to SOLVER_THREADS -- which stage B's own summary denies        │
 #   │ · `--sims-divisor` reaching the config and being recorded as provenance  │
+#   │ · stage 6b's CONTENDED node-rate measurement, and stage 8c's solver       │
+#   │   sizing crossing it with the shipped corpus -- ending in solver caps in  │
+#   │   the same env file pass 2 sources, with the clock proven slack against   │
+#   │   the node budget at the rate just measured                              │
 #   │ · the games-per-point requirement and the grid arithmetic                │
 #   └──────────────────────────────────────────────────────────────────────────┘
 #
@@ -61,6 +65,12 @@
 #                         divides the run's 1600-simulation search; here it
 #                         divides the harness defaults, which is enough to prove
 #                         the flag reaches the config and is recorded.
+#   REHEARSE_RATE_THREADS=4   threads for the contended rate measurement. The
+#                         single-thread figure overstates per-thread capacity --
+#                         measured 1.41M nodes/s/thread at 1 against 795k at 8 on
+#                         this laptop, 1.77x apart -- which is why stage 6b
+#                         measures it contended and why this rehearses that.
+#   REHEARSE_TARGET_SHARE=0.80  fraction of solver capacity the caps may commit.
 #   REHEARSE_DEVICE=cuda
 # =============================================================================
 set -euo pipefail
@@ -202,12 +212,59 @@ say "Translating both sweeps into measured_env.sh"
   --sweep-dir "$OUT" --gate-rung 20 \
   || die "could not summarise the sweeps"
 
+# ── Stage 6b's rate measurement, and stage 8c's solver sizing ───────────────
+#
+# Both are box stages, and both are rehearsed here for the same reason the
+# staged sweep is: the launcher runs them, so a rehearsal that skips them proves
+# a pipeline nobody is going to run.
+#
+# The rate is measured CONTENDED, which is the whole point of it. On this laptop
+# the single-thread figure is 1.41M nodes/s/thread and eight threads give 795k --
+# 1.77x apart, so a budget sized off the uncontended number is 1.77x optimistic.
+# Few threads and a small budget here: this is a plumbing check, and the NUMBER
+# belongs to whichever box measured it.
+say "Solver node rate (CONTENDED, as stage 6b measures it)"
+RATE="$("$PY" - "${REHEARSE_RATE_THREADS:-4}" <<'PYRATE'
+import sys
+from games.seven_wonders_duel.endgame_trigger_study import measure_node_rate_contended
+out = measure_node_rate_contended(
+    max(1, int(sys.argv[1])), max_nodes=2_000_000, max_secs=30.0
+)
+print(int(out["nodes_per_second_per_thread"]))
+print(
+    f"  {out['threads']} threads: {out['nodes_per_second_per_thread']:,.0f} "
+    f"nodes/s/thread, parallel efficiency {out['parallel_efficiency']:.2f}",
+    file=sys.stderr,
+)
+PYRATE
+)"
+RATE="$(printf '%s' "$RATE" | head -1)"
+[ "${RATE:-0}" -gt 0 ] || die "the contended rate measurement produced nothing"
+
+# The corpus is the SHIPPED one -- cloud2's endgames, priced once. That is the
+# artifact a rented box reads, so rehearsing against anything else would leave
+# the file that actually travels untested.
+say "Sizing the solver caps (stage 8c) from the shipped corpus"
+"$PY" -m games.seven_wonders_duel.solver_sizing \
+  --corpus "$REPO/games/seven_wonders_duel/solver_corpus.json" \
+  --rate "$RATE" \
+  --threads "${REHEARSE_RATE_THREADS:-4}" \
+  --generation-wall-seconds 4422 \
+  --games 1000 \
+  --target-share "${REHEARSE_TARGET_SHARE:-0.80}" \
+  --output "$OUT/solver_env.sh" \
+  || die "solver sizing failed"
+cat "$OUT/solver_env.sh" >> "$OUT/measured_env.sh"
+
 # ── Assertions ──────────────────────────────────────────────────────────────
 say "Checking the infrastructure"
-"$PY" - "$OUT" <<'PYCHECK' || die "infrastructure check failed"
+"$PY" - "$OUT" "$RATE" <<'PYCHECK' || die "infrastructure check failed"
 import json, pathlib, subprocess, sys
 
 out = pathlib.Path(sys.argv[1])
+# The rate stage 6b measured, so the clock check below asks the question that
+# matters: does the wall clock stop a solve before the node budget does?
+rate_for_check = int(sys.argv[2])
 payload = json.loads(
     (out / "generation" / "phase_d_sweep.json").read_text(encoding="utf-8")
 )
@@ -287,15 +344,21 @@ single = [row for row in summary if row["scheduler_workers"] == 1]
 # the wait. That is a real gap in the rehearsal, not a failure of the code, and
 # it is reported as such with the way to close it.
 sharded_waits = sorted({row.get("inference_wait_ms", 0.0) for row in sharded})
-if len(waits) < 2:
-    problems.append(f"coalescing wait did not vary: {waits}")
-elif len(sharded_waits) < 2:
+# ORDER MATTERS. The single-shard case collapses the union to {0.0}, so a bare
+# `len(waits) < 2` first swallows exactly the case the branch below exists to
+# explain -- and reports "the wait did not vary" where the truth is "the
+# geometry stage picked one shard, so the wait axis was dropped for it". The
+# first is a grid the operator got wrong; the second is a re-run with a flag.
+if len(sharded) and len(sharded_waits) < 2 or (not sharded and len(waits) < 2):
     problems.append(
-        f"the wait varied ({waits}) but only at ONE shard, where it is dropped "
-        "by construction -- the geometry stage picked a single shard, so the "
-        "wait plumbing was not exercised. Re-run with REHEARSE_WORKERS_CSV=2,4 "
-        "to force a multi-shard winner."
+        f"the wait axis was not exercised (waits seen: {waits}). A positive "
+        "wait is dropped at one shard by construction -- one submitter has "
+        "nothing to merge with -- so when the geometry stage picks a single "
+        "shard the batching stage runs its whole wait axis at 0. Re-run with "
+        "REHEARSE_WORKERS_CSV=2,4 to force a multi-shard winner."
     )
+elif len(waits) < 2:
+    problems.append(f"coalescing wait did not vary: {waits}")
 if not sharded:
     problems.append("no multi-shard point, so coalescing could not be exercised")
 elif not any(row.get("median_requests_per_forward", 0.0) > 1.0 for row in sharded):
@@ -395,6 +458,44 @@ if divisor < 1:
     problems.append("the sweep recorded no sims_divisor; provenance is missing")
 else:
     print(f"  sims divisor recorded: {divisor}x")
+
+# 8. Stage 8c's solver caps reached the SAME file pass 2 sources. Two files to
+#    source is one file to forget, and the geometry and the caps were measured
+#    beside each other -- taking one without the other launches a run whose
+#    solver was sized against a machine it is not running on.
+if not env.is_file():
+    problems.append("measured_env.sh missing; the solver caps had nowhere to go")
+else:
+    text = env.read_text(encoding="utf-8")
+    for name in ("ENDGAME_SOLVER_ATTEMPT_NODES", "ENDGAME_SOLVER_MAX_NODES",
+                 "ENDGAME_SOLVER_MAX_SECS"):
+        if f"export {name}=" not in text:
+            problems.append(f"{name} is absent; stage 8c did not reach the env file")
+    probe = subprocess.run(
+        ["bash", "-c",
+         f'source "{env.as_posix()}"; '
+         'echo "$ENDGAME_SOLVER_ATTEMPT_NODES|$ENDGAME_SOLVER_MAX_NODES'
+         '|$ENDGAME_SOLVER_MAX_SECS"'],
+        capture_output=True, text=True,
+    )
+    if probe.returncode != 0:
+        problems.append(f"measured_env.sh stopped sourcing once the caps were "
+                        f"appended: {probe.stderr.strip()}")
+    else:
+        bar, cap, secs = probe.stdout.strip().split("|")
+        if bar and cap and int(bar) > int(cap):
+            problems.append(
+                f"the attempt bar ({bar}) is above the timeout ({cap}): every "
+                "position admitted there would spend the timeout in full"
+            )
+        # The clock must not be the thing that stops a solve, or a node-censored
+        # decline becomes a load-dependent one.
+        if cap and secs and int(secs) * int(rate_for_check) <= int(cap):
+            problems.append(
+                f"the clock ({secs}s) binds before the node budget ({cap}) at "
+                "the measured rate; declines would depend on machine load"
+            )
+        print(f"  solver caps -> bar={bar} timeout={cap} clock={secs}s")
 
 if problems:
     print("\n".join(f"  - {p}" for p in problems))
