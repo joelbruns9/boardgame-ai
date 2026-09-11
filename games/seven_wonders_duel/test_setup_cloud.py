@@ -1649,6 +1649,70 @@ def test_the_measured_wording_is_only_used_when_it_was_measured(setup_text):
     assert "NOT measured on this box" in setup_text
 
 
+def test_the_sweep_installs_the_solver_node_budget(setup_text):
+    """Threads alone measure nothing.
+
+    `f4_phase_d_sweep` gates solving on `solver_threads > 0 AND
+    solver_max_nodes > 0`, and this stage passed only the first -- so
+    `solver_wants` refused every position and the core-split axis measured a
+    solver that never ran. That is the defect THROUGHPUT_LEVERS.md section 3.1
+    records, on a run where the solver took 22-37% of generation wall, and
+    `rehearse_sweep_laptop.sh` already asserts against it.
+
+    The RUN's budget, not a sweep-specific one: a split measured against a
+    cheaper solver is a split for a run nobody is launching.
+    """
+
+    block = _block(setup_text, "SWEEP_SOLVER_ARGS=()", "  else")
+    assert "--solver-max-nodes" in block, (
+        "the sweep configures solver threads without a node budget, so every "
+        "point runs with solving disabled"
+    )
+    assert "$ENDGAME_SOLVER_MAX_NODES" in block, (
+        "the sweep must use the run's own budget"
+    )
+
+
+def test_the_sweep_asserts_the_solver_actually_solved(setup_text):
+    """Liveness, not configuration.
+
+    Asserting that threads were CONFIGURED is exactly what let the missing node
+    budget go unnoticed -- every point reported a split and none of them solved
+    anything.
+    """
+
+    assert "solves_attempted" in setup_text, (
+        "nothing checks that the swept solver did any work"
+    )
+    index = setup_text.index("solves_attempted")
+    window = setup_text[max(0, index - 2000) : index + 2000]
+    assert "measured a solver that never ran" in window, (
+        "the solves_attempted check does not stop the run"
+    )
+
+
+def test_the_worker_count_is_swept_rather_than_pinned(setup_text):
+    """Defaulting the axis to the shipped value sweeps ONE point.
+
+    That is the same shape as measuring one solver split and reporting it as
+    the answer: the grid returns the setting it was given and nothing about it
+    was measured. Shard count decides whether the CPU can keep the coalesced
+    batch full, and post-coalescer it no longer fragments batches, so there is
+    no longer a reason to hold it fixed.
+
+    Centred on the shipped value so the current setting is always IN the grid:
+    a sweep that cannot return today's configuration cannot say it was right.
+    """
+
+    assert "SWEEP_WORKERS_DEFAULT" in setup_text
+    assert '--workers "${SWEEP_WORKERS_CSV:-$SWEEP_WORKERS_DEFAULT}"' in setup_text, (
+        "the workers axis still defaults to the single shipped value"
+    )
+    block = _block(setup_text, 'SWEEP_WORKERS_DEFAULT="${SWEEP_WORKERS_DEFAULT:-', "  )}")
+    assert "RUST_SCHEDULER_WORKERS / 2" in block
+    assert "RUST_SCHEDULER_WORKERS * 2" in block
+
+
 def test_the_sweep_measures_the_generation_solver_core_split(setup_text):
     """The split is contended -- the solver runs synchronously inside a shard,
     so a thread given to it is a thread taken from leaf production. A single

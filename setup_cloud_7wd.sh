@@ -850,6 +850,22 @@ else
     elif [ -n "$SOLVER_THREADS" ]; then
       SWEEP_SOLVER_ARGS=(--solver-threads "$SOLVER_THREADS")
     fi
+    # THE NODE BUDGET, without which threads measure nothing.
+    #
+    # `f4_phase_d_sweep` gates solving on `solver_threads > 0 AND
+    # solver_max_nodes > 0`, and this stage passed only the first. So every
+    # point ran with `solver_wants` refusing every position: the core-split axis
+    # measured a solver that never ran, which is the defect THROUGHPUT_LEVERS.md
+    # section 3.1 records -- on a run where the solver took 22-37% of generation
+    # wall. `rehearse_sweep_laptop.sh` asserts against it; this script
+    # reintroduced it.
+    #
+    # The RUN's budget, not a sweep-specific one: a split measured against a
+    # cheaper solver is a split for a run nobody is launching.
+    SWEEP_SOLVER_ARGS+=(
+      --solver-max-nodes "$ENDGAME_SOLVER_MAX_NODES"
+      --solver-max-secs "$ENDGAME_SOLVER_MAX_SECS"
+    )
   else
     # The solver is off for this run, so a split has nothing to divide.
     SWEEP_SOLVER_ARGS=(--solver-threads 0)
@@ -865,6 +881,22 @@ else
   # cannot silently reintroduce it. 3 games per slot is the steady-state
   # threshold; ramp and drain otherwise dominate and they favour small slot
   # counts.
+  # Workers is an AXIS, not the shipped value. Defaulting it to
+  # $RUST_SCHEDULER_WORKERS swept ONE point and reported it as the optimum --
+  # the same shape as measuring one solver split and calling it the answer.
+  # Shard count decides whether the CPU can walk trees fast enough to keep the
+  # coalesced batch full, and post-coalescer it no longer fragments batches, so
+  # there is no longer a reason to hold it fixed.
+  #
+  # Centred on the shipped value, so the current setting is always IN the grid:
+  # a sweep that cannot return today's configuration cannot tell you it was right.
+  SWEEP_WORKERS_DEFAULT="${SWEEP_WORKERS_DEFAULT:-$(
+    printf '%s,%s,%s' \
+      "$(( RUST_SCHEDULER_WORKERS / 2 > 0 ? RUST_SCHEDULER_WORKERS / 2 : 1 ))" \
+      "$RUST_SCHEDULER_WORKERS" \
+      "$(( RUST_SCHEDULER_WORKERS * 2 ))"
+  )}"
+
   SWEEP_MAX_SLOTS="$(printf '%s' "${SWEEP_SLOTS_CSV:-128,256,512}" | tr ',' '\n' \
     | sort -n | tail -1)"
   SWEEP_GENERATION_GAMES="${SWEEP_GENERATION_GAMES:-$((SWEEP_MAX_SLOTS * 3))}"
@@ -885,13 +917,38 @@ else
     --slots "${SWEEP_SLOTS_CSV:-128,256,512}" \
     --caps "${SWEEP_CAPS_CSV:-1024,2048}" \
     --inflight "${SWEEP_INFLIGHT_CSV:-1,2}" \
-    --workers "${SWEEP_WORKERS_CSV:-$RUST_SCHEDULER_WORKERS}" \
+    --workers "${SWEEP_WORKERS_CSV:-$SWEEP_WORKERS_DEFAULT}" \
     --inference-wait-ms "${SWEEP_INFERENCE_WAIT_CSV:-0,1,2}" \
     ${SWEEP_SOLVER_ARGS[@]+"${SWEEP_SOLVER_ARGS[@]}"} \
     --device cuda \
     --precision "$PRECISION" \
     || die "Generation sweep did not complete - see the error above. Nothing was measured, so this says nothing about the settings."
   ok "Generation sweep: $SWEEP_DIR/generation/phase_d_sweep.json"
+
+  # LIVENESS, not configuration. Asserting that solver threads were CONFIGURED
+  # is what let the missing node budget go unnoticed: every point reported a
+  # split and none of them solved anything. Assert the solver did work.
+  if [ "$ENDGAME_SOLVER_MAX_NODES" -gt 0 ]; then
+    "$PY" - "$SWEEP_DIR/generation/phase_d_sweep.json" <<'PYSOLVES'       || die "The generation sweep measured a solver that never ran. Its core-split and slot numbers describe a configuration this run will not use."
+import json, sys
+
+summary = json.loads(open(sys.argv[1], encoding="utf-8").read())["summary"]
+on = [row for row in summary if row.get("solver_threads_total", 0) > 0]
+if not on:
+    print("  no sweep point ran with the solver on; nothing to check")
+    raise SystemExit(0)
+attempted = sum(row.get("solves_attempted", 0) for row in on)
+if attempted == 0:
+    print(
+        f"  {len(on)} points configured solver threads and attempted ZERO "
+        "solves",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+answered = sum(row.get("solves_answered", 0) for row in on)
+print(f"  solver LIVE across {len(on)} points: {attempted} attempted, {answered} answered")
+PYSOLVES
+  fi
 
   # Sweep the ladder's *lowest* rung: the gate optimum measured stable across
   # 100/200/600-game gates on the laptop 3070, so the cheap rung answers the
