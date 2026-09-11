@@ -774,8 +774,8 @@ Build the config, write it as a manifest-shaped `{"config": {...}}` JSON, and
 exit without training.
 
 The throughput sweep must measure the RUN's architecture and search budget --
-`f4_phase_d_sweep --config-from-manifest` exists for exactly that, and its own
-docstring records what happens without it: "roughly 50 simulations a move
+`f4_phase_d_sweep`'s config-from-manifest input exists for exactly that, and its
+own docstring records what happens without it: "roughly 50 simulations a move
 instead of the run's measured 522, under a different search algorithm... the
 optimum found that way belongs to a machine nobody is running."
 
