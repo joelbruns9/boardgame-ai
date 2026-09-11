@@ -674,6 +674,118 @@ def measure_node_rate(samples: int = 8) -> float:
     return rates[len(rates) // 2]
 
 
+def endgame_positions(count: int, *, cards: tuple[int, ...] = (9, 10)) -> list:
+    """Real Age III endgames, as Rust games ready to solve.
+
+    Split out of `measure_node_rate` so a benchmark can generate the positions
+    ONCE and then time them under whatever thread count it likes. Generating
+    them inside the timed region would measure bot play as well as solving.
+    """
+
+    from .encoder_audit import DEFAULT_PAIRINGS, make_bot
+    from .engine import apply_action
+    from .game import new_game
+
+    out = []
+    for index in range(1000):
+        left, right = DEFAULT_PAIRINGS[index % len(DEFAULT_PAIRINGS)]
+        game = new_game(index)
+        bots = (make_bot(left, index), make_bot(right, index + 10_000))
+        while game.phase is not Phase.COMPLETE:
+            if game.phase is Phase.PLAY_AGE and game.age == 3:
+                present = sum(1 for c in game.tableau.cards.values() if c.present)
+                if present in cards:
+                    out.append(rust_game_from_state(game.clone()))
+                    break
+            actor = (
+                game.pending_choice.player
+                if game.pending_choice is not None
+                else game.active_player
+            )
+            apply_action(game, bots[actor].select_action(game))
+        if len(out) >= count:
+            break
+    return out
+
+
+def measure_node_rate_contended(
+    threads: int,
+    *,
+    positions: list | None = None,
+    max_nodes: int = 40_000_000,
+    max_secs: float = 60.0,
+) -> dict:
+    """Nodes per second PER THREAD with `threads` solves running at once.
+
+    `measure_node_rate` times one solve at a time, and says so -- it returns
+    "this machine's single-thread solver rate". A run does not solve that way:
+    it runs `--solver-threads` x `--rust-scheduler-workers` of them beside four
+    generation shards, and the per-thread rate falls under that contention. The
+    re-solve study measured 857,015 nodes/s/thread across 8 threads where the
+    uncontended figure is higher, so sizing a node budget off the single-thread
+    number overstates the box's capacity by whatever the contention costs.
+
+    Accounted the way `resolve_censored` does it: TOTAL nodes divided by TOTAL
+    thread-seconds, which is the per-thread rate a budget calculation wants.
+    Wall time is reported too, since the ratio of the two is the parallel
+    efficiency and that is the number that says whether more threads help.
+
+    Declined solves count. They visited real nodes for real time, which is
+    exactly what is being measured -- and they are also the positions a run
+    spends most of its wasted budget on.
+    """
+
+    import concurrent.futures
+    import time
+
+    if threads < 1:
+        raise ValueError("threads must be at least 1")
+    if positions is None:
+        positions = endgame_positions(max(threads * 2, 8))
+    if not positions:
+        raise RuntimeError("could not generate a single endgame to time")
+
+    def one(game):
+        started = time.perf_counter()
+        answer = game.solve_endgame(max_nodes, max_secs, "exact", "star1")
+        return int(answer["nodes"]), time.perf_counter() - started
+
+    wall_started = time.perf_counter()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool:
+        results = list(pool.map(one, positions))
+    wall = time.perf_counter() - wall_started
+
+    nodes = sum(n for n, _ in results)
+    thread_seconds = sum(s for _, s in results)
+    return {
+        "threads": threads,
+        "positions": len(positions),
+        "nodes": nodes,
+        "thread_seconds": thread_seconds,
+        "wall_seconds": wall,
+        "nodes_per_second_per_thread": nodes / thread_seconds if thread_seconds else 0.0,
+        # Aggregate throughput, which is what a budget is actually spent from.
+        "nodes_per_second_total": nodes / wall if wall else 0.0,
+        # 1.0 means the threads did not interfere at all. Below ~0.7 the box is
+        # giving back most of what each extra thread was supposed to buy.
+        "parallel_efficiency": (thread_seconds / wall / threads) if wall and threads else 0.0,
+    }
+
+
+def contention_curve(thread_counts: tuple[int, ...], **kwargs) -> list[dict]:
+    """`measure_node_rate_contended` across thread counts, on ONE position set.
+
+    The same positions at every point, so the curve is a property of the box
+    rather than of which endgames each point happened to draw.
+    """
+
+    positions = endgame_positions(max(max(thread_counts) * 2, 8))
+    return [
+        measure_node_rate_contended(threads, positions=positions, **kwargs)
+        for threads in thread_counts
+    ]
+
+
 def calibrate(rows: list[dict], rate: float, seconds_per_game: float, games: int) -> dict:
     """Pick the deepest cap and budget that fit a per-game time allowance.
 

@@ -432,6 +432,13 @@ ENDGAME_SOLVER_ATTEMPT_NODES="${ENDGAME_SOLVER_ATTEMPT_NODES:-0}"
 # why it is set BEFORE stage 8b rather than after: the sweep must tune the slot
 # axis under the regime the run will use, or its optimum belongs to the other one.
 EXCLUDE_PARKED_FROM_BUDGET="${EXCLUDE_PARKED_FROM_BUDGET:-1}"
+# How much of the box's measured solver capacity the caps are allowed to commit.
+#
+# Not 100%: the corpus that prices the workload was built at one net's strength,
+# and a run reaches different endgames as it improves. Solves also land unevenly
+# across an iteration. The headroom is for both -- sized to the last node of a
+# measured capacity, the first iteration whose endgames run rich is a late one.
+SOLVER_TARGET_SHARE="${SOLVER_TARGET_SHARE:-0.80}"
 ENDGAME_COST_MODEL="${ENDGAME_COST_MODEL:-games/seven_wonders_duel/endgame_cost_model.json}"
 SOLVER_FALLBACK_RESEARCH="${SOLVER_FALLBACK_RESEARCH:-1}"
 
@@ -758,30 +765,6 @@ stage 6b "Solver sizing (node rate, safety clock, thread split)"
 
 # Node counts are machine-independent; the RATE is the only machine-specific
 # term, so it is measured here rather than assumed. One minute.
-NODE_RATE="$("$PY" - <<'PYRATE'
-try:
-    from games.seven_wonders_duel.endgame_trigger_study import measure_node_rate
-    print(int(measure_node_rate()))
-except Exception:
-    print(0)
-PYRATE
-)"
-
-if [ "${NODE_RATE:-0}" -gt 0 ]; then
-  ok "Solver rate on this box: $((NODE_RATE / 1000000))M nodes/s"
-else
-  NODE_RATE=1200000
-  warn "Could not measure the solver's node rate; assuming a conservative ${NODE_RATE}."
-fi
-
-if [ -z "$ENDGAME_SOLVER_MAX_SECS" ]; then
-  # (nodes / rate) x 5. Generous enough never to bind, so the node budget stays
-  # the cutoff and a decline remains a property of the POSITION rather than of
-  # how busy the box was.
-  ENDGAME_SOLVER_MAX_SECS="$(( (ENDGAME_SOLVER_MAX_NODES / NODE_RATE + 1) * 5 ))"
-  ok "Derived --endgame-solver-max-secs ${ENDGAME_SOLVER_MAX_SECS}s from a ${ENDGAME_SOLVER_MAX_NODES}-node budget."
-fi
-
 # One thread solves one position; there is no intra-tree parallelism. So the
 # total solver thread count IS the number of concurrent solves, and the split is
 # simply: cores that are not feeding the GPU go to solving.
@@ -820,6 +803,69 @@ if [ -z "$SOLVER_THREADS" ]; then
   [ "$SOLVER_THREADS" -lt 1 ] && SOLVER_THREADS=1
 fi
 _total_solver=$(( SOLVER_THREADS * GENERATION_THREADS ))
+# The count the rate is measured at: the run's TOTAL concurrent solves. Measuring
+# at any other number would price a contention level this run never reaches.
+SOLVER_RATE_THREADS="${SOLVER_RATE_THREADS:-$_total_solver}"
+
+# THE THREAD SPLIT FIRST, because the rate below is measured AT it.
+#
+# This used to run after the rate measurement, which was fine while that
+# measurement was single-threaded and the count did not matter. It measures
+# contention now, so it needs to know how many threads to contend.
+
+# CONTENDED, not single-thread.
+#
+# `measure_node_rate` returns "this machine's single-thread solver rate", and
+# says so. A run does not solve that way: it runs --solver-threads x
+# --rust-scheduler-workers of them beside the generation shards, and the
+# per-thread rate falls under that contention. The re-solve study measured
+# 857,015 nodes/s/thread across 8 threads. Sizing a node budget off the
+# uncontended figure overstates this box's capacity by whatever contention costs,
+# and the budget is what decides the solver's caps at stage 8c.
+#
+# Measured at the thread count this run will actually use, on one shared set of
+# real Age III endgames so the curve is a property of the box rather than of
+# which positions each point drew.
+NODE_RATE="$("$PY" - "$SOLVER_RATE_THREADS" <<'PYRATE'
+import sys
+try:
+    from games.seven_wonders_duel.endgame_trigger_study import (
+        measure_node_rate_contended,
+    )
+    wanted = max(1, int(sys.argv[1]))
+    out = measure_node_rate_contended(wanted)
+    # Per-thread, which is what `budget = threads x wall x rate` multiplies.
+    print(int(out["nodes_per_second_per_thread"]))
+    print(
+        f"  {out['threads']} threads: "
+        f"{out['nodes_per_second_per_thread']:,.0f} nodes/s/thread, "
+        f"{out['nodes_per_second_total']:,.0f} total, "
+        f"parallel efficiency {out['parallel_efficiency']:.2f}",
+        file=sys.stderr,
+    )
+except Exception as exc:
+    print(0)
+    print(f"  rate measurement failed: {exc}", file=sys.stderr)
+PYRATE
+)"
+NODE_RATE="$(printf '%s' "$NODE_RATE" | head -1)"
+
+if [ "${NODE_RATE:-0}" -gt 0 ]; then
+  ok "Solver rate on this box: $((NODE_RATE / 1000))k nodes/s/thread at $SOLVER_RATE_THREADS threads"
+else
+  NODE_RATE=1200000
+  warn "Could not measure the solver's node rate; assuming a conservative ${NODE_RATE}."
+  warn "Stage 8c will size the solver caps against a rate nobody measured."
+fi
+
+if [ -z "$ENDGAME_SOLVER_MAX_SECS" ]; then
+  # (nodes / rate) x 5. Generous enough never to bind, so the node budget stays
+  # the cutoff and a decline remains a property of the POSITION rather than of
+  # how busy the box was.
+  ENDGAME_SOLVER_MAX_SECS="$(( (ENDGAME_SOLVER_MAX_NODES / NODE_RATE + 1) * 5 ))"
+  ok "Derived --endgame-solver-max-secs ${ENDGAME_SOLVER_MAX_SECS}s from a ${ENDGAME_SOLVER_MAX_NODES}-node budget."
+fi
+
 if [ -z "${RUST_SCHEDULER_WORKERS_MEASURED:-}" ]; then
   warn "--rust-scheduler-workers=$RUST_SCHEDULER_WORKERS is a PLACEHOLDER, not a"
   warn "measurement. Stage 1 of the sweep finds the smallest value that saturates"
@@ -1318,6 +1364,56 @@ PYSOLVES
   "$PY" "$REPO_DIR/games/seven_wonders_duel/sweep_launch_env.py" \
     --sweep-dir "$SWEEP_DIR" --gate-rung "${_SWEEP_RUNGS[0]}" \
     || die "Could not summarise the sweeps."
+
+  # ── SOLVER CAPS, sized from this box rather than assumed ──────────────────
+  #
+  # The last input arrives here and not earlier: the solver's budget is
+  # `threads x GENERATION WALL x rate x share`, and the generation wall is what
+  # the sweep above just measured. Stage 6b supplied the other two.
+  #
+  # Everything else was priced once, off the box: `solver_corpus.json` holds the
+  # true node cost of every position a real run attempted, and node counts are a
+  # property of positions rather than of hardware. So this step solves rather
+  # than searches -- no solving happens here at all.
+  #
+  # Skipped, loudly, when the corpus is absent: sizing the caps off nothing would
+  # produce numbers indistinguishable from measured ones.
+  SOLVER_CORPUS="${SOLVER_CORPUS:-$REPO_DIR/games/seven_wonders_duel/solver_corpus.json}"
+  if [ ! -f "$SOLVER_CORPUS" ]; then
+    warn "No solver corpus at $SOLVER_CORPUS; leaving the solver caps at the"
+    warn "launcher's defaults (attempt bar $ENDGAME_SOLVER_ATTEMPT_NODES, timeout"
+    warn "$ENDGAME_SOLVER_MAX_NODES). Build one with solver_corpus.py."
+  else
+    _GEN_WALL="$("$PY" - "$SWEEP_DIR/generation/phase_d_sweep.json" "$GAMES_PER_ITERATION" <<'PYWALL'
+import json, sys
+# Seconds of GENERATION per iteration at the winning geometry. Not the whole
+# iteration: solving happens during generation, and charging the solver for
+# training time would inflate its budget by however long the learner runs.
+payload = json.loads(open(sys.argv[1], encoding="utf-8").read())
+best = (payload.get("staged") or {}).get("winner") or payload["summary"][0]
+rate = float(best["median_games_per_hour"])
+print(int(int(sys.argv[2]) / rate * 3600) if rate > 0 else 0)
+PYWALL
+)"
+    if [ "${_GEN_WALL:-0}" -gt 0 ]; then
+      "$PY" -m games.seven_wonders_duel.solver_sizing \
+        --corpus "$SOLVER_CORPUS" \
+        --rate "$NODE_RATE" \
+        --threads "$_total_solver" \
+        --generation-wall-seconds "$_GEN_WALL" \
+        --games "$GAMES_PER_ITERATION" \
+        --target-share "$SOLVER_TARGET_SHARE" \
+        --output "$SWEEP_DIR/solver_env.sh" \
+        || die "Could not size the solver caps from this box's measurements."
+      # Appended to the same file pass 2 sources, so there is ONE thing to
+      # source and no way to take the geometry without the caps it was
+      # measured beside.
+      cat "$SWEEP_DIR/solver_env.sh" >> "$SWEEP_DIR/measured_env.sh"
+      ok "Solver caps sized: $SWEEP_DIR/solver_env.sh"
+    else
+      warn "Could not read a generation rate from the sweep; solver caps left at defaults."
+    fi
+  fi
 
   warn "Sweeps measure but do not apply. To launch on this box's numbers:"
   warn "  source $SWEEP_DIR/measured_env.sh && bash \$0"

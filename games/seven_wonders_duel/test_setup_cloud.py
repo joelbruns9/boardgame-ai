@@ -2606,3 +2606,78 @@ def test_the_soak_runs_the_parked_slot_regime_the_box_runs(setup_text):
     assert "--exclude-parked-from-budget" in soak
     assert "ExcludeParkedFromBudget" in soak
     del setup_text
+
+
+# ---------------------------------------------------------------------------
+# Solver sizing: priced once off the box, measured on it
+# ---------------------------------------------------------------------------
+
+
+def test_the_node_rate_is_measured_under_contention(setup_text):
+    """`measure_node_rate` returns the SINGLE-THREAD rate and says so. A run
+    solves with --solver-threads x --rust-scheduler-workers of them beside the
+    generation shards, and the per-thread rate falls under that contention --
+    the re-solve study measured 857,015 nodes/s/thread across 8. Sizing a node
+    budget off the uncontended figure overstates the box."""
+
+    assert "measure_node_rate_contended" in setup_text
+    assert "SOLVER_RATE_THREADS" in setup_text
+
+
+def test_the_thread_split_is_decided_before_the_rate_is_measured(setup_text):
+    """The rate is now measured AT a thread count, so that count has to exist
+    first. It did not: the split used to be derived after the measurement,
+    which was harmless only while the measurement was single-threaded."""
+
+    split = setup_text.index("_total_solver=$(( SOLVER_THREADS * GENERATION_THREADS ))")
+    rate = setup_text.index("measure_node_rate_contended")
+    assert split < rate
+
+
+def test_the_solver_caps_are_sized_after_the_generation_sweep(setup_text):
+    """The budget is `threads x GENERATION WALL x rate x share`, and the wall is
+    what the sweep measures. Sizing before it would need a wall nobody had."""
+
+    swept = setup_text.index('stage 8b "Scheduler sweeps')
+    sized = setup_text.index("games.seven_wonders_duel.solver_sizing")
+    launch = setup_text.index("common::launch_detached")
+    assert swept < sized < launch
+
+
+def test_the_sizing_charges_the_solver_for_generation_not_the_iteration(setup_text):
+    """Solving happens during generation. Charging it for training time would
+    inflate its budget by however long the learner runs."""
+
+    block = _block(setup_text, "_GEN_WALL=\"$(\"$PY\" - ", "PYWALL")
+    assert "median_games_per_hour" in block
+    assert "GAMES_PER_ITERATION" in setup_text
+
+
+def test_a_missing_corpus_is_reported_rather_than_guessed_around(setup_text):
+    """Sizing the caps off nothing would produce numbers indistinguishable from
+    measured ones -- the same failure the pass-2 guard exists for."""
+
+    index = setup_text.index("SOLVER_CORPUS=")
+    block = setup_text[index : index + 700]
+    assert "No solver corpus" in block
+    assert "warn " in block
+
+
+def test_the_sized_caps_reach_the_file_pass_two_sources(setup_text):
+    """Two files to source is one file to forget. The geometry and the caps were
+    measured beside each other and have to travel together."""
+
+    assert 'cat "$SWEEP_DIR/solver_env.sh" >> "$SWEEP_DIR/measured_env.sh"' in setup_text
+
+
+def test_the_target_share_is_a_knob_with_headroom(setup_text):
+    """Not 100%: the corpus prices one net's endgames, and a run reaches
+    different ones as it strengthens."""
+
+    match = re.search(
+        r'^SOLVER_TARGET_SHARE="\$\{SOLVER_TARGET_SHARE:-([0-9.]+)\}"$',
+        setup_text,
+        re.M,
+    )
+    assert match, "the target share is not a knob"
+    assert 0.0 < float(match.group(1)) <= 1.0
