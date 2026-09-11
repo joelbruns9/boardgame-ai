@@ -3248,7 +3248,7 @@ fn set_endgame_cost_model(
             "cost model margin must be finite and non-negative",
         ));
     }
-    let mut fixed = [0.0_f64; 20];
+    let mut fixed = [0.0_f64; crate::cost_model::FEATURE_COUNT];
     fixed.copy_from_slice(&weights);
     self_play::set_endgame_cost_model(Some(crate::cost_model::CostModel {
         intercept,

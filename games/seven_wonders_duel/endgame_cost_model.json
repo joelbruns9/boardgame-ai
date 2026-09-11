@@ -1,21 +1,21 @@
 {
   "comment": "log10(nodes) for an exact endgame solve. Attempt iff prediction + margin_decades <= log10(node_budget). Features are exactly those seven_wonders_rust cost_model computes, in this order. Written by validate_cost_trigger --write-model; do not edit by hand.",
   "fit": {
-    "corpus": "C:\\Users\\joeld\\AppData\\Local\\Temp\\cloud_refit.json",
-    "positions": 2235,
-    "games": 221,
-    "censored_fraction": 0.0738255033557047,
+    "corpus": "C:\\Users\\joeld\\AppData\\Local\\Temp\\claude\\C--Users-joeld-projects-boardgame-ai\\55e8ea47-c469-4142-a792-95bbb94385b7\\scratchpad\\study_corpus.json",
+    "positions": 8013,
+    "games": 823,
+    "censored_fraction": 0.0008735804317983277,
     "censoring": {
-      "rows": 2235,
-      "censored": 165,
-      "censored_fraction": 0.0738255033557047,
+      "rows": 8013,
+      "censored": 7,
+      "censored_fraction": 0.0008735804317983277,
       "by_stop": {
-        "nodes": 165
+        "nodes": 7
       },
       "clock_bound": false
     },
     "holdout_fraction": 0.5,
-    "held_out_r2": 0.9359620055452775,
+    "held_out_r2": 0.9476194938377284,
     "method": "Tobit EM (fit_censored), right-censored at the study node budget; deadline-censored rows dropped"
   },
   "margin_decades": 0.4,
@@ -41,27 +41,27 @@
     "cards_x_logleg",
     "discard_x_revive"
   ],
-  "intercept": -0.005811129179750081,
+  "intercept": -0.0011966556203914095,
   "coefficients": {
-    "cards_left": 0.25368626695979246,
-    "unrevealed": -0.20008295114736255,
-    "accessible": 0.18987589379547842,
-    "legal": -0.030351186592940865,
-    "unbuilt_wonders": 0.15251837326510598,
-    "chance_wonders": 0.6583392469909862,
-    "revive_wonders": 0.3265342374143614,
-    "discard": -0.02800792836086206,
-    "coins": 0.0014752893245377065,
-    "military": -0.0316531139671158,
-    "vp_gap": 0.012524943277148138,
-    "science_max": 0.08270940265170741,
-    "science_threat": -0.3074392037328159,
-    "military_to_win": -0.01976126965491595,
-    "chance_fanout": 0.952194451305559,
-    "chance_fanout_max": 0.04551651009998845,
-    "pending_options": 0.05677766155504829,
-    "affordable_wonders": 0.12327749554911259,
-    "cards_x_logleg": 0.15225082271505552,
-    "discard_x_revive": 0.003210339008994868
+    "cards_left": 0.2814509415253935,
+    "unrevealed": -0.1090336607213042,
+    "accessible": 0.17778694583040222,
+    "legal": -0.01585244521295237,
+    "unbuilt_wonders": -0.025395518369969512,
+    "chance_wonders": 0.6563200415084312,
+    "revive_wonders": 0.0019553815212280026,
+    "discard": -0.009713775403066872,
+    "coins": 0.0013092010220694692,
+    "military": -0.025958009578705716,
+    "vp_gap": 0.005612097429455075,
+    "science_max": 0.01722108047807188,
+    "science_threat": -0.18466508874369897,
+    "military_to_win": -0.002071795721746453,
+    "chance_fanout": 0.9893753764907337,
+    "chance_fanout_max": 0.004626564867014648,
+    "pending_options": 0.05968831595229362,
+    "affordable_wonders": 0.23096426038430834,
+    "cards_x_logleg": 0.1193801848413472,
+    "discard_x_revive": 0.03732066507029158
   }
 }

@@ -25,7 +25,12 @@ use crate::state::{GameState, Phase};
 
 /// Feature order. Must equal `endgame_cost_model.json`'s `features`, which is
 /// `validate_cost_trigger.RUST_FEATURES`.
-pub const FEATURE_NAMES: [&str; 20] = [
+/// One place, so adding a feature cannot miss an array width. It was five
+/// sites before: the name list, the weight array, `predict`, `affordable` and
+/// `features` -- plus two more in other modules.
+pub const FEATURE_COUNT: usize = 20;
+
+pub const FEATURE_NAMES: [&str; FEATURE_COUNT] = [
     "cards_left",
     "unrevealed",
     "accessible",
@@ -53,13 +58,13 @@ pub const FEATURE_NAMES: [&str; 20] = [
 #[derive(Clone, Debug)]
 pub struct CostModel {
     pub intercept: f64,
-    pub weights: [f64; 20],
+    pub weights: [f64; FEATURE_COUNT],
     pub margin_decades: f64,
 }
 
 impl CostModel {
     /// Predicted `log10(nodes)` for a solve at this position.
-    pub fn predict(&self, features: &[f64; 20]) -> f64 {
+    pub fn predict(&self, features: &[f64; FEATURE_COUNT]) -> f64 {
         self.intercept
             + features
                 .iter()
@@ -87,7 +92,7 @@ impl CostModel {
     /// Only `budget` and `margin_decades` TOGETHER matter here, since the test
     /// is a comparison of their difference; the budget's separate job is
     /// deciding when an in-flight solve is abandoned.
-    pub fn affordable(&self, features: &[f64; 20], budget: u64) -> bool {
+    pub fn affordable(&self, features: &[f64; FEATURE_COUNT], budget: u64) -> bool {
         if budget == 0 {
             return false;
         }
@@ -111,7 +116,7 @@ fn unbuilt_named(state: &GameState, name: &str) -> usize {
 ///
 /// O(board) by construction: this runs before every candidate solve, so it must
 /// cost nothing next to the millions of nodes it is deciding about.
-pub fn features(state: &GameState) -> [f64; 20] {
+pub fn features(state: &GameState) -> [f64; FEATURE_COUNT] {
     let present: Vec<usize> = state
         .tableau
         .slots
@@ -139,7 +144,6 @@ pub fn features(state: &GameState) -> [f64; 20] {
         })
         .sum();
     let revive = unbuilt_named(state, "The Mausoleum");
-
     let military = state.conflict_position.abs();
     let vp_gap = (state.score_player(0).total - state.score_player(1).total).abs();
     let science_max = (0..2)

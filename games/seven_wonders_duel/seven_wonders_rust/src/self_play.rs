@@ -4734,10 +4734,10 @@ mod attempt_bar_tests {
         let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let model = crate::cost_model::CostModel {
             intercept: 7.0, // 10^7 = 10M nodes predicted, whatever the position
-            weights: [0.0; 20],
+            weights: [0.0; crate::cost_model::FEATURE_COUNT],
             margin_decades: 0.4,
         };
-        let features = [0.0f64; 20];
+        let features = [0.0f64; crate::cost_model::FEATURE_COUNT];
 
         // Pinned bar of 40M: 10^(7.0 + 0.4) = 25.1M <= 40M, so admitted...
         assert!(model.affordable(&features, 40_000_000));
