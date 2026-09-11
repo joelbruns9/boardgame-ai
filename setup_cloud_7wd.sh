@@ -89,6 +89,14 @@
 #                   sourcing measured_env.sh rather than by hand
 #   SWEEP_SLOTS_CSV / SWEEP_CAPS_CSV / SWEEP_INFLIGHT_CSV  generation grid
 #   SWEEP_SLOTS / SWEEP_CAPS  gate grid (space separated; different harness)
+#   SWEEP_SIMS_DIVISOR=4  run each sweep point at 1/N of the run's simulations,
+#                   with the solver's node budget divided by the same N. Buys
+#                   grid points with fidelity: the search algorithm and the
+#                   solver's share of occupancy survive, absolute games/hour
+#                   does not. Set 1 to measure the run's own search exactly.
+#   SWEEP_STAGE_A_INFLIGHT=1 / SWEEP_STAGE_A_WAIT_MS=0  where the staged sweep
+#                   pins the batching axes while it ranks geometry. Both must be
+#                   values that also appear in the corresponding axis.
 #   SWEEP_GENERATION_GAMES  games per sweep point. DERIVED from SWEEP_SLOTS_CSV
 #                         as 3x the largest slot count, because a point cannot
 #                         hold more games live than it is given: 200 games
@@ -503,6 +511,36 @@ SWEEP_MEASURED_FROM="${SWEEP_MEASURED_FROM:-}"
 # defaults" produce identical command lines otherwise.
 ALLOW_UNMEASURED_LAUNCH="${ALLOW_UNMEASURED_LAUNCH:-0}"
 
+# ── What stage 8b's sweep is allowed to cost ────────────────────────────────
+#
+# The sweep now runs the RUN's search (`--emit-config` plus
+# `--config-from-manifest`) instead of PhaseDConfig's laptop defaults. That was
+# the point -- simulations per move set the leaf arrival rate, which is what the
+# slot and worker axes act on -- and it made each grid point cost roughly what
+# an iteration of the run costs. These two knobs buy the box hours back, and
+# each one gives up something that can be stated.
+#
+# SWEEP_SIMS_DIVISOR runs every point at 1/N of the run's simulations, with the
+# solver's node budget divided by the same N so the solver keeps its share of
+# slot occupancy (measured per point as `parked_slot_fraction`). What survives:
+# the search algorithm, the cheap/full mix, top_k, the chance fan-out. What does
+# not: absolute throughput. games/hour from a divided sweep is about N times the
+# run's rate and is not a prediction of anything; the RATIOS between points are
+# the result. 1 measures the run's own search, at four times the cost.
+SWEEP_SIMS_DIVISOR="${SWEEP_SIMS_DIVISOR:-4}"
+# Where stage A sits on the stage-B axes while it ranks geometry. Both must
+# appear in SWEEP_INFLIGHT_CSV / SWEEP_INFERENCE_WAIT_CSV, which the driver
+# enforces: stage B then re-measures stage A's winning point, and the two
+# stages can be compared instead of merely concatenated.
+#
+# The wait pin is the one with a real cost. The coalescing wait is what recovers
+# cross-shard fragmentation, so at 0 a high shard count looks worse than it is,
+# and stage A is where the shard count is decided. Raise it to the wait the run
+# intends if the shard count is the decision you care about; leave it at 0 to
+# rank shards on their own merits.
+SWEEP_STAGE_A_INFLIGHT="${SWEEP_STAGE_A_INFLIGHT:-1}"
+SWEEP_STAGE_A_WAIT_MS="${SWEEP_STAGE_A_WAIT_MS:-0}"
+
 # ── Workstream switches (W1/W2/W3/W4/W5/W7) ─────────────────────────────────
 #
 # Every one of these defaults OFF in `phase_d`, and until now none was reachable
@@ -799,280 +837,26 @@ else
 fi
 stage_done 8
 
-# ── STAGE 8b: Scheduler sweeps (generation and gate, separately) ─────────────
+# ── The run's command line, assembled BEFORE the sweep that measures it ─────
 #
-# Generation and the gate need *different* settings, and the axes interact, so
-# both are swept jointly on the box that will run them. Measured on the laptop
-# 3070 (d128 L4, 64 sims, 100-game gates, games/s):
+# This used to live inside stage 10, after the sweeps. That order made stage 8b
+# structurally unable to measure the run: `f4_phase_d_sweep
+# --config-from-manifest` takes the RUN's architecture and search budget from a
+# manifest, the run's manifest does not exist until the run starts, and the only
+# other description of the run was the flag array sixty lines further down this
+# file. So the sweep fell back to `PhaseDConfig`'s defaults for everything the
+# launcher did not name -- Gumbel at 128 full simulations, to configure a PUCT
+# run at 1600.
 #
-#     slots \ cap     256      512     1024
-#     48 (shipped)   0.605    0.571    0.581
-#     144            0.752    0.816    0.840
+# `phase_d --emit-config` closes that by building the config from these flags
+# and writing it in the manifest shape. Which means the flags have to be
+# assembled first, and that is all this move is.
 #
-# The cap's *sign* flips with slot count: at 48 slots widening it costs 4%, at
-# 144 slots it gains 12%. Generation is pinned near 48 slots and is ~85% of an
-# iteration, so `--gate-global-batch-cap` exists to keep a gate-sized cap away
-# from it. Sweeping either axis alone concludes the shipped setting is optimal.
-#
-# One gate sweep is enough: the optimum is stable in gate size. 144 slots /
-# 1024 cap won at 100, 200 and 600 games on the laptop 3070, and the gain over
-# 48/256 barely moved (1.39x at 100 games, 1.37x at 600). GATE_SWEEP_RUNGS
-# defaults to the ladder's middle rung; pass more than one value if a box looks
-# unlike the others, since nothing guarantees that stability on new hardware.
-
-stage 8b "Scheduler sweeps (generation, then gate)"
-if [ "$SKIP_SWEEPS" = "1" ]; then
-  warn "SKIP_SWEEPS=1 — launching on defaults rather than this box's measurement."
-elif [ -z "${SWEEP_CHECKPOINT:-}" ]; then
-  warn "SWEEP_CHECKPOINT unset; skipping both sweeps. Phase D will run on"
-  warn "defaults measured on a different GPU. Set it to a W0 L checkpoint."
-else
-  SWEEP_DIR="$REPO_DIR/$RUN_DIR_REL/sweeps"
-  mkdir -p "$SWEEP_DIR"
-
-  # The generation/solver CORE SPLIT, as an axis rather than a constant.
-  #
-  # Generation and the endgame solver compete for the same physical cores, and
-  # the solver runs SYNCHRONOUSLY inside a scheduler shard -- so a thread given
-  # to it is a thread taken from leaf production, and the best split is a
-  # property of this box's core count, not of the algorithm. Until now this
-  # stage passed a single fixed --solver-threads, which measures one split and
-  # reports it as the answer.
-  #
-  # Swept as a TOTAL, because --solver-threads is per shard and the worker count
-  # is itself an axis: holding "threads per shard" fixed across worker counts
-  # would silently vary the total, and the total is what competes with
-  # generation. `f4_phase_d_sweep --solver-threads-total` divides at each point.
-  SWEEP_SOLVER_ARGS=()
-  if [ "$ENDGAME_SOLVER_MAX_NODES" -gt 0 ]; then
-    if [ -n "${SWEEP_SOLVER_THREADS_CSV:-}" ]; then
-      SWEEP_SOLVER_ARGS=(--solver-threads-total "$SWEEP_SOLVER_THREADS_CSV")
-    elif [ -n "$SOLVER_THREADS" ]; then
-      SWEEP_SOLVER_ARGS=(--solver-threads "$SOLVER_THREADS")
-    fi
-    # THE NODE BUDGET, without which threads measure nothing.
-    #
-    # `f4_phase_d_sweep` gates solving on `solver_threads > 0 AND
-    # solver_max_nodes > 0`, and this stage passed only the first. So every
-    # point ran with `solver_wants` refusing every position: the core-split axis
-    # measured a solver that never ran, which is the defect THROUGHPUT_LEVERS.md
-    # section 3.1 records -- on a run where the solver took 22-37% of generation
-    # wall. `rehearse_sweep_laptop.sh` asserts against it; this script
-    # reintroduced it.
-    #
-    # The RUN's budget, not a sweep-specific one: a split measured against a
-    # cheaper solver is a split for a run nobody is launching.
-    SWEEP_SOLVER_ARGS+=(
-      --solver-max-nodes "$ENDGAME_SOLVER_MAX_NODES"
-      --solver-max-secs "$ENDGAME_SOLVER_MAX_SECS"
-    )
-  else
-    # The solver is off for this run, so a split has nothing to divide.
-    SWEEP_SOLVER_ARGS=(--solver-threads 0)
-  fi
-
-  # Games must outnumber the largest slot count, or that point never fills its
-  # slots and the slot axis is measured at an occupancy no run has. The default
-  # used to be a flat 200 against slot values up to 512 -- so the two largest
-  # points on the axis were measuring 200 slots under someone else's label, and
-  # `f4_phase_d_sweep` now refuses that outright.
-  #
-  # Derived from the slot list rather than pinned, so raising SWEEP_SLOTS_CSV
-  # cannot silently reintroduce it. 3 games per slot is the steady-state
-  # threshold; ramp and drain otherwise dominate and they favour small slot
-  # counts.
-  # Workers is an AXIS, not the shipped value. Defaulting it to
-  # $RUST_SCHEDULER_WORKERS swept ONE point and reported it as the optimum --
-  # the same shape as measuring one solver split and calling it the answer.
-  # Shard count decides whether the CPU can walk trees fast enough to keep the
-  # coalesced batch full, and post-coalescer it no longer fragments batches, so
-  # there is no longer a reason to hold it fixed.
-  #
-  # Centred on the shipped value, so the current setting is always IN the grid:
-  # a sweep that cannot return today's configuration cannot tell you it was right.
-  SWEEP_WORKERS_DEFAULT="${SWEEP_WORKERS_DEFAULT:-$(
-    printf '%s,%s,%s' \
-      "$(( RUST_SCHEDULER_WORKERS / 2 > 0 ? RUST_SCHEDULER_WORKERS / 2 : 1 ))" \
-      "$RUST_SCHEDULER_WORKERS" \
-      "$(( RUST_SCHEDULER_WORKERS * 2 ))"
-  )}"
-
-  SWEEP_MAX_SLOTS="$(printf '%s' "${SWEEP_SLOTS_CSV:-128,256,512}" | tr ',' '\n' \
-    | sort -n | tail -1)"
-  SWEEP_GENERATION_GAMES="${SWEEP_GENERATION_GAMES:-$((SWEEP_MAX_SLOTS * 3))}"
-  if [ "$SWEEP_GENERATION_GAMES" -lt "$SWEEP_MAX_SLOTS" ]; then
-    die "SWEEP_GENERATION_GAMES=$SWEEP_GENERATION_GAMES cannot fill $SWEEP_MAX_SLOTS slots; the slot axis would measure nothing above the game count."
-  fi
-  say "Generation sweep: $SWEEP_GENERATION_GAMES games/point against max $SWEEP_MAX_SLOTS slots ($(( SWEEP_GENERATION_GAMES / SWEEP_MAX_SLOTS )) per slot)"
-
-  # f4_phase_d_sweep takes COMMA-separated axes and an --output DIRECTORY (it
-  # writes phase_d_sweep.json inside). w5_gate_slots_sweep takes space-separated
-  # axes and an --output FILE. They are different harnesses; test_setup_cloud
-  # arg-parses both invocations so this cannot drift again.
-  "$PY" -m games.seven_wonders_duel.f4_phase_d_sweep \
-    --checkpoint "$SWEEP_CHECKPOINT" \
-    --output "$SWEEP_DIR/generation" \
-    --games "$SWEEP_GENERATION_GAMES" \
-    --repetitions "${SWEEP_REPETITIONS:-1}" \
-    --slots "${SWEEP_SLOTS_CSV:-128,256,512}" \
-    --caps "${SWEEP_CAPS_CSV:-1024,2048}" \
-    --inflight "${SWEEP_INFLIGHT_CSV:-1,2}" \
-    --workers "${SWEEP_WORKERS_CSV:-$SWEEP_WORKERS_DEFAULT}" \
-    --inference-wait-ms "${SWEEP_INFERENCE_WAIT_CSV:-0,1,2}" \
-    ${SWEEP_SOLVER_ARGS[@]+"${SWEEP_SOLVER_ARGS[@]}"} \
-    --device cuda \
-    --precision "$PRECISION" \
-    || die "Generation sweep did not complete - see the error above. Nothing was measured, so this says nothing about the settings."
-  ok "Generation sweep: $SWEEP_DIR/generation/phase_d_sweep.json"
-
-  # LIVENESS, not configuration. Asserting that solver threads were CONFIGURED
-  # is what let the missing node budget go unnoticed: every point reported a
-  # split and none of them solved anything. Assert the solver did work.
-  if [ "$ENDGAME_SOLVER_MAX_NODES" -gt 0 ]; then
-    "$PY" - "$SWEEP_DIR/generation/phase_d_sweep.json" <<'PYSOLVES'       || die "The generation sweep measured a solver that never ran. Its core-split and slot numbers describe a configuration this run will not use."
-import json, sys
-
-summary = json.loads(open(sys.argv[1], encoding="utf-8").read())["summary"]
-on = [row for row in summary if row.get("solver_threads_total", 0) > 0]
-if not on:
-    print("  no sweep point ran with the solver on; nothing to check")
-    raise SystemExit(0)
-attempted = sum(row.get("solves_attempted", 0) for row in on)
-if attempted == 0:
-    print(
-        f"  {len(on)} points configured solver threads and attempted ZERO "
-        "solves",
-        file=sys.stderr,
-    )
-    raise SystemExit(1)
-answered = sum(row.get("solves_answered", 0) for row in on)
-print(f"  solver LIVE across {len(on)} points: {attempted} attempted, {answered} answered")
-PYSOLVES
-  fi
-
-  # Sweep the ladder's *lowest* rung: the gate optimum measured stable across
-  # 100/200/600-game gates on the laptop 3070, so the cheap rung answers the
-  # same question at a fraction of the games. Override with GATE_SWEEP_RUNGS.
-  read -r -a _RUNGS <<< "$GATE_LADDER"
-  read -r -a _SWEEP_RUNGS <<< "${GATE_SWEEP_RUNGS:-${_RUNGS[0]}}"
-  for RUNG in "${_SWEEP_RUNGS[@]}"; do
-    "$PY" -m games.seven_wonders_duel.w5_gate_slots_sweep \
-      --checkpoint "$SWEEP_CHECKPOINT" \
-      --work-dir "$SWEEP_DIR/gate_$RUNG" \
-      --output "$SWEEP_DIR/gate_$RUNG.json" \
-      --games "$RUNG" \
-      --slots ${SWEEP_SLOTS:-48 96 144} \
-      --caps ${SWEEP_CAPS:-256 1024} \
-      --sims "${GATE_SIMS:-64}" \
-      --precision "$PRECISION" \
-      || die "Gate sweep at rung $RUNG failed."
-    ok "Gate sweep (rung $RUNG): $SWEEP_DIR/gate_$RUNG.json"
-  done
-
-  # Turn both results into an env file pass 2 can source. The generation sweep
-  # writes {summary: [...]} sorted fastest-first; the gate sweep writes {best:
-  # {...}}. Neither is in the production-manifest shape f4_launch_flags reads,
-  # so the translation lives here rather than pretending LAUNCH_FLAGS_JSON can
-  # consume a sweep.
-  "$PY" "$REPO_DIR/games/seven_wonders_duel/sweep_launch_env.py" \
-    --sweep-dir "$SWEEP_DIR" --gate-rung "${_SWEEP_RUNGS[0]}" \
-    || die "Could not summarise the sweeps."
-
-  warn "Sweeps measure but do not apply. To launch on this box's numbers:"
-  warn "  source $SWEEP_DIR/measured_env.sh && bash \$0"
-fi
-stage_done 8b
-
-# ── STAGE 9: Phase D plumbing smoke on CUDA ──────────────────────────────────
-stage 9 "Phase D plumbing smoke on CUDA"
-if [ "$SKIP_SMOKE" = "1" ]; then
-  warn "SKIP_SMOKE=1; skipping the CUDA plumbing smoke."
-else
-  SMOKE_DIR="runs/seven_wonders_duel/phase_d_smoke_$(date +%Y%m%dT%H%M%S)"
-  common::quietly "$REPO_DIR/$RUN_DIR_REL/setup/plumbing_smoke.log" "plumbing smoke" -- \
-    "$PY" -m games.seven_wonders_duel.phase_d \
-    --run-dir "$SMOKE_DIR" --device cuda --plumbing-smoke --process-workers 2 \
-    || die "CUDA plumbing smoke failed — do not launch training."
-  ok "Smoke completed: $SMOKE_DIR"
-fi
-stage_done 9
-
-# ── STAGE 10: Launch training detached ───────────────────────────────────────
-stage 10 "Launch training"
-RUN_DIR="$REPO_DIR/$RUN_DIR_REL"
-mkdir -p "$RUN_DIR"
-LOG_FILE="$RUN_DIR/launch_$(date +%Y%m%dT%H%M%S).log"
-
-# W6.3: the throughput sweep and Phase D spell the same four settings
-# differently. Translate rather than re-type.
-# ── The pass-2 guard: were this box's measured numbers actually applied? ─────
-#
-# `RUST_SLOTS` and friends carry cloud6 defaults, so pass 2 without sourcing
-# `measured_env.sh` launches on those and prints "Measured generation flags",
-# which is a lie: they came from a default, not from this box. The two cases
-# produce identical command lines, and the run is 24 hours long.
-#
-# `SWEEP_MEASURED` is exported only by `sweep_launch_env.py`. If a sweep exists
-# on this box and that marker is absent, the operator forgot to source it.
-if [ "$SWEEP_MEASURED" = "1" ]; then
-  ok "Using this box's measured sweep: ${SWEEP_MEASURED_FROM:-unknown}"
-elif [ -f "$REPO_DIR/$RUN_DIR_REL/sweeps/measured_env.sh" ]; then
-  if [ "$ALLOW_UNMEASURED_LAUNCH" = "1" ]; then
-    warn "This box has a measured sweep that was NOT sourced, and"
-    warn "ALLOW_UNMEASURED_LAUNCH=1, so the run proceeds on defaults."
-  else
-    die "This box has a measured sweep that was not sourced, so the launch would
-use built-in defaults while reporting them as measured. Run:
-
-  source $REPO_DIR/$RUN_DIR_REL/sweeps/measured_env.sh && bash \$0
-
-Set ALLOW_UNMEASURED_LAUNCH=1 to launch on defaults deliberately."
-  fi
-fi
-
-TUNED_FLAGS=()
-[ -n "$RUST_SLOTS" ] && TUNED_FLAGS+=(--rust-slots "$RUST_SLOTS")
-[ -n "$RUST_GLOBAL_BATCH_CAP" ] &&
-  TUNED_FLAGS+=(--rust-global-batch-cap "$RUST_GLOBAL_BATCH_CAP")
-[ -n "$RUST_MAX_INFLIGHT_BATCHES" ] &&
-  TUNED_FLAGS+=(--rust-max-inflight-batches "$RUST_MAX_INFLIGHT_BATCHES")
-# The evaluator coalescing wait. Only ever set from a sweep that VARIED it --
-# `sweep_launch_env` refuses to emit it otherwise -- so an unset value here
-# means the run takes the 0 default, which still merges everything already
-# queued. It does NOT mean coalescing is off.
-[ -n "${RUST_INFERENCE_WAIT_MS:-}" ] &&
-  TUNED_FLAGS+=(--rust-inference-wait-ms "$RUST_INFERENCE_WAIT_MS")
-if [ ${#TUNED_FLAGS[@]} -gt 0 ]; then
-  if [ "$SWEEP_MEASURED" = "1" ]; then
-    ok "Measured generation flags: ${TUNED_FLAGS[*]}"
-  else
-    warn "Generation flags (NOT measured on this box): ${TUNED_FLAGS[*]}"
-  fi
-elif [ -n "${LAUNCH_FLAGS_JSON:-}" ]; then
-  read -r -a TUNED_FLAGS <<< "$(
-    "$PY" -m games.seven_wonders_duel.f4_launch_flags "$LAUNCH_FLAGS_JSON"
-  )" || die "Could not translate $LAUNCH_FLAGS_JSON into Phase D flags."
-  ok "Measured launch flags: ${TUNED_FLAGS[*]}"
-else
-  warn "LAUNCH_FLAGS_JSON unset; launching on Phase D defaults rather than this "
-  warn "box's measured sweep."
-fi
+# What stays in stage 10 is everything that depends on the sweep's OUTPUT: the
+# pass-2 guard, TUNED_FLAGS and GATE_TUNED_FLAGS. The split is exactly "does
+# this come from the operator's choices, or from this box's measurement".
 
 read -r -a LADDER_RUNGS <<< "$GATE_LADDER"
-
-# Gate-side scheduler settings, from stage 8b. Deliberately separate from the
-# generation flags in TUNED_FLAGS: the two paths run at different slot counts,
-# and the batch cap helps at one and hurts at the other.
-GATE_TUNED_FLAGS=()
-[ -n "$GATE_SLOTS" ] && GATE_TUNED_FLAGS+=(--gate-slots "$GATE_SLOTS")
-[ -n "$GATE_GLOBAL_BATCH_CAP" ] &&
-  GATE_TUNED_FLAGS+=(--gate-global-batch-cap "$GATE_GLOBAL_BATCH_CAP")
-if [ ${#GATE_TUNED_FLAGS[@]} -eq 0 ]; then
-  warn "GATE_SLOTS/GATE_GLOBAL_BATCH_CAP unset; the gate will run on generation's"
-  warn "scheduler settings, which measured ~1.2x slower on the laptop 3070."
-else
-  ok "Gate scheduler flags: ${GATE_TUNED_FLAGS[*]}"
-fi
 
 # W7b ships present-but-disabled: detection reports either way, and enabling
 # the response is a deliberate choice made at launch, not mid-run.
@@ -1243,9 +1027,363 @@ TRAIN_CMD=(
   --vram-budget-gb "$VRAM_BUDGET_GB"
   --memory-headroom-gb "$MEMORY_HEADROOM_GB"
   "${LADDER_FLAG[@]}"
-  "${TUNED_FLAGS[@]}"
-  "${GATE_TUNED_FLAGS[@]}"
+  # TUNED_FLAGS and GATE_TUNED_FLAGS are appended at STAGE 10, not set here.
+  # They come OUT of the sweep this command is assembled to feed, so they
+  # cannot exist yet on the pass that measures them -- and on that pass the
+  # geometry left in place is the launcher's own default, which is exactly the
+  # baseline `f4_phase_d_sweep` should rank its grid against.
 )
+
+# ── STAGE 8b: Scheduler sweeps (generation and gate, separately) ─────────────
+#
+# Generation and the gate need *different* settings, and the axes interact, so
+# both are swept jointly on the box that will run them. Measured on the laptop
+# 3070 (d128 L4, 64 sims, 100-game gates, games/s):
+#
+#     slots \ cap     256      512     1024
+#     48 (shipped)   0.605    0.571    0.581
+#     144            0.752    0.816    0.840
+#
+# The cap's *sign* flips with slot count: at 48 slots widening it costs 4%, at
+# 144 slots it gains 12%. Generation is pinned near 48 slots and is ~85% of an
+# iteration, so `--gate-global-batch-cap` exists to keep a gate-sized cap away
+# from it. Sweeping either axis alone concludes the shipped setting is optimal.
+#
+# One gate sweep is enough: the optimum is stable in gate size. 144 slots /
+# 1024 cap won at 100, 200 and 600 games on the laptop 3070, and the gain over
+# 48/256 barely moved (1.39x at 100 games, 1.37x at 600). GATE_SWEEP_RUNGS
+# defaults to the ladder's middle rung; pass more than one value if a box looks
+# unlike the others, since nothing guarantees that stability on new hardware.
+
+stage 8b "Scheduler sweeps (generation, then gate)"
+if [ "$SKIP_SWEEPS" = "1" ]; then
+  warn "SKIP_SWEEPS=1 — launching on defaults rather than this box's measurement."
+elif [ -z "${SWEEP_CHECKPOINT:-}" ]; then
+  warn "SWEEP_CHECKPOINT unset; skipping both sweeps. Phase D will run on"
+  warn "defaults measured on a different GPU. Set it to a W0 L checkpoint."
+else
+  SWEEP_DIR="$REPO_DIR/$RUN_DIR_REL/sweeps"
+  mkdir -p "$SWEEP_DIR"
+
+  # ── THE RUN'S CONFIGURATION, so the sweep measures the run ────────────────
+  #
+  # `f4_phase_d_sweep --config-from-manifest` exists precisely for this, and its
+  # own docstring records what happens without it: "roughly 50 simulations a
+  # move instead of the run's measured 522, under a different search algorithm
+  # ... the optimum found that way belongs to a machine nobody is running".
+  # Simulations per move set the leaf arrival rate, and the leaf arrival rate is
+  # what the slot and worker axes act on.
+  #
+  # The obstacle was never the flag, it was the ORDER: the run's manifest does
+  # not exist until the run starts, and the sweep runs first. `--emit-config`
+  # builds the config from the launch flags assembled above and writes it in the
+  # manifest shape, so the sweep reads the run that is about to be launched
+  # rather than a dataclass.
+  #
+  # Validated on the way out by Phase D itself. Emitting a config Phase D would
+  # refuse is worse than emitting none: the sweep would spend box hours ranking
+  # a geometry for a run that cannot start.
+  #
+  # `[@]:3` drops $PY, -m and the module name: the flags, not the interpreter.
+  # No `cd` because stage 2's clone left the shell in $REPO_DIR, which is the
+  # same thing the sweep invocations below rely on.
+  RUN_CONFIG_JSON="$SWEEP_DIR/run_config.json"
+  common::quietly "$REPO_DIR/$RUN_DIR_REL/setup/emit_config.log" "emit run config" -- \
+    "$PY" -m games.seven_wonders_duel.phase_d \
+    --emit-config "$RUN_CONFIG_JSON" "${TRAIN_CMD[@]:3}" \
+    || die "Could not build this run's configuration, so the sweep would fall back
+to PhaseDConfig's defaults and measure a search this run does not run.
+Fix the knobs above; nothing was measured and nothing was launched."
+  ok "Run configuration for the sweep: $RUN_CONFIG_JSON"
+
+  # The generation/solver CORE SPLIT, as an axis rather than a constant.
+  #
+  # Generation and the endgame solver compete for the same physical cores, and
+  # the solver runs SYNCHRONOUSLY inside a scheduler shard -- so a thread given
+  # to it is a thread taken from leaf production, and the best split is a
+  # property of this box's core count, not of the algorithm. Until now this
+  # stage passed a single fixed --solver-threads, which measures one split and
+  # reports it as the answer.
+  #
+  # Swept as a TOTAL, because --solver-threads is per shard and the worker count
+  # is itself an axis: holding "threads per shard" fixed across worker counts
+  # would silently vary the total, and the total is what competes with
+  # generation. `f4_phase_d_sweep --solver-threads-total` divides at each point.
+  SWEEP_SOLVER_ARGS=()
+  if [ "$ENDGAME_SOLVER_MAX_NODES" -gt 0 ]; then
+    if [ -n "${SWEEP_SOLVER_THREADS_CSV:-}" ]; then
+      SWEEP_SOLVER_ARGS=(--solver-threads-total "$SWEEP_SOLVER_THREADS_CSV")
+    elif [ -n "$SOLVER_THREADS" ]; then
+      SWEEP_SOLVER_ARGS=(--solver-threads "$SOLVER_THREADS")
+    fi
+    # THE NODE BUDGET, without which threads measure nothing.
+    #
+    # `f4_phase_d_sweep` gates solving on `solver_threads > 0 AND
+    # solver_max_nodes > 0`, and this stage passed only the first. So every
+    # point ran with `solver_wants` refusing every position: the core-split axis
+    # measured a solver that never ran, which is the defect THROUGHPUT_LEVERS.md
+    # section 3.1 records -- on a run where the solver took 22-37% of generation
+    # wall. `rehearse_sweep_laptop.sh` asserts against it; this script
+    # reintroduced it.
+    #
+    # The RUN's budget, not a sweep-specific one: a split measured against a
+    # cheaper solver is a split for a run nobody is launching.
+    SWEEP_SOLVER_ARGS+=(
+      --solver-max-nodes "$ENDGAME_SOLVER_MAX_NODES"
+      --solver-max-secs "$ENDGAME_SOLVER_MAX_SECS"
+    )
+  else
+    # The solver is off for this run, so a split has nothing to divide.
+    SWEEP_SOLVER_ARGS=(--solver-threads 0)
+  fi
+
+  # Games must outnumber the largest slot count, or that point never fills its
+  # slots and the slot axis is measured at an occupancy no run has. The default
+  # used to be a flat 200 against slot values up to 512 -- so the two largest
+  # points on the axis were measuring 200 slots under someone else's label, and
+  # `f4_phase_d_sweep` now refuses that outright.
+  #
+  # Derived from the slot list rather than pinned, so raising SWEEP_SLOTS_CSV
+  # cannot silently reintroduce it. 3 games per slot is the steady-state
+  # threshold; ramp and drain otherwise dominate and they favour small slot
+  # counts.
+  # Workers is an AXIS, not the shipped value. Defaulting it to
+  # $RUST_SCHEDULER_WORKERS swept ONE point and reported it as the optimum --
+  # the same shape as measuring one solver split and calling it the answer.
+  # Shard count decides whether the CPU can walk trees fast enough to keep the
+  # coalesced batch full, and post-coalescer it no longer fragments batches, so
+  # there is no longer a reason to hold it fixed.
+  #
+  # Centred on the shipped value, so the current setting is always IN the grid:
+  # a sweep that cannot return today's configuration cannot tell you it was right.
+  SWEEP_WORKERS_DEFAULT="${SWEEP_WORKERS_DEFAULT:-$(
+    printf '%s,%s,%s' \
+      "$(( RUST_SCHEDULER_WORKERS / 2 > 0 ? RUST_SCHEDULER_WORKERS / 2 : 1 ))" \
+      "$RUST_SCHEDULER_WORKERS" \
+      "$(( RUST_SCHEDULER_WORKERS * 2 ))"
+  )}"
+
+  SWEEP_MAX_SLOTS="$(printf '%s' "${SWEEP_SLOTS_CSV:-128,256,512}" | tr ',' '\n' \
+    | sort -n | tail -1)"
+  SWEEP_GENERATION_GAMES="${SWEEP_GENERATION_GAMES:-$((SWEEP_MAX_SLOTS * 3))}"
+  if [ "$SWEEP_GENERATION_GAMES" -lt "$SWEEP_MAX_SLOTS" ]; then
+    die "SWEEP_GENERATION_GAMES=$SWEEP_GENERATION_GAMES cannot fill $SWEEP_MAX_SLOTS slots; the slot axis would measure nothing above the game count."
+  fi
+  say "Generation sweep: $SWEEP_GENERATION_GAMES games/point against max $SWEEP_MAX_SLOTS slots ($(( SWEEP_GENERATION_GAMES / SWEEP_MAX_SLOTS )) per slot)"
+
+  # ── THE COST OF MEASURING THE RUN, and what is done about it ──────────────
+  #
+  # Two changes above made each grid point ~10x more expensive: the run's own
+  # search instead of PhaseDConfig's defaults, and the run's own solver budget.
+  # Both were fixes -- but 6 axes at 3x2x2x3x3 points, twice over, at 1600
+  # simulations a move is a sweep that costs more than the run it configures.
+  # Two knobs buy that back, and each gives up something SAYABLE:
+  #
+  # 1. `f4_staged_sweep` replaces the cartesian product with two stages:
+  #    geometry (slots x caps x workers x solver split) is ranked first, then
+  #    inflight x wait is swept at the winner. 18 + 6 points against 108. The
+  #    cost is that stage B cannot reorder stage A; SWEEP_STAGE_A_WAIT_MS is the
+  #    knob for the one interaction where that is known to bite (the coalescing
+  #    wait rewards high shard counts, and stage A ranks shards without it).
+  # 2. SWEEP_SIMS_DIVISOR runs every point at 1/N of the run's simulations, with
+  #    the solver's node budget divided by the same N so the solver keeps its
+  #    share of slot occupancy. The search ALGORITHM, the cheap/full mix and
+  #    top_k all survive; ABSOLUTE throughput does not. games/hour out of a
+  #    divided sweep is not the run's rate, and `measured_env.sh` says so.
+  #
+  # Set SWEEP_SIMS_DIVISOR=1 to measure the run's own search exactly, at four
+  # times the box hours.
+  #
+  # Both harnesses take COMMA-separated axes and an --output DIRECTORY (the
+  # staged driver writes phase_d_sweep.json inside, in the same shape).
+  # w5_gate_slots_sweep takes space-separated axes and an --output FILE. They
+  # are different harnesses; test_setup_cloud arg-parses both invocations so
+  # this cannot drift again.
+  "$PY" -m games.seven_wonders_duel.f4_staged_sweep \
+    --checkpoint "$SWEEP_CHECKPOINT" \
+    --output "$SWEEP_DIR/generation" \
+    --games "$SWEEP_GENERATION_GAMES" \
+    --repetitions "${SWEEP_REPETITIONS:-1}" \
+    --config-from-manifest "$RUN_CONFIG_JSON" \
+    --sims-divisor "$SWEEP_SIMS_DIVISOR" \
+    --slots "${SWEEP_SLOTS_CSV:-128,256,512}" \
+    --caps "${SWEEP_CAPS_CSV:-1024,2048}" \
+    --inflight "${SWEEP_INFLIGHT_CSV:-1,2}" \
+    --workers "${SWEEP_WORKERS_CSV:-$SWEEP_WORKERS_DEFAULT}" \
+    --inference-wait-ms "${SWEEP_INFERENCE_WAIT_CSV:-0,1,2}" \
+    --stage-a-inflight "$SWEEP_STAGE_A_INFLIGHT" \
+    --stage-a-wait-ms "$SWEEP_STAGE_A_WAIT_MS" \
+    ${SWEEP_SOLVER_ARGS[@]+"${SWEEP_SOLVER_ARGS[@]}"} \
+    --device cuda \
+    --precision "$PRECISION" \
+    || die "Generation sweep did not complete - see the error above. Nothing was measured, so this says nothing about the settings."
+  ok "Generation sweep: $SWEEP_DIR/generation/phase_d_sweep.json"
+
+  # LIVENESS, not configuration. Asserting that solver threads were CONFIGURED
+  # is what let the missing node budget go unnoticed: every point reported a
+  # split and none of them solved anything. Assert the solver did work.
+  if [ "$ENDGAME_SOLVER_MAX_NODES" -gt 0 ]; then
+    "$PY" - "$SWEEP_DIR/generation/phase_d_sweep.json" <<'PYSOLVES'       || die "The generation sweep measured a solver that never ran. Its core-split and slot numbers describe a configuration this run will not use."
+import json, sys
+
+payload = json.loads(open(sys.argv[1], encoding="utf-8").read())
+# THE UNION OF BOTH STAGES, not `summary`.
+#
+# `summary` is the BATCHING stage's, and that stage pins whatever the geometry
+# stage won -- including the solver split. So if the solver-off point wins the
+# geometry stage, every row here reads zero and this check would report "no
+# point ran with the solver on" about a sweep that measured the split
+# thoroughly. The split is measured in stage A; the assertion has to look there.
+staged = payload.get("staged")
+if staged:
+    summary = [row for stage in staged["stages"] for row in stage["summary"]]
+else:
+    summary = payload["summary"]
+on = [row for row in summary if row.get("solver_threads_total", 0) > 0]
+if not on:
+    print("  no sweep point ran with the solver on; nothing to check")
+    raise SystemExit(0)
+attempted = sum(row.get("solves_attempted", 0) for row in on)
+if attempted == 0:
+    print(
+        f"  {len(on)} points configured solver threads and attempted ZERO "
+        "solves",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+answered = sum(row.get("solves_answered", 0) for row in on)
+print(f"  solver LIVE across {len(on)} points: {attempted} attempted, {answered} answered")
+PYSOLVES
+  fi
+
+  # Sweep the ladder's *lowest* rung: the gate optimum measured stable across
+  # 100/200/600-game gates on the laptop 3070, so the cheap rung answers the
+  # same question at a fraction of the games. Override with GATE_SWEEP_RUNGS.
+  read -r -a _RUNGS <<< "$GATE_LADDER"
+  read -r -a _SWEEP_RUNGS <<< "${GATE_SWEEP_RUNGS:-${_RUNGS[0]}}"
+  for RUNG in "${_SWEEP_RUNGS[@]}"; do
+    "$PY" -m games.seven_wonders_duel.w5_gate_slots_sweep \
+      --checkpoint "$SWEEP_CHECKPOINT" \
+      --work-dir "$SWEEP_DIR/gate_$RUNG" \
+      --output "$SWEEP_DIR/gate_$RUNG.json" \
+      --games "$RUNG" \
+      --slots ${SWEEP_SLOTS:-48 96 144} \
+      --caps ${SWEEP_CAPS:-256 1024} \
+      --sims "${GATE_SIMS:-64}" \
+      --precision "$PRECISION" \
+      || die "Gate sweep at rung $RUNG failed."
+    ok "Gate sweep (rung $RUNG): $SWEEP_DIR/gate_$RUNG.json"
+  done
+
+  # Turn both results into an env file pass 2 can source. The generation sweep
+  # writes {summary: [...]} sorted fastest-first; the gate sweep writes {best:
+  # {...}}. Neither is in the production-manifest shape f4_launch_flags reads,
+  # so the translation lives here rather than pretending LAUNCH_FLAGS_JSON can
+  # consume a sweep.
+  "$PY" "$REPO_DIR/games/seven_wonders_duel/sweep_launch_env.py" \
+    --sweep-dir "$SWEEP_DIR" --gate-rung "${_SWEEP_RUNGS[0]}" \
+    || die "Could not summarise the sweeps."
+
+  warn "Sweeps measure but do not apply. To launch on this box's numbers:"
+  warn "  source $SWEEP_DIR/measured_env.sh && bash \$0"
+fi
+stage_done 8b
+
+# ── STAGE 9: Phase D plumbing smoke on CUDA ──────────────────────────────────
+stage 9 "Phase D plumbing smoke on CUDA"
+if [ "$SKIP_SMOKE" = "1" ]; then
+  warn "SKIP_SMOKE=1; skipping the CUDA plumbing smoke."
+else
+  SMOKE_DIR="runs/seven_wonders_duel/phase_d_smoke_$(date +%Y%m%dT%H%M%S)"
+  common::quietly "$REPO_DIR/$RUN_DIR_REL/setup/plumbing_smoke.log" "plumbing smoke" -- \
+    "$PY" -m games.seven_wonders_duel.phase_d \
+    --run-dir "$SMOKE_DIR" --device cuda --plumbing-smoke --process-workers 2 \
+    || die "CUDA plumbing smoke failed — do not launch training."
+  ok "Smoke completed: $SMOKE_DIR"
+fi
+stage_done 9
+
+# ── STAGE 10: Launch training detached ───────────────────────────────────────
+stage 10 "Launch training"
+RUN_DIR="$REPO_DIR/$RUN_DIR_REL"
+mkdir -p "$RUN_DIR"
+LOG_FILE="$RUN_DIR/launch_$(date +%Y%m%dT%H%M%S).log"
+
+# W6.3: the throughput sweep and Phase D spell the same four settings
+# differently. Translate rather than re-type.
+# ── The pass-2 guard: were this box's measured numbers actually applied? ─────
+#
+# `RUST_SLOTS` and friends carry cloud6 defaults, so pass 2 without sourcing
+# `measured_env.sh` launches on those and prints "Measured generation flags",
+# which is a lie: they came from a default, not from this box. The two cases
+# produce identical command lines, and the run is 24 hours long.
+#
+# `SWEEP_MEASURED` is exported only by `sweep_launch_env.py`. If a sweep exists
+# on this box and that marker is absent, the operator forgot to source it.
+if [ "$SWEEP_MEASURED" = "1" ]; then
+  ok "Using this box's measured sweep: ${SWEEP_MEASURED_FROM:-unknown}"
+elif [ -f "$REPO_DIR/$RUN_DIR_REL/sweeps/measured_env.sh" ]; then
+  if [ "$ALLOW_UNMEASURED_LAUNCH" = "1" ]; then
+    warn "This box has a measured sweep that was NOT sourced, and"
+    warn "ALLOW_UNMEASURED_LAUNCH=1, so the run proceeds on defaults."
+  else
+    die "This box has a measured sweep that was not sourced, so the launch would
+use built-in defaults while reporting them as measured. Run:
+
+  source $REPO_DIR/$RUN_DIR_REL/sweeps/measured_env.sh && bash \$0
+
+Set ALLOW_UNMEASURED_LAUNCH=1 to launch on defaults deliberately."
+  fi
+fi
+
+TUNED_FLAGS=()
+[ -n "$RUST_SLOTS" ] && TUNED_FLAGS+=(--rust-slots "$RUST_SLOTS")
+[ -n "$RUST_GLOBAL_BATCH_CAP" ] &&
+  TUNED_FLAGS+=(--rust-global-batch-cap "$RUST_GLOBAL_BATCH_CAP")
+[ -n "$RUST_MAX_INFLIGHT_BATCHES" ] &&
+  TUNED_FLAGS+=(--rust-max-inflight-batches "$RUST_MAX_INFLIGHT_BATCHES")
+# The evaluator coalescing wait. Only ever set from a sweep that VARIED it --
+# `sweep_launch_env` refuses to emit it otherwise -- so an unset value here
+# means the run takes the 0 default, which still merges everything already
+# queued. It does NOT mean coalescing is off.
+[ -n "${RUST_INFERENCE_WAIT_MS:-}" ] &&
+  TUNED_FLAGS+=(--rust-inference-wait-ms "$RUST_INFERENCE_WAIT_MS")
+if [ ${#TUNED_FLAGS[@]} -gt 0 ]; then
+  if [ "$SWEEP_MEASURED" = "1" ]; then
+    ok "Measured generation flags: ${TUNED_FLAGS[*]}"
+  else
+    warn "Generation flags (NOT measured on this box): ${TUNED_FLAGS[*]}"
+  fi
+elif [ -n "${LAUNCH_FLAGS_JSON:-}" ]; then
+  read -r -a TUNED_FLAGS <<< "$(
+    "$PY" -m games.seven_wonders_duel.f4_launch_flags "$LAUNCH_FLAGS_JSON"
+  )" || die "Could not translate $LAUNCH_FLAGS_JSON into Phase D flags."
+  ok "Measured launch flags: ${TUNED_FLAGS[*]}"
+else
+  warn "LAUNCH_FLAGS_JSON unset; launching on Phase D defaults rather than this "
+  warn "box's measured sweep."
+fi
+
+# Gate-side scheduler settings, from stage 8b. Deliberately separate from the
+# generation flags in TUNED_FLAGS: the two paths run at different slot counts,
+# and the batch cap helps at one and hurts at the other.
+GATE_TUNED_FLAGS=()
+[ -n "$GATE_SLOTS" ] && GATE_TUNED_FLAGS+=(--gate-slots "$GATE_SLOTS")
+[ -n "$GATE_GLOBAL_BATCH_CAP" ] &&
+  GATE_TUNED_FLAGS+=(--gate-global-batch-cap "$GATE_GLOBAL_BATCH_CAP")
+if [ ${#GATE_TUNED_FLAGS[@]} -eq 0 ]; then
+  warn "GATE_SLOTS/GATE_GLOBAL_BATCH_CAP unset; the gate will run on generation's"
+  warn "scheduler settings, which measured ~1.2x slower on the laptop 3070."
+else
+  ok "Gate scheduler flags: ${GATE_TUNED_FLAGS[*]}"
+fi
+
+# The measured geometry, onto the command assembled before stage 8b. Appended
+# rather than interpolated because this is the ONLY part of the launch line that
+# comes from the box rather than from the operator, and it has to land after the
+# sweep that produced it. Last also means last wins, which is what a measurement
+# should do to a default.
+TRAIN_CMD+=("${TUNED_FLAGS[@]}" "${GATE_TUNED_FLAGS[@]}")
 
 if [ "$LAUNCH" != "1" ]; then
   warn "LAUNCH=$LAUNCH; verified but not launching. Launch manually with:"

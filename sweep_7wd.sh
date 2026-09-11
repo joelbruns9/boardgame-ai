@@ -2,9 +2,11 @@
 # =============================================================================
 # sweep_7wd.sh — measure this box's scheduler geometry. Never launches training.
 #
-# setup_cloud_7wd.sh cannot be used for this: its stage 10 launches the run, and
-# stage 8b's sweep is opt-in, pinned to inflight=1, and measures at one shard
-# while configuring a run at four. This script does the measurement alone.
+# setup_cloud_7wd.sh cannot be used for this: its stage 10 launches the run, its
+# stage 8b is opt-in, and that stage now runs a STAGED sweep at a divided search
+# budget -- the right trade while setting a box up, and the wrong one once a run
+# exists and its real cost curve is the question. This script measures alone, at
+# the run's own search, against the run's own manifest.
 #
 # What it does:
 #   1. works out of a SEPARATE checkout, so the running run's repo keeps the
@@ -59,6 +61,12 @@
 #                                  has used yet. Space separated, e.g.
 #                                  CONFIG_OVERRIDES="--config-override leaf_batch=6
 #                                  --config-override virtual_loss_root=true"
+#   SIMS_DIVISOR=1                 run every point at 1/N of the run's search,
+#                                  with the solver's node budget divided by the
+#                                  same N. 1 measures the run faithfully, which
+#                                  is what stopping a live run is FOR; raise it
+#                                  to buy grid points, and stop reading absolute
+#                                  games/hour as the run's rate when you do
 #   SOLVER_THREADS=3               per shard, as the run passes it
 #   SOLVER_THREADS_TOTAL=<n>       total solver threads, divided across shards
 #                                  at each point. SET THIS whenever SWEEP_WORKERS
@@ -93,6 +101,14 @@ WARMUP_GAMES="${WARMUP_GAMES:-8}"
 PRECISION="${PRECISION:-bf16}"
 SOLVER_THREADS="${SOLVER_THREADS:-3}"
 GATE_RUNG="${GATE_RUNG:-200}"
+# 1, deliberately, where the launcher's stage 8b defaults to 4. This script
+# measures a run that EXISTS, against its own manifest, and the whole reason to
+# stop a live run and sweep is to get its real cost curve -- so faithfulness is
+# worth the hours here in a way it is not during setup. Raise it when the grid
+# matters more than the fidelity of any single point; the solver's node budget
+# is divided by the same factor so its share of slot occupancy is preserved, and
+# absolute games/hour stops being the run's rate.
+SIMS_DIVISOR="${SIMS_DIVISOR:-1}"
 
 # Grids. The shipped values (256 slots, 2048 cap, inflight 1, 4 workers) are
 # INSIDE every axis on purpose: a sweep whose grid excludes the current setting
@@ -136,7 +152,7 @@ log "logging to $SWEEP_LOG"
 # observation -- raw.githubusercontent is CDN-cached, so a curl seconds after a
 # push can legitimately return the old file. That ambiguity cost a full
 # debugging round trip; the version line ends it.
-SWEEP_SCRIPT_VERSION=6
+SWEEP_SCRIPT_VERSION=7
 log "sweep_7wd.sh version $SWEEP_SCRIPT_VERSION (checksum $(cksum < "${BASH_SOURCE[0]}" | cut -d' ' -f1))"
 
 # ── STAGE 1: a checkout that is not the run's ────────────────────────────────
@@ -218,7 +234,7 @@ if [ "${PROFILE_ONLY:-0}" = "1" ]; then
   log "PROFILE_ONLY=1: skipping the sweep-harness capability check"
 else
 SWEEP_HELP="$("$PY" -m games.seven_wonders_duel.f4_phase_d_sweep --help 2>&1 || true)"
-for flag in --workers --solver-threads-total --config-from-manifest; do
+for flag in --workers --solver-threads-total --config-from-manifest --sims-divisor; do
   case "$SWEEP_HELP" in
     *"$flag"*) ;;
     *) MISSING="$MISSING $flag" ;;
@@ -362,6 +378,7 @@ PYTHONPATH="$EXT_DIR" "$PY" -m games.seven_wonders_duel.f4_phase_d_sweep \
   --inflight "$SWEEP_INFLIGHT" \
   --workers "$SWEEP_WORKERS" \
   --config-from-manifest "$RUN_DIR/run_manifest.json" \
+  --sims-divisor "$SIMS_DIVISOR" \
   ${CONFIG_OVERRIDES:+$CONFIG_OVERRIDES} \
   ${SOLVER_THREADS_TOTAL:+--solver-threads-total "$SOLVER_THREADS_TOTAL"} \
   --solver-threads "$SOLVER_THREADS" \

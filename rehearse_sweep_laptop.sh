@@ -19,6 +19,10 @@
 #   │ · `sweep_launch_env.py` writes a sourceable env file carrying the winner │
 #   │   AND the `SWEEP_MEASURED` provenance marker the launcher's pass-2 guard │
 #   │   refuses without                                                       │
+#   │ · the STAGED handoff: geometry ranked first, the batching axes swept at  │
+#   │   the winner, and `swept_axes` carrying "stage A measured the split"     │
+#   │   through to SOLVER_THREADS -- which stage B's own summary denies        │
+#   │ · `--sims-divisor` reaching the config and being recorded as provenance  │
 #   │ · the games-per-point requirement and the grid arithmetic                │
 #   └──────────────────────────────────────────────────────────────────────────┘
 #
@@ -44,6 +48,19 @@
 #   REHEARSE_SOLVER_NODES=2000000
 #                         node budget installed at every solver-on point. The
 #                         axis measures nothing without it -- see the check.
+#   REHEARSE_WORKERS_CSV=1,2  shard counts for the GEOMETRY stage. 1 is in the
+#                         list so the "a single shard cannot merge" property is
+#                         checked; the cost is that if a single shard WINS, the
+#                         batching stage runs its whole wait axis at 0 and the
+#                         wait plumbing goes unexercised. The check says so and
+#                         names 2,4 as the re-run.
+#   REHEARSE_INFLIGHT_CSV=1,2  inflight batches for the BATCHING stage. Two
+#                         values, or that stage resolves to one point and ranks
+#                         nothing.
+#   REHEARSE_SIMS_DIVISOR=2   exercises the box's cost knob. On the box it
+#                         divides the run's 1600-simulation search; here it
+#                         divides the harness defaults, which is enough to prove
+#                         the flag reaches the config and is recorded.
 #   REHEARSE_DEVICE=cuda
 # =============================================================================
 set -euo pipefail
@@ -143,16 +160,29 @@ fi
 # it is an axis the box will run, and this script exists to prove the plumbing
 # of that axis before it is rented. A wait that reaches the harness and merges
 # nothing looks identical, in a log, to a wait that helps a little.
-say "Generation sweep (toy grid; solver split and coalescing wait as axes, LAPTOP-SCALE search)"
-"$PY" -m games.seven_wonders_duel.f4_phase_d_sweep \
+# STAGED, because that is what the box runs. The launcher's stage 8b drives
+# `f4_staged_sweep`, which ranks geometry first and sweeps the batching axes at
+# the winner -- and the handoff it adds (which axes were varied ACROSS the two
+# stages, threaded through `sweep_launch_env`) is plumbing, which is exactly
+# what this script exists to prove before anything is rented. Rehearsing the
+# unstaged harness would leave the box's real pipeline unrehearsed.
+#
+# `--sims-divisor` is exercised for the same reason: on the box it divides the
+# run's 1600-simulation search, and a divisor that failed to reach the harness
+# would look, in a log, like a sweep that was simply fast.
+say "Generation sweep (STAGED toy grid; solver split and wait as axes, LAPTOP-SCALE search)"
+"$PY" -m games.seven_wonders_duel.f4_staged_sweep \
   --checkpoint "$CKPT" \
   --output "$OUT/generation" \
   --games "$GAMES" --warmup-games 2 --repetitions 1 \
-  --slots 8 --caps 256 --inflight 1 \
-  --workers 1,2 \
+  --slots 8 --caps 256 \
+  --inflight "${REHEARSE_INFLIGHT_CSV:-1,2}" \
+  --workers "${REHEARSE_WORKERS_CSV:-1,2}" \
   --inference-wait-ms "${REHEARSE_WAIT_CSV:-0,2}" \
   --solver-threads-total "0,4" \
   --solver-max-nodes "${REHEARSE_SOLVER_NODES:-2000000}" \
+  --stage-a-inflight 1 --stage-a-wait-ms 0 \
+  --sims-divisor "${REHEARSE_SIMS_DIVISOR:-2}" \
   --device "$DEVICE" --precision bf16 \
   || die "generation sweep did not complete"
 
@@ -178,14 +208,39 @@ say "Checking the infrastructure"
 import json, pathlib, subprocess, sys
 
 out = pathlib.Path(sys.argv[1])
-summary = json.loads(
+payload = json.loads(
     (out / "generation" / "phase_d_sweep.json").read_text(encoding="utf-8")
-)["summary"]
+)
 problems = []
 
-# 1. More than one point, or the sweep reported 1.00x against itself.
-if len(summary) < 2:
-    problems.append(f"grid resolved to {len(summary)} point(s); that is not a measurement")
+# THE UNION OF BOTH STAGES, not `summary`.
+#
+# `summary` is stage B's, and stage B pins everything stage A won -- so read
+# alone it shows one solver split, one slot count and one shard count, and every
+# "did this axis vary" check below would fail on a sweep that measured all of
+# them. That is the same reading error `sweep_launch_env` has to avoid, which is
+# why the driver publishes `staged.stages`; this checks the publication works.
+staged = payload.get("staged")
+if staged is None:
+    problems.append(
+        "no `staged` block: the generation sweep was not driven by "
+        "f4_staged_sweep, so this rehearsed a pipeline the box does not run"
+    )
+    summary = payload["summary"]
+    stage_summaries = [payload["summary"]]
+else:
+    stage_summaries = [stage["summary"] for stage in staged["stages"]]
+    summary = [row for stage in stage_summaries for row in stage]
+
+# 1. More than one point per stage, or that stage reported 1.00x against
+#    itself. Per stage rather than in total: a staged sweep whose second stage
+#    collapsed to one point ranked nothing, and the union would hide it.
+for index, stage in enumerate(stage_summaries):
+    if len(stage) < 2:
+        problems.append(
+            f"stage {index} resolved to {len(stage)} point(s); that is not a "
+            "measurement"
+        )
 
 # 2. The solver axis varied, and -- the point of this check -- the solver
 #    actually DID WORK where it was switched on.
@@ -223,10 +278,24 @@ answered = sum(row.get("solves_answered", 0) for row in on)
 #    and the ratio is 1.00 by construction, which is a fact about the geometry
 #    rather than a failure.
 waits = sorted({row.get("inference_wait_ms", 0.0) for row in summary})
-if len(waits) < 2:
-    problems.append(f"coalescing wait did not vary: {waits}")
 sharded = [row for row in summary if row["scheduler_workers"] > 1]
 single = [row for row in summary if row["scheduler_workers"] == 1]
+# Among MULTI-SHARD points, because that is where the wait can do anything.
+# `f4_phase_d_sweep` drops a positive wait at one shard outright -- one
+# submitter has nothing to merge with -- so a staged sweep whose geometry stage
+# picked a single shard runs its whole wait axis at 0 and proves nothing about
+# the wait. That is a real gap in the rehearsal, not a failure of the code, and
+# it is reported as such with the way to close it.
+sharded_waits = sorted({row.get("inference_wait_ms", 0.0) for row in sharded})
+if len(waits) < 2:
+    problems.append(f"coalescing wait did not vary: {waits}")
+elif len(sharded_waits) < 2:
+    problems.append(
+        f"the wait varied ({waits}) but only at ONE shard, where it is dropped "
+        "by construction -- the geometry stage picked a single shard, so the "
+        "wait plumbing was not exercised. Re-run with REHEARSE_WORKERS_CSV=2,4 "
+        "to force a multi-shard winner."
+    )
 if not sharded:
     problems.append("no multi-shard point, so coalescing could not be exercised")
 elif not any(row.get("median_requests_per_forward", 0.0) > 1.0 for row in sharded):
@@ -285,6 +354,47 @@ else:
             f"  measured_env.sh -> slots={slots} workers={workers} "
             f"gate_slots={gate} wait={wait}ms"
         )
+
+# 6. The staged handoff. Stage B's summary carries ONE solver split, because
+#    stage A pinned it -- so the rule `sweep_launch_env` uses on an unstaged
+#    file ("was the split varied") reads false and the measurement stage A paid
+#    for is silently dropped. The `swept_axes` block is what prevents that, and
+#    nothing else in this script would notice if it stopped arriving.
+if staged is not None:
+    swept = set(staged.get("swept_axes") or ())
+    for axis in ("solver_threads_per_shard", "scheduler_workers"):
+        if len({row.get(axis) for row in stage_summaries[-1]}) > 1:
+            problems.append(
+                f"stage B varied {axis}; the geometry pin did not take"
+            )
+    if "solver_threads_total" not in swept:
+        problems.append(
+            "the split was swept at stage A but swept_axes does not say so, so "
+            "SOLVER_THREADS would be dropped from measured_env.sh"
+        )
+    env_text = env.read_text(encoding="utf-8") if env.is_file() else ""
+    if "export SOLVER_THREADS=" not in env_text:
+        problems.append(
+            "SOLVER_THREADS is absent from measured_env.sh although stage A "
+            "measured the split -- the staged handoff did not reach it"
+        )
+    drift = staged.get("carryover_drift")
+    if drift is None:
+        problems.append(
+            "no carryover_drift: stage B did not re-measure stage A's winning "
+            "point, so the two stages cannot be compared"
+        )
+    else:
+        print(f"  staged: axes {sorted(swept)}, carryover {drift:+.1%}")
+
+# 7. The sims divisor REACHED the harness. A divisor that silently did nothing
+#    looks, in a log, like a sweep that was simply fast -- and on the box it is
+#    the difference between measuring the run's search and a quarter of it.
+divisor = int((payload.get("config") or {}).get("sims_divisor", 0) or 0)
+if divisor < 1:
+    problems.append("the sweep recorded no sims_divisor; provenance is missing")
+else:
+    print(f"  sims divisor recorded: {divisor}x")
 
 if problems:
     print("\n".join(f"  - {p}" for p in problems))

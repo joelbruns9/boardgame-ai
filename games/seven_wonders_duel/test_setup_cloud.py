@@ -396,7 +396,7 @@ def _module_options(module: str) -> set[str]:
 
 
 @pytest.mark.parametrize(
-    "module", ["f4_phase_d_sweep", "w5_gate_slots_sweep"]
+    "module", ["f4_staged_sweep", "w5_gate_slots_sweep"]
 )
 def test_the_sweep_invocations_only_use_flags_that_exist(setup_text, module):
     used = _long_flags(_invocation(setup_text, module))
@@ -414,7 +414,7 @@ def test_both_sweeps_measure_at_the_precision_the_run_will_use(setup_text):
     passed $PRECISION; the generation sweep did not.
     """
 
-    for module in ("f4_phase_d_sweep", "w5_gate_slots_sweep"):
+    for module in ("f4_staged_sweep", "w5_gate_slots_sweep"):
         block = _invocation(setup_text, module)
         assert '--precision "$PRECISION"' in block, f"{module} sweeps at a fixed precision"
 
@@ -426,7 +426,7 @@ def test_the_generation_sweep_passes_comma_separated_axes(setup_text):
     argparse rejects the whole command. That is the original bug.
     """
 
-    block = _invocation(setup_text, "f4_phase_d_sweep")
+    block = _invocation(setup_text, "f4_staged_sweep")
     for axis in ("--slots", "--caps", "--inflight"):
         match = re.search(rf'{axis}\s+"([^"]*)"', block)
         assert match, f"{axis} must be quoted as a single argument: {block}"
@@ -699,8 +699,24 @@ def test_every_flag_cloud6_used_is_passed_or_deliberately_dropped(setup_text):
     block = _block(setup_text, "TRAIN_CMD=(")
     ours = _long_flags(block)
     # Flags the launcher assembles into arrays rather than writing inline.
-    for array in ("ARCH_FLAGS", "SOLVER_FLAGS", "TUNED_FLAGS", "GATE_TUNED_FLAGS"):
+    for array in ("ARCH_FLAGS", "SOLVER_FLAGS"):
         assert f'"${{{array}[@]}}"' in block, f"{array} is not spliced into TRAIN_CMD"
+    # The two MEASURED arrays are appended at stage 10 instead of interpolated
+    # here, because the command is now assembled before the sweep that fills
+    # them -- that is what lets `--emit-config` describe the run to the sweep.
+    # They still have to reach the command line, and "spliced somewhere" is the
+    # property that matters; "spliced in this literal" was only ever a proxy.
+    assert (
+        'TRAIN_CMD+=("${TUNED_FLAGS[@]}" "${GATE_TUNED_FLAGS[@]}")' in setup_text
+    ), "the measured scheduler flags never reach TRAIN_CMD"
+    assembly = setup_text.index("TRAIN_CMD=(")
+    append = setup_text.index('TRAIN_CMD+=("${TUNED_FLAGS[@]}"')
+    sweep = setup_text.index('stage 8b "Scheduler sweeps')
+    launch = setup_text.index("common::launch_detached")
+    assert assembly < sweep < append < launch, (
+        "the command must be assembled BEFORE the sweep that measures it, and "
+        "the measured flags appended AFTER it and before the launch"
+    )
     ours |= _long_flags(setup_text)
 
     missing = sorted(CLOUD6_FLAGS - ours - CLOUD6_FLAGS_DROPPED)
@@ -934,7 +950,8 @@ def _fake_run_repo(tmp_path, harness: bool = True):
             "import argparse\n"
             "p = argparse.ArgumentParser()\n"
             "for flag in ('--workers', '--solver-threads-total',\n"
-            "             '--config-from-manifest', '--checkpoint'):\n"
+            "             '--config-from-manifest', '--sims-divisor',\n"
+            "             '--checkpoint'):\n"
             "    p.add_argument(flag)\n"
             "p.parse_args()\n",
             encoding="utf-8",
@@ -1855,3 +1872,573 @@ def test_the_measured_env_survives_a_path_with_a_space(tmp_path):
     assert slots == "256"
     assert measured == "1"
     assert source.endswith("run dir with spaces")
+
+
+# ---------------------------------------------------------------------------
+# The sweep measures the RUN: --emit-config, --config-from-manifest, and what
+# buying the box hours back is allowed to cost
+# ---------------------------------------------------------------------------
+
+
+def test_the_sweep_is_told_the_configuration_the_run_will_launch(setup_text):
+    """Without this the sweep measures `PhaseDConfig`'s defaults for everything
+    the launcher does not name -- Gumbel at 128 full simulations, to configure a
+    PUCT run at 1600. Simulations per move set the leaf arrival rate, which is
+    exactly what the slot and worker axes act on, so the optimum found that way
+    belongs to a machine nobody is running.
+
+    The run's own manifest cannot serve: it does not exist until the run starts,
+    and the sweep runs first.
+    """
+
+    assert "--emit-config" in setup_text, (
+        "nothing describes this run to the sweep"
+    )
+    block = _invocation(setup_text, "f4_staged_sweep")
+    assert '--config-from-manifest "$RUN_CONFIG_JSON"' in block, (
+        "the sweep is not pointed at the emitted config, so it measures "
+        "dataclass defaults"
+    )
+    # And the emit has to happen BEFORE the sweep reads it.
+    assert setup_text.index("--emit-config") < setup_text.index(
+        "games.seven_wonders_duel.f4_staged_sweep"
+    )
+
+
+def test_emit_config_exists_and_does_not_train():
+    from .phase_d import build_parser
+
+    assert "--emit-config" in _parser_options(build_parser())
+    source = (REPO_ROOT / "games/seven_wonders_duel/phase_d.py").read_text(
+        encoding="utf-8"
+    )
+    block = source[source.index("if args.emit_config:") :][:800]
+    assert "return 0" in block
+    assert "loop.run()" not in block, "emitting a config must not start training"
+
+
+def test_the_generation_sweep_is_staged_rather_than_a_full_product(setup_text):
+    """Six axes at the run's own search is a sweep that costs more than the run
+    it configures. The staged driver ranks geometry first and sweeps the
+    batching axes at the winner: 18 + 6 points against 108."""
+
+    block = _invocation(setup_text, "f4_staged_sweep")
+    for flag in ("--stage-a-inflight", "--stage-a-wait-ms"):
+        assert flag in block, f"{flag} is not pinned, so the stages are not tied"
+
+
+def test_the_stage_a_pins_are_inside_the_axes_they_pin(setup_text):
+    """The driver refuses a pin outside its axis, because stage B would then
+    never re-measure the point stage A chose. The launcher's own defaults must
+    not be the case that trips it."""
+
+    from .f4_staged_sweep import _values
+
+    for pin, axis in (
+        ("SWEEP_STAGE_A_INFLIGHT", "SWEEP_INFLIGHT_CSV"),
+        ("SWEEP_STAGE_A_WAIT_MS", "SWEEP_INFERENCE_WAIT_CSV"),
+    ):
+        pinned = re.search(rf'^{pin}="\$\{{{pin}:-([^}}]*)\}}"$', setup_text, re.M)
+        assert pinned, f"{pin} has no default"
+        swept = re.search(rf'"\$\{{{axis}:-([^}}]*)\}}"', setup_text)
+        assert swept, f"{axis} has no default"
+        assert pinned.group(1) in _values(swept.group(1)), (
+            f"{pin}={pinned.group(1)} is not one of {axis}={swept.group(1)}, so "
+            "the staged sweep would refuse its own launcher's defaults"
+        )
+
+
+def test_the_sweep_budget_knob_scales_the_solver_by_the_same_factor(setup_text):
+    """Dividing the simulations without dividing the solver's node budget would
+    hand the solver the concurrency cheaper generation vacates, and the sweep
+    would rank geometry against a solver share no run has."""
+
+    assert 'SWEEP_SIMS_DIVISOR="${SWEEP_SIMS_DIVISOR:-4}"' in setup_text
+    block = _invocation(setup_text, "f4_staged_sweep")
+    assert '--sims-divisor "$SWEEP_SIMS_DIVISOR"' in block
+
+    source = (REPO_ROOT / "games/seven_wonders_duel/f4_phase_d_sweep.py").read_text(
+        encoding="utf-8"
+    )
+    divided = source[source.index("if args.sims_divisor > 1 and solver_max_nodes > 0:") :][
+        :700
+    ]
+    assert "solver_max_nodes / args.sims_divisor" in divided, (
+        "the node budget is not divided by the same factor as the simulations"
+    )
+    assert "args.solver_max_secs / args.sims_divisor" in divided, (
+        "an explicit deadline is not divided, so node declines become deadline "
+        "declines -- which makes a proof depend on how busy the box was"
+    )
+
+
+def test_the_divisor_keeps_the_search_shape_it_claims_to_keep():
+    """The whole claim of `--sims-divisor` is that it runs the SAME search
+    shallower. A divisor that also moved the algorithm, the mix or top_k would
+    be the defect it was written to avoid, one layer down."""
+
+    from .f4_phase_d_sweep import apply_sims_divisor
+    from .phase_d import PhaseDConfig
+
+    config = PhaseDConfig(
+        run_dir="x",
+        selfplay_search_mode="puct",
+        cheap_search_mode="gumbel",
+        cheap_sims_min=100,
+        cheap_sims_max=100,
+        full_sims_min=1600,
+        full_sims_max=1600,
+        top_k=16,
+        full_search_fraction=0.25,
+    )
+    apply_sims_divisor(config, 4)
+    assert (config.cheap_sims_min, config.cheap_sims_max) == (25, 25)
+    assert (config.full_sims_min, config.full_sims_max) == (400, 400)
+    assert config.selfplay_search_mode == "puct"
+    assert config.cheap_search_mode == "gumbel"
+    assert config.top_k == 16
+    assert config.full_search_fraction == 0.25
+
+
+def test_the_divisor_never_rounds_a_budget_to_zero():
+    from .f4_phase_d_sweep import apply_sims_divisor
+    from .phase_d import PhaseDConfig
+
+    config = PhaseDConfig(
+        run_dir="x", cheap_sims_min=1, cheap_sims_max=2, full_sims_min=1,
+        full_sims_max=2,
+    )
+    apply_sims_divisor(config, 64)
+    assert config.cheap_sims_min >= 1 and config.full_sims_min >= 1
+    config.validate()
+
+
+def test_a_divisor_of_one_changes_nothing():
+    """The default must be inert, or every undivided sweep carries a rounding
+    this was never meant to apply."""
+
+    from .f4_phase_d_sweep import apply_sims_divisor
+    from .phase_d import PhaseDConfig
+
+    config = PhaseDConfig(
+        run_dir="x", cheap_sims_min=100, cheap_sims_max=100,
+        full_sims_min=1600, full_sims_max=1600,
+    )
+    apply_sims_divisor(config, 1)
+    assert (config.cheap_sims_max, config.full_sims_max) == (100, 1600)
+
+
+# ---------------------------------------------------------------------------
+# The staged sweep, and what `sweep_launch_env` has to learn from it
+# ---------------------------------------------------------------------------
+
+
+def _stage_row(**overrides):
+    row = {
+        "slots": 256,
+        "global_batch_cap": 2048,
+        "max_inflight_batches": 1,
+        "scheduler_workers": 4,
+        "inference_wait_ms": 0.0,
+        "solver_threads_per_shard": 2,
+        "solver_threads_total": 8,
+        "median_seconds": 10.0,
+        "median_games_per_hour": 360.0,
+        "median_parked_slot_fraction": 0.18,
+        "median_requests_per_forward": 2.4,
+    }
+    row.update(overrides)
+    return row
+
+
+def _staged_sweep_dir(tmp_path, *, sims_divisor=1):
+    """A staged output: stage A varied the split, stage B held it constant.
+
+    This is the exact shape that defeats the unstaged rule. `summary` is stage
+    B's, whose solver column is constant BECAUSE STAGE A PINNED IT -- not
+    because nobody measured it.
+    """
+
+    import json
+
+    generation = tmp_path / "generation"
+    generation.mkdir(parents=True)
+    stage_b = [
+        _stage_row(inference_wait_ms=2.0, median_seconds=9.0),
+        _stage_row(inference_wait_ms=0.0, median_seconds=10.0),
+    ]
+    stage_a = [
+        _stage_row(),
+        _stage_row(solver_threads_per_shard=0, solver_threads_total=0,
+                   median_seconds=11.0),
+    ]
+    (generation / "phase_d_sweep.json").write_text(
+        json.dumps(
+            {
+                "config": {"sims_divisor": sims_divisor, "staged": True},
+                "summary": stage_b,
+                "staged": {
+                    "winner": stage_b[0],
+                    "swept_axes": [
+                        "inference_wait_ms",
+                        "solver_threads_total",
+                    ],
+                    "carryover_drift": 0.01,
+                    "stages": [
+                        {"name": "geometry", "summary": stage_a},
+                        {"name": "batching", "summary": stage_b},
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "gate_200.json").write_text(
+        json.dumps({"best": {"slots": 144, "global_batch_cap": 256}}),
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+def test_a_staged_sweep_pins_the_split_its_first_stage_measured(tmp_path):
+    """Stage B's summary has ONE solver value, so the unstaged rule
+    (`len(splits) > 1`) would conclude the split was never swept and decline to
+    pin it -- throwing away the measurement stage A paid for."""
+
+    from games.seven_wonders_duel.sweep_launch_env import build_env, render
+
+    env = build_env(_staged_sweep_dir(tmp_path), "200")
+    assert env["SOLVER_THREADS"] == 2, (
+        "the staged sweep measured the split at stage A and it was dropped"
+    )
+    assert env["RUST_INFERENCE_WAIT_MS"] == 2.0
+    assert env["_WAIT_WAS_SWEPT"] is True
+    text = render(env)
+    assert "MEASURED here, so it is pinned" in text
+    assert "STAGED sweep" in text
+
+
+def test_the_staged_winner_is_the_row_the_driver_named(tmp_path):
+    """Not `summary[0]` by luck. They agree here on purpose -- stage B's summary
+    is sorted fastest-first -- and the point is that the winner is READ rather
+    than re-derived, so a driver that ever sorts differently cannot silently
+    hand over a different point."""
+
+    from games.seven_wonders_duel.sweep_launch_env import build_env
+
+    env = build_env(_staged_sweep_dir(tmp_path), "200")
+    assert env["RUST_SLOTS"] == 256
+    assert env["RUST_GLOBAL_BATCH_CAP"] == 2048
+    assert env["RUST_SCHEDULER_WORKERS"] == 4
+
+
+def test_a_divided_sweep_says_so_where_the_operator_reads_it(tmp_path):
+    """The geometry is still the geometry to launch on. The games/hour is not
+    the run's rate, and the file carrying the numbers is the only place anyone
+    would find that out."""
+
+    from games.seven_wonders_duel.sweep_launch_env import build_env, render
+
+    divided = render(build_env(_staged_sweep_dir(tmp_path / "a", sims_divisor=4), "200"))
+    assert "1/4 of the run's SIMULATION budget" in divided
+    assert "not a prediction" in divided
+    # ...and it must not be exported: it is not a launcher knob.
+    assert "export _SIMS_DIVISOR" not in divided
+    assert "SIMS_DIVISOR=" not in [
+        line.removeprefix("export ").split("=", 1)[0] + "="
+        for line in divided.splitlines()
+        if line.startswith("export ")
+    ]
+
+    plain = render(build_env(_staged_sweep_dir(tmp_path / "b", sims_divisor=1), "200"))
+    assert "SIMULATION budget" not in plain
+
+
+def test_an_unstaged_sweep_still_works_unchanged(tmp_path):
+    """The staged block is additive. A `phase_d_sweep.json` from the plain
+    harness -- which is what `sweep_7wd.sh` still writes -- must read exactly as
+    it did before."""
+
+    from games.seven_wonders_duel.sweep_launch_env import build_env
+
+    env = build_env(_sweep_dir(tmp_path, vary_solver=True), "200")
+    assert env["RUST_SLOTS"] == 256
+    assert env["SOLVER_THREADS"] == 2
+    assert "_STAGED_AXES" not in env
+
+
+def test_the_driver_refuses_a_pin_its_second_stage_never_measures():
+    """A pin outside the stage-B axis means the two stages share no row, so they
+    can only be compared across a configuration change -- and the carryover
+    check that catches a drifting box has nothing to compare."""
+
+    from games.seven_wonders_duel import f4_staged_sweep
+
+    with pytest.raises(SystemExit) as raised:
+        f4_staged_sweep.main(
+            [
+                "--checkpoint", "x", "--output", "y",
+                "--inflight", "1,2", "--stage-a-inflight", "4",
+            ]
+        )
+    assert "never re-measure" in str(raised.value)
+
+
+def test_the_driver_reports_the_split_by_the_column_that_means_it():
+    """`solver_threads_total` is split x workers, so it varies whenever the
+    WORKER axis does -- a grid that held the total fixed across workers has a
+    moving total and a split nobody swept. `sweep_launch_env` has always read
+    the per-shard column for this, and the staged output has to agree or a
+    constant gets dressed up as a measurement."""
+
+    from games.seven_wonders_duel.f4_staged_sweep import AXES
+
+    _flag, reported, varied_key = AXES["solver"]
+    assert reported == "solver_threads_total"
+    assert varied_key == "solver_threads_per_shard"
+
+
+def test_the_driver_pins_stage_a_s_winner_into_stage_b(tmp_path, monkeypatch):
+    """The plumbing, end to end, without a GPU: stage A's winning geometry must
+    arrive at stage B as PINNED AXES, and the solver must arrive as the winning
+    row's own per-shard count rather than as the flag's.
+
+    That last one is the trap. `f4_phase_d_sweep` falls back to
+    `--solver-threads` whenever the total axis is exactly `[0]`, so forwarding
+    the launcher's per-shard value would revive the solver at a stage whose
+    pinned total is 0 -- and "solver off" is a measured point with its own cost
+    curve, not an absence.
+    """
+
+    import json
+    from games.seven_wonders_duel import f4_staged_sweep
+
+    seen: list[dict] = []
+
+    def fake_main(argv):
+        flags = {}
+        for index, token in enumerate(argv):
+            if token.startswith("--") and index + 1 < len(argv):
+                flags[token] = argv[index + 1]
+        seen.append(flags)
+        # Stage A: the 512-slot / 1-shard / solver-off point wins.
+        if len(seen) == 1:
+            rows = [
+                _stage_row(slots=512, scheduler_workers=1,
+                           solver_threads_per_shard=0, solver_threads_total=0,
+                           median_seconds=8.0),
+                _stage_row(median_seconds=9.0),
+            ]
+        else:
+            rows = [
+                _stage_row(slots=512, scheduler_workers=1,
+                           solver_threads_per_shard=0, solver_threads_total=0,
+                           max_inflight_batches=2, median_seconds=7.0),
+                _stage_row(slots=512, scheduler_workers=1,
+                           solver_threads_per_shard=0, solver_threads_total=0,
+                           median_seconds=8.0),
+            ]
+        return {"summary": rows, "config": {"sims_divisor": 4}}
+
+    monkeypatch.setattr(f4_staged_sweep.sweep, "main", fake_main)
+    assert (
+        f4_staged_sweep.main(
+            [
+                "--checkpoint", "ckpt.pt",
+                "--output", str(tmp_path),
+                "--slots", "256,512",
+                "--workers", "1,4",
+                "--solver-threads-total", "0,8",
+                "--solver-threads", "3",
+                "--inflight", "1,2",
+                "--inference-wait-ms", "0,2",
+                "--sims-divisor", "4",
+            ]
+        )
+        == 0
+    )
+
+    stage_a, stage_b = seen
+    # Stage A sweeps geometry and sits still on the batching axes.
+    assert stage_a["--slots"] == "256,512" and stage_a["--workers"] == "1,4"
+    assert stage_a["--inflight"] == "1" and stage_a["--inference-wait-ms"] == "0"
+    # Stage B is the mirror image, at the winner.
+    assert stage_b["--slots"] == "512" and stage_b["--workers"] == "1"
+    assert stage_b["--inflight"] == "1,2"
+    assert stage_b["--inference-wait-ms"] == "0,2"
+    assert stage_b["--solver-threads-total"] == "0"
+    assert stage_b["--solver-threads"] == "0", (
+        "stage B revived the solver the winning point had OFF"
+    )
+    # And both stages measured the same search.
+    assert stage_a["--sims-divisor"] == stage_b["--sims-divisor"] == "4"
+
+    payload = json.loads(
+        (tmp_path / "phase_d_sweep.json").read_text(encoding="utf-8")
+    )
+    assert payload["summary"][0]["max_inflight_batches"] == 2
+    assert payload["staged"]["winner"]["max_inflight_batches"] == 2
+    # Varied at stage A only, at stage B only, and nowhere.
+    swept = payload["staged"]["swept_axes"]
+    assert "slots" in swept and "scheduler_workers" in swept
+    assert "solver_threads_total" in swept
+    assert "max_inflight_batches" in swept
+    assert "global_batch_cap" not in swept
+    # Stage B re-measured stage A's point, so the stages can be compared.
+    assert payload["staged"]["carryover_drift"] == pytest.approx(0.0)
+
+
+def test_the_driver_refuses_a_stage_b_that_lost_the_pin(tmp_path, monkeypatch):
+    """A flag forwarded to the wrong stage produces a winner describing a
+    geometry nobody measured, and it looks exactly like a legitimate result."""
+
+    from games.seven_wonders_duel import f4_staged_sweep
+
+    calls = []
+
+    def fake_main(argv):
+        calls.append(argv)
+        slots = 256 if len(calls) == 1 else 128
+        return {"summary": [_stage_row(slots=slots)], "config": {}}
+
+    monkeypatch.setattr(f4_staged_sweep.sweep, "main", fake_main)
+    with pytest.raises(SystemExit) as raised:
+        f4_staged_sweep.main(
+            ["--checkpoint", "c", "--output", str(tmp_path)]
+        )
+    assert "pin did not reach the harness" in str(raised.value)
+
+
+# ---------------------------------------------------------------------------
+# rehearse_sweep_laptop.sh -- it only rehearses what the box actually runs
+# ---------------------------------------------------------------------------
+
+REHEARSAL = REPO_ROOT / "rehearse_sweep_laptop.sh"
+
+
+@pytest.fixture(scope="module")
+def rehearsal_text() -> str:
+    return REHEARSAL.read_text(encoding="utf-8")
+
+
+def test_the_rehearsal_drives_the_harness_the_box_drives(rehearsal_text, setup_text):
+    """This script exists to prove the box's stage-8b plumbing on a laptop
+    before anything is rented. A rehearsal of a DIFFERENT harness than the one
+    stage 8b calls is worse than none: it reports OK for a pipeline nobody is
+    going to run."""
+
+    launcher = re.search(
+        r"games\.seven_wonders_duel\.(f4_\w*sweep)", setup_text
+    )
+    assert launcher, "the launcher calls no generation sweep"
+    assert f"games.seven_wonders_duel.{launcher.group(1)}" in rehearsal_text, (
+        f"the launcher drives {launcher.group(1)} and the rehearsal does not"
+    )
+
+
+def test_the_rehearsal_checks_the_staged_handoff(rehearsal_text):
+    """The one thing the staged output adds over the plain one is `swept_axes`,
+    and nothing else in the rehearsal would notice if it stopped arriving --
+    the geometry would still be right and SOLVER_THREADS would just vanish."""
+
+    assert "swept_axes" in rehearsal_text
+    assert "carryover_drift" in rehearsal_text
+    assert "export SOLVER_THREADS=" in rehearsal_text, (
+        "nothing checks the split reaches measured_env.sh"
+    )
+
+
+def test_the_rehearsal_reads_both_stages_not_just_the_last(rehearsal_text):
+    """Stage B pins everything stage A won, so its summary shows one solver
+    split, one slot count and one shard count. Every `did this axis vary` check
+    would fail on a sweep that measured all of them."""
+
+    assert "stage_summaries" in rehearsal_text
+    assert 'staged["stages"]' in rehearsal_text
+
+
+def test_the_solver_liveness_check_reads_both_stages(setup_text):
+    """The batching stage pins whatever the geometry stage won, including the
+    split. If the solver-OFF point wins, every row in `summary` reads zero and
+    the check reports "no point ran with the solver on" about a sweep that
+    measured the split thoroughly -- passing, silently, for the wrong reason."""
+
+    block = setup_text[setup_text.index("<<'PYSOLVES'") :]
+    block = block[: block.index("PYSOLVES\n", 20)]
+    assert 'staged["stages"]' in block, (
+        "the liveness check reads only the last stage's summary"
+    )
+
+
+def test_the_emitted_config_is_the_search_the_sweep_then_measures(tmp_path):
+    """The whole chain, on a laptop: launcher-style flags -> `--emit-config` ->
+    `config_from_manifest`. Each half has its own test; neither notices if the
+    JSON one writes is not the JSON the other reads, and that is the failure
+    this ordering change exists to make impossible.
+    """
+
+    import json
+    import sys
+
+    from .f4_phase_d_sweep import (
+        apply_sims_divisor,
+        config_from_manifest,
+        _find_manifest_value,
+    )
+
+    emitted = tmp_path / "run_config.json"
+    proc = subprocess.run(
+        [
+            sys.executable, "-m", "games.seven_wonders_duel.phase_d",
+            "--emit-config", str(emitted),
+            "--run-dir", str(tmp_path / "run"), "--device", "cpu",
+            "--selfplay-search-mode", "puct", "--cheap-search-mode", "gumbel",
+            "--cheap-sims-min", "100", "--cheap-sims-max", "100",
+            "--full-sims-min", "1600", "--full-sims-max", "1600",
+            "--top-k", "16", "--full-search-fraction", "0.25",
+            "--endgame-solver-max-nodes", "40000000",
+            "--endgame-solver-max-secs", "170", "--solver-threads", "1",
+            "--pooled-readout", "--reply-head",
+            "--rust-slots", "256", "--rust-global-batch-cap", "2048",
+            "--rust-scheduler-workers", "4",
+            "--train-steps", "120", "--weight-decay", "0.5",
+            "--leaf-batch", "1", "--virtual-loss-root",
+            "--cheap-leaf-batch", "16", "--eval-leaf-batch", "16",
+            "--cheap-conflict-free-waves", "--cheap-round-robin-candidates",
+        ],
+        capture_output=True, text=True, cwd=REPO_ROOT,
+    )
+    assert proc.returncode == 0, proc.stdout[-800:] + proc.stderr[-800:]
+
+    config = config_from_manifest(
+        emitted,
+        output=tmp_path / "sweep",
+        device="cpu",
+        games=8,
+        precision="fp32",
+        geometry={"d_model": 128, "layers": 4, "heads": 4},
+    )
+    # The search, which is what the whole reorder was for.
+    assert config.selfplay_search_mode == "puct"
+    assert (config.cheap_sims_max, config.full_sims_max) == (100, 1600)
+    assert config.top_k == 16 and config.full_search_fraction == 0.25
+    # The architecture, which decides what a leaf costs.
+    assert config.pooled_readout and config.reply_head
+    # The solver budget, which the sweep reads out of the manifest separately.
+    assert (
+        _find_manifest_value(
+            json.loads(emitted.read_text(encoding="utf-8")),
+            "endgame_solver_max_nodes",
+        )
+        == 40000000
+    )
+    # And the UNMEASURED geometry, which is the baseline the grid is ranked
+    # against -- "what would changing this buy me" is only answered against the
+    # status quo. It is absent from the emitted config only if the launcher
+    # appended its measured flags too early.
+    assert config.rust_slots == 256
+    assert config.rust_global_batch_cap == 2048
+    assert config.rust_scheduler_workers == 4
+
+    apply_sims_divisor(config, 4)
+    assert (config.cheap_sims_max, config.full_sims_max) == (25, 400)

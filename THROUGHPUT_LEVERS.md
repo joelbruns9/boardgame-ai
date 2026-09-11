@@ -205,6 +205,37 @@ Requirements for any sweep harness:
   reports `1.00x` against itself. That is not a measurement, and it is
   surprisingly easy not to notice.
 
+**And then pay for it.** Those requirements are not free, and the bill lands in
+the same place every time: building the config from the run's manifest makes
+each grid point cost what an iteration of the run costs, and sweeping the axes
+jointly makes the number of points a product. 7WD's generation sweep went from a
+128-simulation default to the run's 1600 across six axes — 108 points, twice
+over. A sweep nobody can afford to run is not more rigorous than a cheap one; it
+is a sweep that does not happen, and the geometry ships unmeasured.
+
+Two cuts keep the requirements and buy the hours back, and the rule for both is
+that what they give up must be *stated in the output*, not discovered later:
+
+- **Stage the grid.** Rank the axes that interact strongly (in 7WD: slots, batch
+  cap, shard count, solver split) first, then sweep the remaining axes at the
+  winner. 18 + 6 points against 108. What you give up is the second stage's
+  ability to reorder the first, so name the interaction where that is known to
+  bite — here, the coalescing wait rewards high shard counts, and stage A ranks
+  shards without it — and expose a knob that pins the second-stage axes wherever
+  the operator needs them. Publish which axes were varied *across* stages: the
+  second stage's summary holds the first stage's winners as constants, so a
+  consumer reading it alone concludes those axes were never measured.
+- **Divide the search budget, and the workload budget with it.** Run every point
+  at 1/N of the run's simulations, and divide the solver's node budget by the
+  same N so the workload class keeps its share of slot occupancy. What survives:
+  the search algorithm, the cheap/full mix, `top_k`, the chance fan-out. What
+  does not: absolute throughput — games/hour is now roughly N times the run's
+  rate and is not a prediction of anything. Only the RATIOS between points are a
+  result. Measure the share you claim to be preserving (7WD records
+  `parked_slot_fraction` per point) rather than asserting it: dividing an
+  ADMISSION THRESHOLD is not the same as dividing a cost, and the residual
+  should be a number somebody can check against the live run's profile.
+
 ### 3.2 Know which resource binds, and use the right number for it
 
 Only a lever that relieves the binding resource can help. Everything else

@@ -60,6 +60,20 @@ def build_env(sweep_dir: Path, gate_rung: str) -> dict[str, object]:
     best_generation = summary[0]
     best_gate = _require(gate, "best", gate_path)
 
+    # THE STAGED SWEEP, when `f4_staged_sweep` drove it.
+    #
+    # Its `summary` is stage B's, which already carries stage A's winning
+    # geometry on every row -- so everything above is correct without this block
+    # and a file written by the old harness still works. What the block adds is
+    # WHICH AXES WERE VARIED. The two conditional emits below ask exactly that
+    # question, and stage B's summary cannot answer it: the solver column is
+    # constant there because stage A pinned it, not because nobody measured it.
+    staged = generation.get("staged")
+    swept: set[str] | None = None
+    if isinstance(staged, dict):
+        best_generation = staged.get("winner") or best_generation
+        swept = set(staged.get("swept_axes") or ())
+
     env: dict[str, object] = {
         "RUST_SLOTS": int(best_generation["slots"]),
         "RUST_GLOBAL_BATCH_CAP": int(best_generation["global_batch_cap"]),
@@ -81,7 +95,10 @@ def build_env(sweep_dir: Path, gate_rung: str) -> dict[str, object]:
         for row in summary
         if "solver_threads_per_shard" in row
     }
-    if len(splits) > 1:
+    solver_was_swept = (
+        "solver_threads_total" in swept if swept is not None else len(splits) > 1
+    )
+    if solver_was_swept and "solver_threads_per_shard" in best_generation:
         env["SOLVER_THREADS"] = int(best_generation["solver_threads_per_shard"])
     # The coalescing wait: emitted whenever the winning row HAS one, varied or
     # not.
@@ -104,7 +121,9 @@ def build_env(sweep_dir: Path, gate_rung: str) -> dict[str, object]:
         waits = {
             row["inference_wait_ms"] for row in summary if "inference_wait_ms" in row
         }
-        env["_WAIT_WAS_SWEPT"] = len(waits) > 1
+        env["_WAIT_WAS_SWEPT"] = (
+            "inference_wait_ms" in swept if swept is not None else len(waits) > 1
+        )
     # Provenance. `SKIP_SWEEPS` cannot serve as this marker: an operator sets
     # that by hand to skip measuring altogether, so it is true in exactly the
     # case this needs to detect.
@@ -114,6 +133,17 @@ def build_env(sweep_dir: Path, gate_rung: str) -> dict[str, object]:
         env["_REQUESTS_PER_FORWARD"] = float(
             best_generation["median_requests_per_forward"]
         )
+    # The SEARCH BUDGET the geometry was chosen at, and whether it was staged.
+    # Both are underscore-prefixed: they steer `render`'s comments and are never
+    # exported, because neither is a launcher knob. A geometry measured at a
+    # quarter of the run's simulations is still the right geometry to launch on
+    # -- it is just not a measurement of the run's throughput, and the file that
+    # carries it should say so where the operator reads it.
+    divisor = int((generation.get("config") or {}).get("sims_divisor", 1) or 1)
+    if divisor > 1:
+        env["_SIMS_DIVISOR"] = divisor
+    if swept is not None:
+        env["_STAGED_AXES"] = ",".join(sorted(swept))
     env["SWEEP_MEASURED"] = "1"
     env["SWEEP_MEASURED_FROM"] = str(sweep_dir.resolve())
     return env
@@ -124,6 +154,30 @@ def render(env: dict[str, object]) -> str:
         "# Measured on this box (setup_cloud_7wd.sh stage 8b, or sweep_7wd.sh).",
         "# Source this, then re-run the launcher to launch on these numbers.",
     ]
+    if "_STAGED_AXES" in env:
+        lines += [
+            "#",
+            "# STAGED sweep (f4_staged_sweep): geometry -- slots, cap, workers,",
+            "# solver split -- was ranked first, then the inflight and wait axes",
+            "# were swept at the winning geometry. That is a SUM of two grids",
+            "# rather than their product; the cost is that the second stage",
+            "# cannot reorder the first. Axes that actually varied somewhere:",
+            f"#   {env['_STAGED_AXES']}",
+        ]
+    if "_SIMS_DIVISOR" in env:
+        divisor = env["_SIMS_DIVISOR"]
+        lines += [
+            "#",
+            f"# ! Measured at 1/{divisor} of the run's SIMULATION budget, with the",
+            "#   solver's node budget divided by the same factor. The geometry",
+            "#   below is still the geometry to launch on: what the sweep ranks",
+            "#   is points against each other, and the search algorithm, the",
+            "#   cheap/full mix and the solver's share of slot occupancy all",
+            "#   survive the division.",
+            "#   What does NOT survive is the ABSOLUTE throughput. Any games/hour",
+            f"#   in the sweep output is roughly {divisor}x the run's rate and is",
+            "#   not a prediction. Read the run's own heartbeat for that.",
+        ]
     if "RUST_SCHEDULER_WORKERS" in env and "SOLVER_THREADS" not in env:
         workers = env["RUST_SCHEDULER_WORKERS"]
         lines += [

@@ -784,6 +784,22 @@ first. So the launcher emits one, and points the sweep at it. Validated on the
 way out: emitting a config Phase D would refuse is worse than emitting none,
 because the sweep would then measure a geometry no run can launch.
 
+`setup_cloud_7wd.sh` calls this from stage 8b, which is why its training flags
+are assembled before that stage rather than inside stage 10. The scheduler
+settings measured BY the sweep (`TUNED_FLAGS`, `GATE_TUNED_FLAGS`) are appended
+afterwards and so are absent from the emitted config -- deliberately: what is
+left in their place is the launcher's own default geometry, which is exactly the
+baseline the sweep should rank its grid against.
+
+Paying for the fidelity: each grid point now costs what an iteration of the run
+costs. Two knobs buy it back, both in the sweep rather than here --
+`f4_staged_sweep` (rank geometry, then sweep the batching axes at the winner)
+and `--sims-divisor` (every point at 1/N of the run's simulations, with the
+solver's node budget divided by the same N). The first gives up stage B's
+ability to reorder stage A; the second gives up absolute throughput, and keeps
+the search algorithm, the cheap/full mix, `top_k` and the solver's share of slot
+occupancy.
+
 ### `--exclude-parked-from-budget`, `--no-exclude-parked-from-budget`
 
 **Default:** off.

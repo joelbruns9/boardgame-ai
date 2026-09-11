@@ -83,6 +83,14 @@ def timed_scheduler_calls():
                 "boundary_forward_rows",
                 "coalesce_wait_ns",
                 "coalesce_carried",
+                # The SOLVER's share of slot occupancy, time-weighted. A parked
+                # slot yields no evaluation group until its solve returns, so
+                # this is the concurrency the solver takes away from generation
+                # -- and it is the quantity `--sims-divisor` assumes it holds
+                # roughly fixed. Recorded so that assumption is checkable
+                # against the live run's profile rather than asserted.
+                "parked_slot_ns",
+                "live_slot_ns",
             )
         }
         try:
@@ -248,6 +256,73 @@ def apply_config_overrides(config, overrides: list[str]) -> "pd.PhaseDConfig":
     return config
 
 
+SIMS_FIELDS = ("cheap_sims_min", "cheap_sims_max", "full_sims_min", "full_sims_max")
+
+
+def apply_sims_divisor(config, divisor: int) -> "pd.PhaseDConfig":
+    """Divide the SEARCH BUDGET by `divisor`, keeping the search's shape.
+
+    `--config-from-manifest` is what makes this necessary. Before it, the sweep
+    measured `PhaseDConfig`'s laptop defaults -- 24 cheap and 128 full sims of
+    Gumbel -- while configuring a run at 100 and 1600 of PUCT. Fixing that
+    multiplied the box hours by roughly the same factor it fixed the fidelity
+    by, against a grid that is already dozens of points times two repetitions.
+
+    So: the honest cheap sweep is not a DIFFERENT search, it is the SAME search
+    run shallower. What survives the divisor:
+
+    * the search ALGORITHM (`selfplay_search_mode`, `cheap_search_mode`) -- the
+      thing whose absence made the old default sweep meaningless;
+    * the cheap/full MIX (`full_search_fraction`, `full_search_every_games`), so
+      the leaf arrival rate keeps the run's bimodal shape rather than averaging
+      into one;
+    * `top_k` and the chance fan-out, so a full search still splits its visits
+      across the same number of worlds;
+    * the SOLVER-to-generation ratio, because the caller divides the node budget
+      by the same factor -- see the caveat below.
+
+    What does NOT survive, and must not be read off a divided sweep:
+
+    * absolute throughput. `games_per_hour` at divisor 4 is roughly 4x the run's
+      rate and is not a prediction of anything. The ratios BETWEEN points are
+      what this sweep is for; the absolute number belongs to the undivided run.
+    * the per-move leaf arrival RATE, which is exactly what the slot and worker
+      axes act on. A large divisor measures a lighter machine, and a geometry
+      chosen there is chosen for it. 4 keeps a 1600-sim full search at 400,
+      which is still deeper than anything the old default sweep ever ran.
+
+    The solver caveat, stated rather than buried: dividing the node budget is
+    the closest cheap approximation, not an identity. The budget is an
+    ADMISSION THRESHOLD, so halving it both shortens each solve and refuses the
+    expensive positions -- which carry most of the nodes. Leaving it alone
+    instead would over-weight the solver by the full divisor, since games finish
+    that much faster while each solve costs the same. Neither is exact, the
+    divided budget is the nearer of the two, and `parked_slot_fraction` is
+    recorded at every point so the residual is a number the operator can compare
+    against the live run's profile instead of a hope.
+    """
+
+    if divisor <= 1:
+        return config
+    before = {name: getattr(config, name) for name in SIMS_FIELDS}
+    for name in SIMS_FIELDS:
+        setattr(config, name, max(1, round(before[name] / divisor)))
+    # Re-validate: `validate` enforces `1 <= min <= max` on both pairs, and
+    # rounding can collapse a narrow band -- finding that at the first grid
+    # point would waste the model load and the warmup before it.
+    config.validate()
+    print(
+        f"sims divisor {divisor}x: "
+        + ", ".join(
+            f"{name}={before[name]}->{getattr(config, name)}" for name in SIMS_FIELDS
+        )
+        + " (ratios between points are the result; absolute games/hour is NOT "
+        "the run's rate)",
+        flush=True,
+    )
+    return config
+
+
 def steady_state_schedules(loop) -> "pd.ResolvedSchedules":
     """Schedules for the part of the run this geometry has to serve.
 
@@ -368,6 +443,8 @@ def run_point(
             "boundary_forward_rows",
             "coalesce_wait_ns",
             "coalesce_carried",
+            "parked_slot_ns",
+            "live_slot_ns",
         )
     }
     waves = [call["mean_wave_width"] for call in calls if call.get("mean_wave_width")]
@@ -394,6 +471,16 @@ def run_point(
         ),
         "coalesce_wait_seconds": int(scheduler.get("coalesce_wait_ns", 0)) / 1e9,
         "coalesce_carried": int(scheduler.get("coalesce_carried", 0)),
+        # Slot-time parked on a solve, as a share of slot-time live. This is
+        # what "the solver costs concurrency" means as a number: at 0.30 the
+        # solver is holding three slots in ten, and the slot axis is really
+        # being swept at 70% of its label.
+        "parked_slot_ns": int(scheduler.get("parked_slot_ns", 0)),
+        "live_slot_ns": int(scheduler.get("live_slot_ns", 0)),
+        "parked_slot_fraction": (
+            int(scheduler.get("parked_slot_ns", 0))
+            / int(scheduler.get("live_slot_ns", 1) or 1)
+        ),
         # GPU-side forwards, from the Python adapter. A routed model runs one
         # per network present, so this is the number that says whether a merge
         # actually reduced GPU work or only the boundary hop.
@@ -443,7 +530,16 @@ def run_point(
     return stats, fingerprint
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> dict:
+    """Run the grid and return the payload it wrote.
+
+    Takes `argv` and returns the payload so a DRIVER can stage this harness --
+    `f4_staged_sweep` runs it twice, reads the first stage's winner and pins it
+    for the second. Both would be possible over subprocesses and a JSON file;
+    doing it in process keeps one parser as the single place an axis is
+    validated, and keeps a driver from having to re-quote every flag.
+    """
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output", required=True)
@@ -467,6 +563,19 @@ def main() -> None:
         help="set a PhaseDConfig field after the manifest is read; repeatable. "
         "Needed to sweep a configuration no run has used yet, e.g. "
         "--config-override leaf_batch=6 --config-override virtual_loss_root=true",
+    )
+    parser.add_argument(
+        "--sims-divisor",
+        type=int,
+        default=1,
+        help="divide the run's simulation budget (and, with it, the solver's "
+        "node budget and deadline) by this factor at every point. The default "
+        "of 1 measures the run's own search. Use it to buy grid points with "
+        "box hours once --config-from-manifest has made each point cost what "
+        "the run costs: it keeps the search ALGORITHM, the cheap/full mix, "
+        "top_k and the solver-to-generation ratio, and gives up absolute "
+        "throughput -- games/hour from a divided sweep is not the run's rate, "
+        "only the ratios between points are. See `apply_sims_divisor`.",
     )
     parser.add_argument(
         "--config-from-manifest",
@@ -538,7 +647,9 @@ def main() -> None:
         "answer. `0` in the list measures with the solver off, which is the "
         "honest baseline for what solving costs.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.sims_divisor < 1:
+        raise SystemExit("--sims-divisor must be 1 or more")
 
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
@@ -583,7 +694,16 @@ def main() -> None:
             flush=True,
         )
     if not grid:
-        raise SystemExit("every grid point has fewer slots than shards")
+        # Naming both filters, because they are both reachable and the message
+        # used to name only the first. A staged sweep that pins one shard and a
+        # positive wait empties the grid here, and "fewer slots than shards" is
+        # then a wrong answer to a real question.
+        raise SystemExit(
+            "the grid is empty after dropping points with fewer slots than "
+            "shards, and single-shard points with a positive coalescing wait. "
+            "Raise --slots above --workers, or drop the positive waits when "
+            "sweeping one shard."
+        )
 
     # A point cannot hold more games live than it is GIVEN. The scheduler
     # activates a queued game whenever one finishes, so at `--games 200` a
@@ -660,6 +780,22 @@ def main() -> None:
         if found:
             solver_max_nodes = int(found)
             print(f"solver budget from manifest: {solver_max_nodes:,} nodes", flush=True)
+    # The SAME factor as the sims, so the solver keeps its share of slot
+    # occupancy instead of growing into the space cheaper generation vacates.
+    # `run_point` derives the deadline from the node budget when none is given,
+    # so that follows automatically; an explicit one has to be divided here or
+    # the sweep would turn node declines into deadline declines, which is the
+    # one kind of decline the launcher's stage 6b exists to avoid.
+    if args.sims_divisor > 1 and solver_max_nodes > 0:
+        divided = max(1, round(solver_max_nodes / args.sims_divisor))
+        print(
+            f"solver budget divided {args.sims_divisor}x: "
+            f"{solver_max_nodes:,} -> {divided:,} nodes",
+            flush=True,
+        )
+        solver_max_nodes = divided
+        if args.solver_max_secs > 0:
+            args.solver_max_secs = args.solver_max_secs / args.sims_divisor
     if solver_totals != [0] and solver_max_nodes <= 0:
         raise SystemExit(
             "a solver split was requested but no node budget is available, so "
@@ -698,6 +834,10 @@ def main() -> None:
             **geometry,
         )
     config = apply_config_overrides(config, args.config_override)
+    # LAST, so an explicit --config-override names the budget the operator
+    # meant and the divisor is applied to that rather than to whatever the
+    # manifest happened to carry.
+    config = apply_sims_divisor(config, args.sims_divisor)
 
     # SNAPSHOT before anything runs. `run_point` assigns loop.config.rust_slots
     # and friends at every grid point, and `run_config` is the same object, so
@@ -786,7 +926,8 @@ def main() -> None:
                 f"wait={wait_ms:<4g} "
                 f"fwd={stats['mean_forward_rows']:6.1f}x{stats['requests_per_forward']:.2f} "
                 f"batch={stats['mean_batch_size']:6.1f} "
-                f"wave={stats['mean_wave_width']:4.2f}  "
+                f"wave={stats['mean_wave_width']:4.2f} "
+                f"park={stats['parked_slot_fraction']:4.0%} "
                 f"{stats['wall_seconds']:7.1f}s  {stats['games_per_hour']:7.0f} games/h  "
                 + detail,
                 flush=True,
@@ -822,6 +963,13 @@ def main() -> None:
                 ),
                 "coalesce_wait_seconds": sum(
                     row["coalesce_wait_seconds"] for row in matching
+                ),
+                # See `parked_slot_fraction` in `run_point`. Carried into the
+                # summary because `--sims-divisor` is only honest while this
+                # stays near the run's own figure, and the summary is the only
+                # thing `sweep_launch_env` and a human ever read.
+                "median_parked_slot_fraction": statistics.median(
+                    row.get("parked_slot_fraction", 0.0) for row in matching
                 ),
                 "median_model_forwards_per_forward": statistics.median(
                     row["model_forwards_per_forward"] for row in matching
@@ -933,6 +1081,13 @@ def main() -> None:
             "checkpoint": args.checkpoint,
             "games": args.games,
             "repetitions": args.repetitions,
+            # Provenance, read by `sweep_launch_env` so `measured_env.sh` can
+            # say the geometry was chosen at a reduced search budget. A number
+            # in a file nobody reads is not provenance.
+            "sims_divisor": args.sims_divisor,
+            "cheap_sims": [config.cheap_sims_min, config.cheap_sims_max],
+            "full_sims": [config.full_sims_min, config.full_sims_max],
+            "solver_max_nodes": solver_max_nodes,
             "grid": [list(point) for point in grid],
             "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
             "opponent_fraction": config.opponent_fraction,
@@ -956,7 +1111,8 @@ def main() -> None:
             f"fwd={row['median_forward_rows']:5.0f}"
             f"x{row['median_requests_per_forward']:.2f} "
             f"batch={row['median_batch_size']:5.0f} "
-            f"wave={row['median_wave_width']:4.2f}  "
+            f"wave={row['median_wave_width']:4.2f} "
+            f"park={row['median_parked_slot_fraction']:4.0%} "
             f"{row['median_games_per_hour']:7.0f} games/h  "
             f"({row['speedup_vs_baseline']:.2f}x vs {baseline_label})"
         )
@@ -964,6 +1120,7 @@ def main() -> None:
         f"\ndistinct trajectory sets across all points: {len(fingerprints)} "
         "(1 = these axes changed nothing the search saw)"
     )
+    return payload
 
 
 if __name__ == "__main__":
