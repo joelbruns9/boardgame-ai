@@ -51,7 +51,25 @@ param(
     # launcher does this before it detaches; a flag combination that Phase D
     # refuses should cost a second here, not the first iteration of a run.
     [switch]$ValidateOnly,
-    [string]$RunDir = "runs/seven_wonders_duel/laptop_soak2"
+    [string]$RunDir = "runs/seven_wonders_duel/laptop_soak2",
+
+    # ---- Phase 1: measure what the endgame solver's DECLINES cost ----------
+    # Runs BEFORE the soak and never beside it. Both are throughput-sensitive
+    # and they contend for the same cores, so overlapping them would invalidate
+    # each other's numbers -- the reason RENTING_A_BOX.md insists a sweep gets
+    # the box to itself.
+    [switch]$SkipResolve,
+    [switch]$ResolveOnly,
+    # cloud2's most recent iteration: the strongest net that run produced, so
+    # its endgames are the closest available match to what the next loop will
+    # reach. Older iterations are weaker and less representative.
+    [string]$ResolveBuffer =
+        "runs/seven_wonders_duel/cloud2/7wd_cloud_20260825T005745Z/buffers/iter_0096.jsonl",
+    [int]$ResolveThreads = 8,
+    # 0 = every censored position in the buffer. A small value is for smoke
+    # tests; the frontier needs the whole tail to be meaningful.
+    [int]$ResolveLimit = 0,
+    [string]$ResolveOut = "runs/seven_wonders_duel/endgame_study/censored_iter_0096.json"
 )
 
 $ErrorActionPreference = "Stop"
@@ -235,6 +253,52 @@ if ($ValidateOnly) {
     exit $LASTEXITCODE
 }
 
+# ---- Phase 1 -------------------------------------------------------------
+#
+# cloud2 spent 46% of all solver nodes on the 3.2% of attempts that DECLINED,
+# and a declined position is right-censored: we know only that it cost at least
+# the budget. Refitting the cost model on buffers cannot fix that -- every
+# censored row sits at the same cap -- so the tail has to be measured.
+#
+# Sized from a measured sample: ~96s of CPU per position under 8-way contention,
+# 259 positions in iter_0096, so roughly 50-60 minutes. True costs in the sample
+# were 46M-366M nodes against the 40M cap that censored them, median 2.4x.
+if (-not $SkipResolve -and -not $ValidateOnly) {
+    Write-Host "==> phase 1: re-solving censored endgames from $ResolveBuffer"
+    if (-not (Test-Path $ResolveBuffer)) {
+        Write-Error "resolve buffer not found: $ResolveBuffer"
+        exit 1
+    }
+    $r = @(
+        "-m", "games.seven_wonders_duel.resolve_censored",
+        $ResolveBuffer,
+        "--threads", "$ResolveThreads",
+        # 20x the 40M cap. Nothing in the sample came close, so a decline at
+        # this budget is a genuinely expensive position rather than a cap.
+        "--max-nodes", "800000000",
+        # Slack on purpose: a deadline stop censors a position a SECOND time,
+        # and for a machine-load-dependent reason.
+        "--max-secs", "1200",
+        "--censored-at", "40000000",
+        "--limit", "$ResolveLimit",
+        "--out", $ResolveOut
+    )
+    $rs = Get-Date
+    python @r
+    $rc = $LASTEXITCODE
+    Write-Host ("==> phase 1 exited {0} after {1:hh\:mm\:ss}" -f $rc, ((Get-Date) - $rs))
+    if ($rc -ne 0) {
+        Write-Error "phase 1 failed; not starting the soak on a contended machine"
+        exit $rc
+    }
+    if ($ResolveOnly) { exit 0 }
+}
+elseif ($ResolveOnly) {
+    Write-Error "-ResolveOnly and -SkipResolve are contradictory"
+    exit 1
+}
+
+# ---- Phase 2 -------------------------------------------------------------
 # No tee and no 2>&1: --run-log already writes <run-dir>/run.log, and in
 # Windows PowerShell 5.1 redirecting a native executable's stderr wraps every
 # line in an ErrorRecord and sets $? to false even on a clean exit.
