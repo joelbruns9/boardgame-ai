@@ -7467,6 +7467,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="use tiny generation/training/gate budgets; verifies plumbing only",
     )
     parser.add_argument(
+        "--emit-config",
+        default="",
+        help="build the config, write it as a manifest-shaped {'config': {...}} "
+        "JSON, and exit. The throughput sweep needs the RUN's architecture and "
+        "search budget, but the run's own manifest does not exist until the run "
+        "starts -- so the launcher emits one first and points "
+        "--config-from-manifest at it. Without that the sweep measures "
+        "PhaseDConfig's defaults for everything it does not name.",
+    )
+    parser.add_argument(
         "--validate-config",
         action="store_true",
         help="build the config, validate it, print 'config OK' and exit. For a "
@@ -7803,6 +7813,18 @@ def main(argv=None) -> int:
         "Structured log": (Path(config.run_dir) / "training_log.jsonl").resolve(),
         "Manifest": (Path(config.run_dir) / "run_manifest.json").resolve(),
     }
+    if args.emit_config:
+        # Build it first: emitting a config Phase D would refuse is worse than
+        # not emitting one, because the sweep would then measure a geometry no
+        # run can launch.
+        PhaseDLoop(config)
+        payload = {"config": asdict(config)}
+        destination = Path(args.emit_config)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+        print(f"wrote {destination}")
+        return 0
+
     if args.validate_config:
         # Build and validate, then stop -- BEFORE the run log opens, so a
         # rejected combination does not leave a half-written run. The launcher

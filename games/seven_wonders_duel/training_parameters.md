@@ -766,6 +766,24 @@ ACROSS positions, which is what `rust_coalesced` does: each position becomes a
 one-move job (`stop_after_moves = 1`) on the ordinary self-play scheduler, so
 their leaves fill the same batches generation's do.
 
+### `--emit-config`
+
+**Default:** unset.
+
+Build the config, write it as a manifest-shaped `{"config": {...}}` JSON, and
+exit without training.
+
+The throughput sweep must measure the RUN's architecture and search budget --
+`f4_phase_d_sweep --config-from-manifest` exists for exactly that, and its own
+docstring records what happens without it: "roughly 50 simulations a move
+instead of the run's measured 522, under a different search algorithm... the
+optimum found that way belongs to a machine nobody is running."
+
+But the run's manifest does not exist until the run starts, and the sweep runs
+first. So the launcher emits one, and points the sweep at it. Validated on the
+way out: emitting a config Phase D would refuse is worse than emitting none,
+because the sweep would then measure a geometry no run can launch.
+
 ### `--exclude-parked-from-budget`, `--no-exclude-parked-from-budget`
 
 **Default:** off.
