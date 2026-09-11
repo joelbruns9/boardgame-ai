@@ -357,7 +357,7 @@ def _find_manifest_value(payload, key):
 def run_point(
     loop, model, iteration, jobs, destination, slots, cap, inflight,
     workers=1, solver_threads=0, solver_max_nodes=0, solver_max_secs=0.0,
-    inference_wait_ms=0.0,
+    inference_wait_ms=0.0, solver_attempt_nodes=0,
 ):
     loop.config.rust_slots = slots
     loop.config.rust_global_batch_cap = cap
@@ -391,11 +391,17 @@ def run_point(
     # the sweep could set differently.
     loop.config.endgame_solver_max_nodes = solver_max_nodes if solving else 0
     if solving:
+        # The ATTEMPT BAR as well as the timeout. They are separate settings on
+        # the run, and passing only the timeout would leave the bar defaulting
+        # to it -- which on a run that narrows the bar admits a far larger set of
+        # positions than the run does, so the solver load being measured is not
+        # the run's. Same defect as measuring a solver that never ran, inverted.
         pd.configure_endgame_solver(
             solver_max_nodes,
             solver_max_secs or float(solver_max_nodes) / 1_200_000.0 * 5.0,
             0,
             True,
+            solver_attempt_nodes,
         )
     else:
         pd.configure_endgame_solver(0, 1.0, 0, False)
@@ -630,6 +636,17 @@ def main(argv: list[str] | None = None) -> dict:
         help="deadline per solve; derived from the node budget when 0.",
     )
     parser.add_argument(
+        "--solver-attempt-nodes",
+        type=int,
+        default=0,
+        help="the budget the cost model is compared against when deciding to "
+        "attempt a solve. 0 uses the timeout, which is what one shared number "
+        "always meant. Taken from the manifest when --config-from-manifest is "
+        "given and this is left at 0: a run that narrowed its bar attempts far "
+        "fewer positions than its timeout implies, and sweeping at the timeout "
+        "would measure a solver load no run carries.",
+    )
+    parser.add_argument(
         "--solver-threads-total",
         default="0",
         help="TOTAL solver threads, divided across shards at each point. Takes "
@@ -770,6 +787,7 @@ def main(argv: list[str] | None = None) -> dict:
     # budget is the solver's ADMISSION THRESHOLD, not a ceiling
     # (`THROUGHPUT_LEVERS.md` class D).
     solver_max_nodes = args.solver_max_nodes
+    solver_attempt_nodes = args.solver_attempt_nodes
     if solver_max_nodes <= 0 and args.config_from_manifest:
         import json as _json
 
@@ -780,6 +798,20 @@ def main(argv: list[str] | None = None) -> dict:
         if found:
             solver_max_nodes = int(found)
             print(f"solver budget from manifest: {solver_max_nodes:,} nodes", flush=True)
+        # The ATTEMPT BAR, which is a different number from the timeout on any
+        # run that split them. Left at 0 it falls back to the timeout, which is
+        # what one shared number always meant -- but on a run that narrowed the
+        # bar, defaulting to the timeout admits a much larger set of positions
+        # and measures a solver load the run does not carry.
+        bar = _find_manifest_value(manifest, "endgame_solver_attempt_nodes")
+        if bar:
+            solver_attempt_nodes = int(bar)
+            print(
+                f"solver attempt bar from manifest: {solver_attempt_nodes:,} "
+                f"nodes ({solver_max_nodes / max(1, solver_attempt_nodes):.1f}x "
+                "below the timeout)",
+                flush=True,
+            )
     # The SAME factor as the sims, so the solver keeps its share of slot
     # occupancy instead of growing into the space cheaper generation vacates.
     # `run_point` derives the deadline from the node budget when none is given,
@@ -796,6 +828,14 @@ def main(argv: list[str] | None = None) -> dict:
         solver_max_nodes = divided
         if args.solver_max_secs > 0:
             args.solver_max_secs = args.solver_max_secs / args.sims_divisor
+        # The bar divides too, so the two keep their RATIO. Dividing the timeout
+        # alone would leave the same positions admitted against a quarter of the
+        # budget, turning proofs into declines and measuring a solver that fails
+        # far more often than the run's does.
+        if solver_attempt_nodes > 0:
+            solver_attempt_nodes = max(
+                1, round(solver_attempt_nodes / args.sims_divisor)
+            )
     if solver_totals != [0] and solver_max_nodes <= 0:
         raise SystemExit(
             "a solver split was requested but no node budget is available, so "
@@ -875,6 +915,7 @@ def main(argv: list[str] | None = None) -> dict:
             solver_max_nodes=solver_max_nodes,
             solver_max_secs=args.solver_max_secs,
             inference_wait_ms=grid[0][5],
+            solver_attempt_nodes=solver_attempt_nodes,
         )
 
     jobs = jobs_for(args.games, args.iteration)
@@ -904,6 +945,7 @@ def main(argv: list[str] | None = None) -> dict:
                 solver_max_nodes,
                 args.solver_max_secs,
                 wait_ms,
+                solver_attempt_nodes,
             )
             stats["repetition"] = repetition
             results.append(stats)
@@ -1088,6 +1130,7 @@ def main(argv: list[str] | None = None) -> dict:
             "cheap_sims": [config.cheap_sims_min, config.cheap_sims_max],
             "full_sims": [config.full_sims_min, config.full_sims_max],
             "solver_max_nodes": solver_max_nodes,
+            "solver_attempt_nodes": solver_attempt_nodes,
             "grid": [list(point) for point in grid],
             "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
             "opponent_fraction": config.opponent_fraction,

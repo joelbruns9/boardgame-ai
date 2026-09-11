@@ -1134,6 +1134,11 @@ def phase_d_record_from_rust(raw: dict, *, validate: bool = True) -> GameRecord:
                     else None
                 ),
                 solver_nodes=int(row.get("solver_nodes") or 0),
+                solver_predicted_nodes=(
+                    float(row["solver_predicted_nodes"])
+                    if row.get("solver_predicted_nodes") is not None
+                    else None
+                ),
                 solver_masked=bool(row.get("solver_masked") or False),
             )
         )

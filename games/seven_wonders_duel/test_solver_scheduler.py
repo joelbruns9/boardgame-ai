@@ -23,7 +23,11 @@ from __future__ import annotations
 
 import pytest
 
+from pathlib import Path
+
 from .rust_bridge import rust_games_for_self_play
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 from .test_f4_scheduler import _common, _row_eval
 
 swr = pytest.importorskip("seven_wonders_rust")
@@ -48,10 +52,15 @@ def _records(
     full_fraction: float = 0.3,
     shards: int = 2,
     slots: int = 4,
+    attempt_nodes: int = 0,
 ):
-    """One run through the production scheduler, with the solver on."""
+    """One run through the production scheduler, with the solver on.
 
-    swr.set_endgame_solver(max_nodes, 120.0, MAX_CARDS, True)
+    `attempt_nodes` 0 means "same as max_nodes", which is what one shared number
+    always meant -- so every caller predating the split is unaffected.
+    """
+
+    swr.set_endgame_solver(max_nodes, 120.0, MAX_CARDS, True, attempt_nodes)
     swr.set_solver_threads(threads)
 
     def adapter(rows):
@@ -368,3 +377,130 @@ def test_the_flag_is_off_by_default():
 
     _records, metrics = _flat(False, slots=4)
     assert metrics["max_live_slots"] <= 4
+
+
+# --- two caps: the attempt bar and the timeout ------------------------------
+#
+# One number used to serve both, with `margin_decades` the only way to separate
+# them -- `predict + margin <= log10(budget)` put the attempt bar at
+# `budget / 10**margin`, so raising the timeout widened admission by the same
+# factor unless the margin was moved to compensate, by hand, in log space.
+#
+# The two decisions fail in opposite directions. A bar set too high admits
+# hopeless positions that each burn the full timeout for nothing (45.9% of all
+# solver nodes on cloud2 iteration 96). A timeout set too low discards work
+# already done on positions the model merely underestimated.
+
+
+def _install_cost_model():
+    """The shipped model, which is what makes the bar mean anything.
+
+    Without a model installed `solver_wants` falls back to the card cap and the
+    node bar is not consulted at all -- so a test of the bar that forgot this
+    would pass while measuring nothing.
+    """
+
+    from .phase_d import configure_endgame_cost_model
+
+    return configure_endgame_cost_model(
+        REPO_ROOT / "games/seven_wonders_duel/endgame_cost_model.json"
+    )
+
+
+def test_an_unset_attempt_bar_reproduces_the_single_number():
+    swr.set_endgame_solver(40_000_000, 75.0, MAX_CARDS, True)
+    assert swr.endgame_solver() == (40_000_000, 75.0, MAX_CARDS, True, 40_000_000), (
+        "0 must resolve to the timeout, or every run before the split changes"
+    )
+
+
+def test_the_bar_and_the_timeout_are_reported_separately():
+    swr.set_endgame_solver(320_000_000, 900.0, MAX_CARDS, True, 16_000_000)
+    max_nodes, _secs, _cards, _mask, bar = swr.endgame_solver()
+    assert (max_nodes, bar) == (320_000_000, 16_000_000)
+
+
+def test_a_bar_above_the_timeout_is_refused():
+    """Every position admitted above the timeout spends it in full and answers
+    nothing -- the exact waste the split exists to remove, and a factor-sized
+    typo rather than a digit-sized one."""
+
+    with pytest.raises(ValueError, match="exceeds"):
+        swr.set_endgame_solver(40_000_000, 75.0, MAX_CARDS, True, 80_000_000)
+
+
+def test_narrowing_the_bar_attempts_fewer_positions():
+    """The behaviour the split is FOR, on the production scheduler.
+
+    Same timeout throughout, so what changes is admission and not the solve.
+
+    COUNTS, not a subset -- and the difference is the point. A successful solve
+    masks the policy target, which changes the move sampled, which changes every
+    position after it. So a narrower bar does not merely drop rows from the same
+    game: it plays a different game, and positions appear that the wider bar
+    never reached. (Measured here: 57 attempts against 64, with one position
+    unique to the narrow run.)
+
+    That makes the attempt bar a TARGET-CHANGING knob, not a free one like slots
+    or the batch cap. It cannot be A/B'd on wall clock alone, and two runs either
+    side of it do not share a buffer definition.
+    """
+
+    if _install_cost_model() is None:
+        pytest.skip("no cost model installed; the card cap ignores the node bar")
+
+    def attempted(bar):
+        records = _records(0, max_nodes=3_000_000, attempt_nodes=bar)
+        return {
+            (game, move["i"])   # the move index key is `i` on the Rust row
+            for game, record in enumerate(records)
+            for move in record["moves"]
+            if move["solver_attempted"]
+        }
+
+    wide = attempted(3_000_000)
+    narrow = attempted(300_000)
+    assert wide, "nothing was attempted at the wide bar; the test proves nothing"
+    assert len(narrow) < len(wide), (
+        f"narrowing the bar 10x did not shrink the attempted set "
+        f"({len(narrow)} vs {len(wide)})"
+    )
+
+
+def test_every_attempted_solve_records_what_was_predicted():
+    """The attempt bar filters on the prediction, and until it was recorded the
+    bar could not be tuned from a run's own output: the only costs observable
+    were those of positions the bar had already admitted.
+
+    Asserted on the DECLINES too -- they are exactly the rows a different bar
+    would move, and a prediction logged only for solves that succeeded would be
+    a sample selected by the outcome it is meant to predict.
+    """
+
+    if _install_cost_model() is None:
+        pytest.skip("no cost model installed; nothing predicts anything")
+
+    records = _records(0, max_nodes=200_000, full_fraction=0.3)
+    attempted = [m for m in _moves(records) if m["solver_attempted"]]
+    assert attempted, "nothing was attempted; the assertion below is vacuous"
+    for move in attempted:
+        assert move["solver_predicted_nodes"] is not None, (
+            "an attempted solve carries no prediction"
+        )
+        assert move["solver_predicted_nodes"] > 0
+
+    declined = [m for m in attempted if m["solver_stop"] == "nodes"]
+    if declined:
+        assert all(m["solver_predicted_nodes"] is not None for m in declined), (
+            "declines carry no prediction, so the residual cannot be measured "
+            "on the rows a different bar would move"
+        )
+
+
+def test_a_move_with_no_solve_carries_no_prediction():
+    """A 0 would read as 'predicted to cost nothing'."""
+
+    records = _records(0, max_nodes=200_000, full_fraction=0.3)
+    unattempted = [m for m in _moves(records) if not m["solver_attempted"]]
+    assert unattempted
+    assert all(m["solver_predicted_nodes"] is None for m in unattempted)

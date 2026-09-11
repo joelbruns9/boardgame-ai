@@ -129,6 +129,7 @@ def build_stage_argv(
         "--sims-divisor", str(args.sims_divisor),
         "--solver-max-nodes", str(args.solver_max_nodes),
         "--solver-max-secs", str(args.solver_max_secs),
+        "--solver-attempt-nodes", str(args.solver_attempt_nodes),
     ]
     if args.config_from_manifest:
         argv += ["--config-from-manifest", args.config_from_manifest]
@@ -167,6 +168,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--solver-threads", type=int, default=0)
     parser.add_argument("--solver-max-nodes", type=int, default=0)
     parser.add_argument("--solver-max-secs", type=float, default=0.0)
+    parser.add_argument("--solver-attempt-nodes", type=int, default=0)
     # Stage B axes.
     parser.add_argument("--inflight", default="1,2")
     parser.add_argument("--inference-wait-ms", default="0")

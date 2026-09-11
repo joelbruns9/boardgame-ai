@@ -539,6 +539,15 @@ pub struct MoveRecord {
     /// Nodes visited, INCLUDING by a solve that then declined. A decline is not
     /// free: the budget was spent synchronously before it was reached.
     pub solver_nodes: u64,
+    /// What the cost model predicted this would cost, in nodes, before the
+    /// solve ran. `None` when no model is installed.
+    ///
+    /// The attempt bar filters on this number, so without it in the buffer the
+    /// bar cannot be tuned against anything: a run only ever observes the cost
+    /// of positions the bar already admitted, which is a sample the bar itself
+    /// selected. Paired with `solver_nodes` it gives the residual directly, on
+    /// the declines as well as the proofs.
+    pub solver_predicted_nodes: Option<f64>,
     pub solver_masked: bool,
 }
 
@@ -768,6 +777,29 @@ pub(crate) fn actual_chance_outcomes(
 /// holding a scheduler slot, and should be set generously enough not to bind.
 static SOLVER_MAX_NODES: AtomicU64 = AtomicU64::new(0);
 static SOLVER_MAX_SECS_BITS: AtomicU64 = AtomicU64::new(0);
+/// The budget the COST MODEL is compared against, which is a different question
+/// from the one `SOLVER_MAX_NODES` answers.
+///
+/// Two caps, because the two decisions have opposite error costs:
+///
+/// * the ATTEMPT bar decides which positions are worth starting. Set it too
+///   high and every admitted-but-hopeless position burns the full timeout for
+///   nothing -- measured at 45.9% of all solver nodes on cloud2 iteration 96.
+/// * the TIMEOUT decides when an in-flight solve is abandoned. Set it too low
+///   and work already done is discarded, including on positions the model was
+///   right about and that were nearly finished.
+///
+/// So the timeout wants to be generously ABOVE the attempt bar: the bar filters
+/// on a PREDICTION, and the prediction has residual error the bar cannot see.
+/// Until now one number served both, and `margin_decades` was the only way to
+/// separate them -- `predict + margin <= log10(budget)` made the attempt bar
+/// `budget / 10^margin`, so raising the timeout silently widened admission by
+/// the same factor unless the margin was moved to compensate, in log space, by
+/// hand. That coupling is the thing this exists to break.
+///
+/// 0 means "use `SOLVER_MAX_NODES`", which reproduces every run before this
+/// exactly: the margin then behaves as it always did.
+static SOLVER_ATTEMPT_NODES: AtomicU64 = AtomicU64::new(0);
 /// Cards still on the board at or below which a solve is attempted. Measured on
 /// real (human) endgames, not bot ones, which are 3x cheaper and far narrower:
 /// <=6 cards is milliseconds, 8 is 0.05-0.31s, 10 is 3.4-4.1s, 12 is ~60s or
@@ -826,21 +858,45 @@ pub fn solver_threads() -> usize {
 /// are: only self-play generation reads it, and threading four more fields
 /// through `SelfPlayConfig` would touch ten pyo3 signatures to express something
 /// no two concurrent callers vary.
-pub fn set_endgame_solver(max_nodes: u64, max_secs: f64, max_cards: usize, mask_policy: bool) {
+pub fn set_endgame_solver(
+    max_nodes: u64,
+    max_secs: f64,
+    max_cards: usize,
+    mask_policy: bool,
+    attempt_nodes: u64,
+) {
     SOLVER_MAX_NODES.store(max_nodes, Ordering::Relaxed);
     SOLVER_MAX_SECS_BITS.store(max_secs.to_bits(), Ordering::Relaxed);
     SOLVER_MAX_CARDS.store(max_cards, Ordering::Relaxed);
     SOLVER_MASK_POLICY.store(mask_policy, Ordering::Relaxed);
+    SOLVER_ATTEMPT_NODES.store(attempt_nodes, Ordering::Relaxed);
 }
 
-/// `(max_nodes, max_secs, max_cards, mask_policy)` in force, for run manifests.
-pub fn endgame_solver() -> (u64, f64, usize, bool) {
+/// `(max_nodes, max_secs, max_cards, mask_policy, attempt_nodes)` in force, for
+/// run manifests. `attempt_nodes` is reported RESOLVED -- the value actually
+/// used, not the 0 sentinel -- because a manifest saying 0 would read as "the
+/// solver attempts nothing", which is the opposite of what 0 means here.
+pub fn endgame_solver() -> (u64, f64, usize, bool, u64) {
+    let max_nodes = SOLVER_MAX_NODES.load(Ordering::Relaxed);
     (
-        SOLVER_MAX_NODES.load(Ordering::Relaxed),
+        max_nodes,
         f64::from_bits(SOLVER_MAX_SECS_BITS.load(Ordering::Relaxed)),
         SOLVER_MAX_CARDS.load(Ordering::Relaxed),
         SOLVER_MASK_POLICY.load(Ordering::Relaxed),
+        attempt_nodes(max_nodes),
     )
+}
+
+/// The attempt bar, with the 0 sentinel resolved against the timeout.
+///
+/// One function so the resolution cannot differ between the predicate that
+/// decides and the getter that reports -- which is exactly how `solver_wants`
+/// and `endgame_overlay` came to re-implement the same eligibility test.
+fn attempt_nodes(max_nodes: u64) -> u64 {
+    match SOLVER_ATTEMPT_NODES.load(Ordering::Relaxed) {
+        0 => max_nodes,
+        set => set,
+    }
 }
 
 /// The fitted cost model, or `None` to fall back to the card cap.
@@ -898,6 +954,11 @@ pub struct SolverOverlay {
     /// `policy_target` follows the new definition; a global `TARGET_VERSION`
     /// bump would say less and invalidate every existing buffer to say it.
     pub masked: bool,
+    /// What the cost model PREDICTED this position would cost, in nodes, or
+    /// `None` when no model is installed. See `cost_prediction_nodes`: this is
+    /// the number the attempt bar filtered on, recorded beside the number the
+    /// solve actually took so the two can finally be compared.
+    pub predicted_nodes: Option<f64>,
     /// The proven-optimal set, aligned to `legal`, or `None` when the solve
     /// declined or the mask is switched off.
     ///
@@ -927,7 +988,7 @@ pub fn solve_stop_name(stop: crate::solver::SolveStop) -> &'static str {
 /// `endgame_overlay` applies, exposed so the async path can decline to dispatch
 /// rather than pay a channel round trip to be told no.
 pub fn solver_wants(state: &GameState) -> bool {
-    let (max_nodes, _secs, max_cards, _mask) = endgame_solver();
+    let (max_nodes, _secs, max_cards, _mask, attempt) = endgame_solver();
     if max_nodes == 0 {
         return false;
     }
@@ -938,10 +999,35 @@ pub fn solver_wants(state: &GameState) -> bool {
     // that is the point of it. A cap cannot attempt a cheap 11-card position or
     // skip an expensive 8-card one, and cost is driven far more by how much of
     // the board is face down than by how many cards remain.
+    //
+    // Compared against the ATTEMPT bar, not the timeout. Those were the same
+    // number until the two were split; with `attempt_nodes` unset they still
+    // are, so this reproduces every earlier run.
     if let Some(model) = endgame_cost_model() {
-        return model.affordable(&crate::cost_model::features(state), max_nodes);
+        return model.affordable(&crate::cost_model::features(state), attempt);
     }
     cards_left(state) <= max_cards
+}
+
+/// What the cost model predicted this position would cost, in NODES.
+///
+/// Recorded on every attempted solve beside the nodes it actually took, because
+/// the attempt bar filters on this number and nothing in the buffer used to
+/// contain it. Without it "would a wider bar admit useful positions" and "does
+/// the model rank cost at all" are both unanswerable from a run's own output --
+/// the only observable was the actual cost of the positions that were already
+/// admitted, which is the sample the bar selected.
+///
+/// Nodes rather than the model's native log10, so it sits next to `solver_nodes`
+/// in the same units and a reader can compare them without transforming either.
+/// The MARGIN is deliberately excluded: this is the prediction, not the policy
+/// applied to it, and mixing them would make the residual uninterpretable.
+///
+/// `None` when no model is installed -- the card cap predicts nothing, and a 0
+/// would read as a prediction of zero cost.
+pub fn cost_prediction_nodes(state: &GameState) -> Option<f64> {
+    endgame_cost_model()
+        .map(|model| 10f64.powf(model.predict(&crate::cost_model::features(state))))
 }
 
 /// Zero the losing moves and renormalise the survivors, in place.
@@ -995,7 +1081,7 @@ pub fn endgame_overlay(
     state: &GameState,
     legal: &[usize],
 ) -> Option<SolverOverlay> {
-    let (max_nodes, max_secs, _max_cards, mask_policy) = endgame_solver();
+    let (max_nodes, max_secs, _max_cards, mask_policy, _attempt) = endgame_solver();
     // ONE decision site. This used to re-implement the eligibility test that
     // `solver_wants` already owned, so installing the cost model in one of them
     // would have left the two disagreeing -- the async path parking a slot for a
@@ -1003,6 +1089,11 @@ pub fn endgame_overlay(
     if !solver_wants(state) {
         return None;
     }
+    // Captured BEFORE the solve, and on both exit paths below. A prediction
+    // recorded only for the solves that succeeded would be a sample selected by
+    // the outcome it is meant to predict -- the declines are precisely the rows
+    // the residual has to be measured on.
+    let predicted_nodes = cost_prediction_nodes(state);
     let limits = crate::solver::Limits {
         max_nodes,
         deadline: Instant::now() + std::time::Duration::from_secs_f64(max_secs.max(0.0)),
@@ -1036,6 +1127,7 @@ pub fn endgame_overlay(
                 stop: Some(solve_stop_name(stop)),
                 nodes,
                 masked: false,
+                predicted_nodes,
                 keep: None,
             })
         }
@@ -1084,6 +1176,7 @@ pub fn endgame_overlay(
         stop: None,
         nodes: solved.nodes,
         masked: keep_set.is_some(),
+        predicted_nodes,
         keep: keep_set,
     })
 }
@@ -1363,6 +1456,7 @@ pub fn run<E: Eval>(
             solver_attempted: overlay.is_some(),
             solver_stop: overlay.as_ref().and_then(|o| o.stop),
             solver_nodes: overlay.as_ref().map_or(0, |o| o.nodes),
+            solver_predicted_nodes: overlay.as_ref().and_then(|o| o.predicted_nodes),
             solver_masked: overlay.is_some_and(|o| o.masked),
         });
     }
@@ -3019,6 +3113,7 @@ impl GameSlot {
             solver_attempted: overlay.is_some(),
             solver_stop: overlay.as_ref().and_then(|o| o.stop),
             solver_nodes: overlay.as_ref().map_or(0, |o| o.nodes),
+            solver_predicted_nodes: overlay.as_ref().and_then(|o| o.predicted_nodes),
             solver_masked: overlay.is_some_and(|o| o.masked),
         });
         self.stage = if self.state.phase == Phase::Complete || self.stopped_short() {
@@ -3089,6 +3184,7 @@ impl GameSlot {
             solver_attempted: false,
             solver_stop: None,
             solver_nodes: 0,
+            solver_predicted_nodes: None,
             solver_masked: false,
         });
         self.stage = if self.state.phase == Phase::Complete || self.stopped_short() {
@@ -4402,6 +4498,7 @@ mod fallback_research_tests {
             stop: Some(stop),
             nodes: 4_500_000,
             masked: false,
+            predicted_nodes: Some(1_000_000.0),
             keep: None,
         }
     }
@@ -4480,6 +4577,7 @@ mod fallback_research_tests {
             stop: None,
             nodes: 1000,
             masked: true,
+            predicted_nodes: Some(900.0),
             keep: Some(vec![true, false]),
         };
         assert!(slot.fallback_research_meta(&meta, Some(&solved)).is_none());
@@ -4585,5 +4683,74 @@ mod leaf_batch_resolution_tests {
         // ...and the cheap override wins on cheap moves, for both seats.
         assert_eq!(resolve_leaf_batch(&cfg, 0, false), 8);
         assert_eq!(resolve_leaf_batch(&cfg, 1, false), 8);
+    }
+}
+
+#[cfg(test)]
+mod attempt_bar_tests {
+    use super::*;
+
+    /// Serialised: the solver settings are process globals, so two tests
+    /// setting them concurrently would read each other's values.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn restore() {
+        set_endgame_solver(0, 60.0, 0, false, 0);
+    }
+
+    #[test]
+    fn an_unset_attempt_bar_is_the_timeout() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_endgame_solver(40_000_000, 75.0, 0, true, 0);
+        let (max_nodes, _secs, _cards, _mask, attempt) = endgame_solver();
+        assert_eq!(max_nodes, 40_000_000);
+        assert_eq!(
+            attempt, 40_000_000,
+            "0 must resolve to the timeout, or every run before the split \
+             changes behaviour"
+        );
+        restore();
+    }
+
+    #[test]
+    fn the_getter_reports_the_resolved_bar_not_the_sentinel() {
+        // A manifest that recorded 0 would read as "attempts nothing", which is
+        // the opposite of what 0 means.
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_endgame_solver(320_000_000, 900.0, 0, true, 16_000_000);
+        let (max_nodes, _secs, _cards, _mask, attempt) = endgame_solver();
+        assert_eq!((max_nodes, attempt), (320_000_000, 16_000_000));
+        restore();
+    }
+
+    /// The whole point of the split: the timeout moves and admission does not.
+    ///
+    /// Before it, `affordable` was compared against the timeout, so raising the
+    /// timeout 8x widened the attempt bar 8x as a side effect -- and the only
+    /// way to hold admission still was to move `margin_decades` by log10(8) in
+    /// the opposite direction, by hand, in log space.
+    #[test]
+    fn raising_the_timeout_no_longer_widens_admission() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let model = crate::cost_model::CostModel {
+            intercept: 7.0, // 10^7 = 10M nodes predicted, whatever the position
+            weights: [0.0; 20],
+            margin_decades: 0.4,
+        };
+        let features = [0.0f64; 20];
+
+        // Pinned bar of 40M: 10^(7.0 + 0.4) = 25.1M <= 40M, so admitted...
+        assert!(model.affordable(&features, 40_000_000));
+        // ...and unchanged when the timeout rises to 320M, because the bar is
+        // what `solver_wants` now passes.
+        set_endgame_solver(320_000_000, 900.0, 0, true, 40_000_000);
+        let (_n, _s, _c, _m, attempt) = endgame_solver();
+        assert!(model.affordable(&features, attempt));
+
+        // A bar of 20M refuses the same position: 25.1M > 20M.
+        set_endgame_solver(320_000_000, 900.0, 0, true, 20_000_000);
+        let (_n, _s, _c, _m, tight) = endgame_solver();
+        assert!(!model.affordable(&features, tight));
+        restore();
     }
 }

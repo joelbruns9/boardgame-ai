@@ -53,6 +53,51 @@ param(
     [switch]$ValidateOnly,
     [string]$RunDir = "runs/seven_wonders_duel/laptop_soak2",
 
+    # ---- The example cache, as a knob rather than a constant ---------------
+    # Derived examples are re-DERIVED, not re-searched: the search results are
+    # already in the buffer, and this is the encode step turning a stored game
+    # into the tensors training consumes. Training draws from the whole replay
+    # window every iteration, so every game in the window has to be materialised
+    # every iteration; the cache is what stops that being recomputed.
+    #
+    # A cap below one window means the LRU evicts exactly what the next
+    # iteration needs. Measured on laptop_soak2 at 1.5 GB: 2,604 of 3,800 games
+    # re-derived, 10.1s of a ~240s iteration -- about 4%, which is why 1.5
+    # stayed. It matters far more on a rented box, where the window is 20,000
+    # games (~17 GiB to hold) against a 4.14 GiB default nobody chose, and where
+    # generation is fast enough that derivation is a larger share of wall.
+    #
+    # A knob so the box's setting can be TESTED here first. What transfers:
+    # bytes per example and examples per game -- `examples_from_record` takes no
+    # run config, so the arrays are the same whichever heads are enabled. What
+    # does NOT transfer: the share of iteration wall, and the absolute cap (this
+    # machine has 15.8 GiB total and has OOM-killed four processes before).
+    [double]$ExampleCacheGb = 1.5,
+    # The pressure valve: RSS above this evicts the cache rather than the OOM
+    # killer evicting the run. Raise it WITH the cache, not after -- they are
+    # the same decision, and the cloud launcher currently sets this to 0, which
+    # turns the valve off entirely.
+    [double]$MemoryBudgetGb = 9,
+
+    # ---- The two solver caps -----------------------------------------------
+    # SolverMaxNodes is the TIMEOUT: when an in-flight solve is abandoned.
+    # SolverAttemptNodes is the ATTEMPT BAR: the budget the cost model is
+    # compared against when deciding to start one at all. 0 means "same as the
+    # timeout", which is what one shared number always meant.
+    #
+    # They want to differ. A decline costs exactly the timeout, so the timeout is
+    # the price of being wrong about a position and the bar decides how often
+    # that happens -- measured on cloud2 iteration 96, 45.9% of ALL solver nodes
+    # went to the 3.2% of attempts that answered nothing. The bar filters on a
+    # PREDICTION, so a timeout equal to the bar also throws away every position
+    # the model merely underestimated.
+    #
+    # Changing either changes the TARGETS, not just the speed: a solve masks the
+    # policy target, so a different bar plays different games. Not an A/B you can
+    # read off wall clock.
+    [int]$SolverMaxNodes = 200000,
+    [int]$SolverAttemptNodes = 0,
+
     # ---- Phase 1: measure what the endgame solver's DECLINES cost ----------
     # Runs BEFORE the soak and never beside it. Both are throughput-sensitive
     # and they contend for the same cores, so overlapping them would invalidate
@@ -212,7 +257,8 @@ $a = @(
     "--gate-global-batch-cap", "512",
 
     # ---- Endgame solver.
-    "--endgame-solver-max-nodes", "200000",
+    "--endgame-solver-max-nodes", "$SolverMaxNodes",
+    "--endgame-solver-attempt-nodes", "$SolverAttemptNodes",
     "--endgame-solver-max-secs", "10",
     "--solver-threads", "2",
     "--endgame-cost-model", "games/seven_wonders_duel/endgame_cost_model.json",
@@ -234,8 +280,8 @@ $a = @(
     "--process-workers", "8",
 
     # ---- Memory. Conservative: four processes were OOM-killed on this machine.
-    "--example-cache-gb", "1.5",
-    "--memory-budget-gb", "9",
+    "--example-cache-gb", "$ExampleCacheGb",
+    "--memory-budget-gb", "$MemoryBudgetGb",
     "--memory-headroom-gb", "1",
     "--vram-budget-gb", "0",
     "--min-games-to-train", "20",

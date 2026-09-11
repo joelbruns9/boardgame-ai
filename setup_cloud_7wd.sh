@@ -402,6 +402,21 @@ FULL_SEARCH_EVERY_GAMES="${FULL_SEARCH_EVERY_GAMES:-25}"
 #
 # The clock follows automatically: stage 6b derives max_secs from this number.
 ENDGAME_SOLVER_MAX_NODES="${ENDGAME_SOLVER_MAX_NODES:-40000000}"
+# The ATTEMPT BAR, separate from the timeout above.
+#
+# Measured on cloud2 iteration 96, where one number served both: 8,013 solves
+# attempted, 7,754 answered, and 45.9% of ALL solver nodes went to the 259 that
+# answered nothing -- each of which spent the full 40M before giving up. A
+# decline costs exactly the timeout, so the timeout is the price of being wrong
+# about a position and the bar is what decides how often that happens.
+#
+# 0 keeps them equal, which is what every run before the split did. Set it BELOW
+# the timeout to admit fewer positions while giving each admitted one more room:
+# the bar filters on a PREDICTION, and a timeout equal to the bar discards every
+# position the model underestimated, including ones nearly finished. The
+# effective bar is this divided by 10^margin_decades (0.4 in the shipped model),
+# so 40M here is really a 15.9M predicted-node bar.
+ENDGAME_SOLVER_ATTEMPT_NODES="${ENDGAME_SOLVER_ATTEMPT_NODES:-0}"
 ENDGAME_COST_MODEL="${ENDGAME_COST_MODEL:-games/seven_wonders_duel/endgame_cost_model.json}"
 SOLVER_FALLBACK_RESEARCH="${SOLVER_FALLBACK_RESEARCH:-1}"
 
@@ -930,6 +945,7 @@ if [ "$ENDGAME_SOLVER_MAX_NODES" -gt 0 ]; then
   SOLVER_FLAGS+=(
     --endgame-solver-max-nodes "$ENDGAME_SOLVER_MAX_NODES"
     --endgame-solver-max-secs "$ENDGAME_SOLVER_MAX_SECS"
+    --endgame-solver-attempt-nodes "$ENDGAME_SOLVER_ATTEMPT_NODES"
     --solver-threads "$SOLVER_THREADS"
   )
   if [ -n "$ENDGAME_COST_MODEL" ] && [ -f "$REPO_DIR/$ENDGAME_COST_MODEL" ]; then

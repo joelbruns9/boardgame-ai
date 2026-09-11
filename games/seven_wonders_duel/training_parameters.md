@@ -1341,6 +1341,51 @@ python -m games.seven_wonders_duel.endgame_trigger_study --from-buffer <buffers>
 python -m games.seven_wonders_duel.validate_cost_trigger --fit-on rows.json
 ```
 
+### `--endgame-solver-attempt-nodes`
+
+**Default:** `0` (use `--endgame-solver-max-nodes`). **Value:** non-negative
+integer, and never above the timeout.
+
+The budget the cost model is compared against when deciding whether to ATTEMPT a
+solve. `--endgame-solver-max-nodes` is when an in-flight solve is ABANDONED.
+Two numbers because the two decisions fail in opposite directions:
+
+* an attempt bar set too high admits positions the solve cannot finish, and each
+  of them burns the full timeout and answers nothing;
+* a timeout set too low discards work already done on positions the model merely
+  underestimated -- including ones that were nearly finished.
+
+So the timeout belongs generously ABOVE the bar. The bar filters on a
+PREDICTION, and the prediction has residual error the bar cannot see.
+
+Measured on cloud2 iteration 96 (1,000 games), where one number served both at
+40M: 8,013 solves attempted, 7,754 answered (96.8%), 259 declined on nodes and
+none on the deadline. Median answered solve 3,731 nodes -- four orders of
+magnitude under the cap -- but **45.9% of all solver nodes went to the 3.2% that
+answered nothing**, because a decline costs exactly the timeout.
+
+The effective bar is `attempt_nodes / 10**margin_decades`, the margin coming from
+the cost model (0.4 shipped). At the default, where `attempt_nodes` falls back to
+`max_nodes`, 40M is really a 15.9M predicted-node bar.
+
+Until the split, `margin_decades` was the only separator, which made raising the
+timeout silently widen admission by the same factor unless the margin was moved
+to compensate by hand, in log space. Unset, the two remain equal and every
+earlier run reproduces exactly.
+
+**This is a target-changing knob, not a free one.** A successful solve masks the
+policy target, which changes the move sampled, which changes every position
+after it -- so two runs either side of a bar change do not share a buffer
+definition and cannot be compared on wall clock alone.
+
+Note the interaction with the clock. `--endgame-solver-max-secs` must stay slack
+against the node budget or node-censoring becomes deadline-censoring, which makes
+whether a position got proved depend on how busy the box was. At the measured
+857,015 nodes/s/thread a 75s deadline reaches only 64M nodes, so raising the
+timeout past that without raising the clock moves the binding constraint. Stage
+6b of `setup_cloud_7wd.sh` derives the clock from the node budget for this
+reason; let it derive rather than pinning a value.
+
 ### `--endgame-solver-max-nodes`, `--endgame-solver-max-secs`, `--endgame-solver-max-cards`, `--endgame-solver-mask-policy`
 
 **Defaults:** `0` (off), `60.0`, `8`, on. **Values:** non-negative integer,

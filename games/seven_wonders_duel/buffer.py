@@ -208,6 +208,18 @@ class MoveRecord:
     """
     solver_nodes: int = 0
     """Nodes visited, including by an attempt that then declined."""
+    solver_predicted_nodes: float | None = None
+    """What the cost model predicted this position would cost, in nodes, before
+    the solve ran.  ``None`` when no model was installed, or on a buffer written
+    before this field existed.
+
+    The attempt bar filters on this number, and until it was recorded a run
+    could not be used to tune the bar: the only costs observable were those of
+    positions the bar had already admitted, which is a sample the bar itself
+    selected.  Paired with ``solver_nodes`` it gives the residual directly --
+    and on the DECLINES too, which are exactly the rows a wider or narrower bar
+    would move.  The margin is excluded on purpose: this is the prediction, not
+    the policy applied to it."""
     solver_masked: bool = False
     """This row's ``policy_target`` has had its provably-losing moves zeroed and
     the survivors renormalised.
@@ -780,6 +792,7 @@ def _solver_fields(move: MoveRecord) -> dict:
         "solver_attempted": True,
         "solver_stop": move.solver_stop,
         "solver_nodes": move.solver_nodes,
+        "solver_predicted_nodes": move.solver_predicted_nodes,
         "solver_masked": move.solver_masked,
     }
 
@@ -907,6 +920,7 @@ def from_json_line(line: str) -> GameRecord:
                 solver_attempted=move.get("solver_attempted", False),
                 solver_stop=move.get("solver_stop"),
                 solver_nodes=move.get("solver_nodes", 0),
+                solver_predicted_nodes=move.get("solver_predicted_nodes"),
                 solver_masked=move.get("solver_masked", False),
             )
             for move in payload["moves"]

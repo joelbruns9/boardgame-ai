@@ -337,6 +337,26 @@ class PhaseDConfig:
     search_mode: str = "closed"
     top_k: int = 16
 
+    endgame_solver_attempt_nodes: int = 0
+    """Budget the COST MODEL is compared against when deciding to attempt a
+    solve; 0 means "use ``endgame_solver_max_nodes``".
+
+    Separate from the timeout because the two decisions fail in opposite
+    directions.  The attempt bar decides which positions are worth starting: set
+    it too high and every admitted-but-hopeless position burns the full timeout
+    and answers nothing -- 45.9% of all solver nodes on cloud2 iteration 96.  The
+    timeout decides when to abandon a solve in flight: set it too low and work
+    already done is discarded, including on positions the model underestimated
+    and that were nearly finished.
+
+    So the timeout belongs generously ABOVE the bar.  One number served both
+    until now, which made ``margin_decades`` the only separator -- ``predict +
+    margin <= log10(budget)`` puts the bar at ``budget / 10**margin``, so raising
+    the timeout widened admission by the same factor unless the margin was moved
+    to compensate, by hand, in log space.  Unset, the two are equal and every
+    earlier run reproduces exactly.
+    """
+
     endgame_solver_max_nodes: int = 0
     """Node budget for one exact endgame solve during self-play; 0 disables it.
 
@@ -1616,13 +1636,29 @@ def configure_forced_playouts(k: float) -> None:
 
 
 def configure_endgame_solver(
-    max_nodes: int, max_secs: float, max_cards: int, mask_policy: bool
-) -> tuple[int, float, int, bool] | None:
+    max_nodes: int,
+    max_secs: float,
+    max_cards: int,
+    mask_policy: bool,
+    attempt_nodes: int = 0,
+) -> tuple[int, float, int, bool, int] | None:
     """Apply the exact endgame solver overlay to the Rust generator.
 
     ``max_nodes = 0`` disables it, which is the default and reproduces every run
     before this feature byte for byte.  A no-op for the Python backend, which has
     no solver hook: runs that want it must use --generation-backend rust.
+
+    TWO node numbers, because they answer different questions.
+    ``attempt_nodes`` is the budget the cost model is compared against -- which
+    positions are worth starting -- and ``max_nodes`` is when an in-flight solve
+    is abandoned.  The timeout wants to sit generously ABOVE the attempt bar: the
+    bar filters on a prediction and the prediction has residual error, so a
+    timeout equal to the bar discards every position the model underestimated,
+    including ones that were nearly done.  Measured on cloud2 iteration 96, 45.9%
+    of all solver nodes went to attempts that answered nothing.
+
+    ``attempt_nodes = 0`` means "use ``max_nodes``", which is what one shared
+    number always did and reproduces every earlier run exactly.
 
     Bound the solve by NODES, not seconds.  A deadline makes generation
     irreproducible from ``(seed, net)`` -- the same position solves on an idle
@@ -1638,11 +1674,25 @@ def configure_endgame_solver(
 
     if max_nodes < 0 or max_cards < 0:
         raise ValueError("--endgame-solver-max-nodes/-max-cards must be non-negative")
+    if attempt_nodes < 0:
+        raise ValueError("--endgame-solver-attempt-nodes must be non-negative")
+    if attempt_nodes > max_nodes > 0:
+        raise ValueError(
+            f"--endgame-solver-attempt-nodes {attempt_nodes:,} exceeds "
+            f"--endgame-solver-max-nodes {max_nodes:,}: every position admitted "
+            "above the timeout spends it in full and answers nothing"
+        )
     try:
         import seven_wonders_rust as swr
     except ImportError:  # pragma: no cover - Python backend needs no bridge
         return None
-    swr.set_endgame_solver(int(max_nodes), float(max_secs), int(max_cards), bool(mask_policy))
+    swr.set_endgame_solver(
+        int(max_nodes),
+        float(max_secs),
+        int(max_cards),
+        bool(mask_policy),
+        int(attempt_nodes),
+    )
     return swr.endgame_solver()
 
 
@@ -7191,6 +7241,20 @@ def build_parser() -> argparse.ArgumentParser:
         "Measure the effect with gumbel_target_kl.py before choosing a value.",
     )
     parser.add_argument(
+        "--endgame-solver-attempt-nodes",
+        type=int,
+        default=0,
+        help="budget the cost model is compared against when deciding whether "
+        "to ATTEMPT a solve; 0 (the default) uses --endgame-solver-max-nodes, "
+        "which is what one shared number always did. Set it BELOW the timeout "
+        "to separate the two decisions: the bar filters on a prediction and the "
+        "prediction has residual error, so a timeout equal to the bar throws "
+        "away every position the model underestimated -- while a bar equal to a "
+        "generous timeout admits hopeless positions that then spend it in full. "
+        "The effective bar is this divided by 10**margin_decades from the cost "
+        "model.",
+    )
+    parser.add_argument(
         "--endgame-solver-max-nodes",
         type=int,
         default=0,
@@ -7647,7 +7711,14 @@ def main(argv=None) -> int:
         args.endgame_solver_max_secs,
         args.endgame_solver_max_cards,
         args.endgame_solver_mask_policy,
-    ) or (0, args.endgame_solver_max_secs, args.endgame_solver_max_cards, False)
+        args.endgame_solver_attempt_nodes,
+    ) or (
+        0,
+        args.endgame_solver_max_secs,
+        args.endgame_solver_max_cards,
+        False,
+        args.endgame_solver_attempt_nodes,
+    )
     applied_cost_model = configure_endgame_cost_model(args.endgame_cost_model)
     config = PhaseDConfig(
         endgame_cost_model=applied_cost_model,
@@ -7657,6 +7728,10 @@ def main(argv=None) -> int:
         endgame_solver_max_secs=float(applied_solver[1]),
         endgame_solver_max_cards=int(applied_solver[2]),
         endgame_solver_mask_policy=bool(applied_solver[3]),
+        # RESOLVED, not the sentinel: the Rust getter returns the bar actually
+        # in force, so a manifest never records a 0 that reads as "attempts
+        # nothing" when it means "same as the timeout".
+        endgame_solver_attempt_nodes=int(applied_solver[4]),
         solver_threads=args.solver_threads,
         run_dir=args.run_dir,
         seed=args.seed,

@@ -159,6 +159,7 @@ fn self_play_record_to_py(py: Python<'_>, record: self_play::GameRecord) -> PyRe
         item.set_item("solver_attempted", row.solver_attempted)?;
         item.set_item("solver_stop", row.solver_stop)?;
         item.set_item("solver_nodes", row.solver_nodes)?;
+        item.set_item("solver_predicted_nodes", row.solver_predicted_nodes)?;
         item.set_item("solver_masked", row.solver_masked)?;
         moves.append(item)?;
     }
@@ -3177,19 +3178,29 @@ fn temperature_schedule() -> (f64, f64) {
 /// nodes: a deadline makes self-play irreproducible from `(seed, net)`, because
 /// the same position can solve on an idle machine and time out on a busy one,
 /// changing the mask and therefore the move that gets played.
-#[pyo3(signature = (max_nodes, max_secs = 60.0, max_cards = 8, mask_policy = true))]
+#[pyo3(signature = (max_nodes, max_secs = 60.0, max_cards = 8, mask_policy = true, attempt_nodes = 0))]
 fn set_endgame_solver(
     max_nodes: u64,
     max_secs: f64,
     max_cards: usize,
     mask_policy: bool,
+    attempt_nodes: u64,
 ) -> PyResult<()> {
     if !(max_secs.is_finite() && max_secs > 0.0) {
         return Err(PyValueError::new_err(
             "endgame solver max_secs must be finite and positive",
         ));
     }
-    self_play::set_endgame_solver(max_nodes, max_secs, max_cards, mask_policy);
+    // A bar ABOVE the timeout admits positions the solve can never finish, so
+    // every one of them burns the full timeout and returns nothing. That is the
+    // exact waste the split exists to remove, and it is easier to typo than to
+    // notice: the two numbers differ by a factor, not a digit.
+    if attempt_nodes > max_nodes && max_nodes > 0 {
+        return Err(PyValueError::new_err(format!(
+            "endgame solver attempt_nodes ({attempt_nodes}) exceeds max_nodes              ({max_nodes}): every position admitted above the timeout would              spend it in full and answer nothing"
+        )));
+    }
+    self_play::set_endgame_solver(max_nodes, max_secs, max_cards, mask_policy, attempt_nodes);
     Ok(())
 }
 
@@ -3308,7 +3319,7 @@ fn prune_policy_target(
 
 #[pyfunction]
 /// The `(max_nodes, max_secs, max_cards, mask_policy)` in force, for manifests.
-fn endgame_solver() -> (u64, f64, usize, bool) {
+fn endgame_solver() -> (u64, f64, usize, bool, u64) {
     self_play::endgame_solver()
 }
 

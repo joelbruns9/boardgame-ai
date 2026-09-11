@@ -2442,3 +2442,130 @@ def test_the_emitted_config_is_the_search_the_sweep_then_measures(tmp_path):
 
     apply_sims_divisor(config, 4)
     assert (config.cheap_sims_max, config.full_sims_max) == (25, 400)
+
+
+# ---------------------------------------------------------------------------
+# Two solver caps: the attempt bar and the timeout
+# ---------------------------------------------------------------------------
+
+
+def test_the_attempt_bar_is_reachable_from_the_launcher(setup_text):
+    """A knob the launcher cannot set is a decision nobody can make. The bar
+    defaults to the timeout, so leaving it unreachable would be invisible --
+    the run would work, and would simply never narrow admission."""
+
+    assert 'ENDGAME_SOLVER_ATTEMPT_NODES="${ENDGAME_SOLVER_ATTEMPT_NODES:-0}"' in setup_text
+    block = _block(setup_text, "SOLVER_FLAGS=()", "fi")
+    assert "--endgame-solver-attempt-nodes" in block
+
+
+def test_the_attempt_bar_defaults_to_the_timeout():
+    """0 must reproduce the single shared number exactly, or shipping the split
+    changes every run that does not set it."""
+
+    from .phase_d import configure_endgame_solver
+
+    applied = configure_endgame_solver(40_000_000, 75.0, 0, True)
+    try:
+        if applied is None:
+            pytest.skip("no Rust generator to configure")
+        assert applied[0] == 40_000_000
+        assert applied[4] == 40_000_000, "the 0 sentinel did not resolve"
+    finally:
+        configure_endgame_solver(0, 60.0, 0, False)
+
+
+def test_a_bar_above_the_timeout_is_refused_by_the_launcher_path():
+    """Every position admitted above the timeout spends it in full and answers
+    nothing -- the exact waste the split removes. Refused where the flag names
+    are known, so the message names knobs rather than Rust arguments."""
+
+    from .phase_d import configure_endgame_solver
+
+    with pytest.raises(ValueError, match="exceeds"):
+        configure_endgame_solver(40_000_000, 75.0, 0, True, 80_000_000)
+
+
+def test_the_sweep_carries_the_runs_attempt_bar(sweep_text):
+    """A sweep that left the bar at its default would measure the run's TIMEOUT
+    as its admission threshold. On a run that narrowed the bar that admits a far
+    larger set of positions, so the solver load being measured is not the run's
+    -- the same defect class as measuring a solver that never ran, inverted."""
+
+    source = (REPO_ROOT / "games/seven_wonders_duel/f4_phase_d_sweep.py").read_text(
+        encoding="utf-8"
+    )
+    assert "--solver-attempt-nodes" in source
+    assert 'endgame_solver_attempt_nodes' in source, (
+        "the sweep never reads the run's bar out of the manifest"
+    )
+    # And it must reach run_point, not merely be parsed.
+    assert "solver_attempt_nodes=solver_attempt_nodes" in source
+    del sweep_text
+
+
+def test_the_divisor_scales_the_bar_with_the_timeout():
+    """Dividing the timeout alone would leave the same positions admitted
+    against a quarter of the budget, turning proofs into declines and measuring
+    a solver that fails far more often than the run's does."""
+
+    source = (REPO_ROOT / "games/seven_wonders_duel/f4_phase_d_sweep.py").read_text(
+        encoding="utf-8"
+    )
+    block = source[source.index("if args.sims_divisor > 1 and solver_max_nodes > 0:") :][
+        :1400
+    ]
+    assert "solver_attempt_nodes / args.sims_divisor" in block
+
+
+def test_the_prediction_is_recorded_on_the_move(setup_text):
+    """The attempt bar filters on the prediction. Without it in the buffer the
+    bar cannot be tuned from a run's own output: the only costs observable are
+    those of positions the bar already admitted."""
+
+    del setup_text
+    from .buffer import MoveRecord
+    import dataclasses
+
+    names = {f.name for f in dataclasses.fields(MoveRecord)}
+    assert "solver_predicted_nodes" in names
+    source = (REPO_ROOT / "games/seven_wonders_duel/buffer.py").read_text(
+        encoding="utf-8"
+    )
+    # Both directions, or a buffer loses it on the way back in.
+    assert '"solver_predicted_nodes": move.solver_predicted_nodes' in source
+    assert 'solver_predicted_nodes=move.get("solver_predicted_nodes")' in source
+
+
+def test_an_old_buffer_without_the_prediction_still_loads():
+    """Every buffer written before this field exists, which is all of them.
+
+    Exercised through `from_json_line`, not the constructor: the constructor
+    would only prove the dataclass has a default, while the thing that has to
+    hold is that a line with no such key still parses.
+    """
+
+    import json
+
+    from .buffer import from_json_line, to_json_line, GameRecord, MoveRecord
+
+    record = GameRecord(
+        seed=1, first_player=0, agents={}, iteration=0, winner=0,
+        victory_type="civilian", scores=(1, 0), chance_log=(),
+        moves=(
+            MoveRecord(
+                i=0, actor=0, action=0, mask_hash="sha256:0",
+                solver_attempted=True, solver_nodes=7,
+                solver_predicted_nodes=1234.0,
+            ),
+        ),
+        final_digest="sha256:0", trajectory_digest="sha256:0",
+    )
+    line = to_json_line(record)
+    payload = json.loads(line)
+    # Strip the key the way a pre-split buffer would not have had it at all.
+    for move in payload["moves"]:
+        move.pop("solver_predicted_nodes", None)
+    reloaded = from_json_line(json.dumps(payload))
+    assert reloaded.moves[0].solver_predicted_nodes is None
+    assert reloaded.moves[0].solver_nodes == 7
