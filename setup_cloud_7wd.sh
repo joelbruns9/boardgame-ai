@@ -417,6 +417,21 @@ ENDGAME_SOLVER_MAX_NODES="${ENDGAME_SOLVER_MAX_NODES:-40000000}"
 # effective bar is this divided by 10^margin_decades (0.4 in the shipped model),
 # so 40M here is really a 15.9M predicted-node bar.
 ENDGAME_SOLVER_ATTEMPT_NODES="${ENDGAME_SOLVER_ATTEMPT_NODES:-0}"
+# A parked slot's --rust-slots token goes back to the pool for the duration of
+# the solve. ON here, where phase_d defaults it off: it shipped behind a flag and
+# nobody flipped it, so until now a slot parked on a solve held its token AND
+# counted toward `active_count`, which divides the batch cap and narrows the row
+# allowance of every slot that IS working.
+#
+# Cheap to turn on because it cannot change what is learned: records are
+# byte-identical either way, and `test_excluding_parked_slots_changes_no_record`
+# is the gate. It is a throughput change and nothing else.
+#
+# It DOES change what --rust-slots means -- concurrent games becomes concurrent
+# SEARCHING games -- so slot counts are not comparable across the two. That is
+# why it is set BEFORE stage 8b rather than after: the sweep must tune the slot
+# axis under the regime the run will use, or its optimum belongs to the other one.
+EXCLUDE_PARKED_FROM_BUDGET="${EXCLUDE_PARKED_FROM_BUDGET:-1}"
 ENDGAME_COST_MODEL="${ENDGAME_COST_MODEL:-games/seven_wonders_duel/endgame_cost_model.json}"
 SOLVER_FALLBACK_RESEARCH="${SOLVER_FALLBACK_RESEARCH:-1}"
 
@@ -957,6 +972,10 @@ if [ "$ENDGAME_SOLVER_MAX_NODES" -gt 0 ]; then
     die "ENDGAME_COST_MODEL=$ENDGAME_COST_MODEL not found under $REPO_DIR."
   fi
   [ "$SOLVER_FALLBACK_RESEARCH" = "1" ] && SOLVER_FLAGS+=(--solver-fallback-research)
+  # Inert with the solver off -- nothing parks -- so it rides inside this gate
+  # rather than putting a knob on the line that changes nothing.
+  [ "$EXCLUDE_PARKED_FROM_BUDGET" = "1" ] &&
+    SOLVER_FLAGS+=(--exclude-parked-from-budget)
 fi
 
 LADDER_FLAG=()

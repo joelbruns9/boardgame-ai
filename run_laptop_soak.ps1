@@ -97,6 +97,21 @@ param(
     # read off wall clock.
     [int]$SolverMaxNodes = 200000,
     [int]$SolverAttemptNodes = 0,
+    # A parked slot's --rust-slots token goes back to the pool while it solves.
+    # ON, where phase_d defaults it off: it shipped behind a flag and nobody
+    # flipped it, so a slot parked on a solve held its token AND counted toward
+    # `active_count`, which divides the batch cap and narrows the row allowance
+    # of every slot that IS working.
+    #
+    # Safe to flip because it cannot change what is learned -- records are
+    # byte-identical either way, gated by
+    # `test_excluding_parked_slots_changes_no_record`. It is throughput only.
+    #
+    # But it DOES redefine --rust-slots, from concurrent games to concurrent
+    # SEARCHING games, so slot counts are not comparable across the two. The box
+    # sweep must run under the same regime, which is why the launcher sets it
+    # before its scheduler sweep rather than after.
+    [bool]$ExcludeParkedFromBudget = $true,
 
     # ---- Phase 1: measure what the endgame solver's DECLINES cost ----------
     # Runs BEFORE the soak and never beside it. Both are throughput-sensitive
@@ -263,6 +278,8 @@ $a = @(
     "--solver-threads", "2",
     "--endgame-cost-model", "games/seven_wonders_duel/endgame_cost_model.json",
     "--solver-fallback-research",
+    $(if ($ExcludeParkedFromBudget) { "--exclude-parked-from-budget" }
+      else { "--no-exclude-parked-from-budget" }),
 
     # ---- Backends and scheduler geometry.
     "--generation-backend", "rust",

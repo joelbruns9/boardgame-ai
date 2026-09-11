@@ -2569,3 +2569,40 @@ def test_an_old_buffer_without_the_prediction_still_loads():
     reloaded = from_json_line(json.dumps(payload))
     assert reloaded.moves[0].solver_predicted_nodes is None
     assert reloaded.moves[0].solver_nodes == 7
+
+
+def test_parked_slots_are_excluded_from_the_slot_budget(setup_text):
+    """`phase_d` defaults this OFF -- it shipped behind a flag and nobody
+    flipped it -- so until now a slot parked on an endgame solve held its
+    --rust-slots token AND counted toward `active_count`, which divides the
+    batch cap and narrows the row allowance of every slot that IS working.
+
+    Set here rather than left to the parser default, which is the same class of
+    omission as --train-steps: a default nobody chose."""
+
+    assert 'EXCLUDE_PARKED_FROM_BUDGET="${EXCLUDE_PARKED_FROM_BUDGET:-1}"' in setup_text
+    block = _block(setup_text, "SOLVER_FLAGS=()", "fi")
+    assert "--exclude-parked-from-budget" in block, (
+        "the flag never reaches the launch line"
+    )
+
+
+def test_the_parked_slot_regime_is_decided_before_the_slot_sweep(setup_text):
+    """It redefines --rust-slots -- concurrent games becomes concurrent
+    SEARCHING games -- so a slot optimum measured under one regime does not
+    transfer to the other. The sweep has to run under the regime the run will
+    use, which means the decision must precede it."""
+
+    decided = setup_text.index('EXCLUDE_PARKED_FROM_BUDGET="${EXCLUDE_PARKED_FROM_BUDGET:-1}"')
+    swept = setup_text.index('stage 8b "Scheduler sweeps')
+    assert decided < swept
+
+
+def test_the_soak_runs_the_parked_slot_regime_the_box_runs(setup_text):
+    """The soak exists to prove the box's mechanism set survives running
+    together. A soak under the other slot regime rehearses something else."""
+
+    soak = (REPO_ROOT / "run_laptop_soak.ps1").read_text(encoding="utf-8")
+    assert "--exclude-parked-from-budget" in soak
+    assert "ExcludeParkedFromBudget" in soak
+    del setup_text
