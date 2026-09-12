@@ -41,7 +41,7 @@ import json
 import math
 from pathlib import Path
 
-from .solver_corpus import admission_ceiling, price
+from .solver_corpus import admission_ceiling, price, recorded_gap
 
 #: Multiples of the attempt bar to consider as timeouts.
 #:
@@ -102,6 +102,14 @@ def candidates(
     out = []
     dropped = []
     for bar in bars:
+        # The gap SHIPPED with the corpus, when one was recorded for this model
+        # and bar. A rented box has no collecting buffer to enumerate from, so
+        # this is the only path available there -- and the ceiling check below
+        # must not drop a bar whose gap is already known.
+        if bar not in uncovered:
+            shipped = recorded_gap(corpus, model, bar)
+            if shipped is not None:
+                uncovered = {**uncovered, bar: shipped}
         if bar in uncovered:
             for multiple in multiples:
                 out.append(

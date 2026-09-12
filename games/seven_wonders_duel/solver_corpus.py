@@ -235,6 +235,48 @@ def admission_ceiling(corpus: dict, model: dict) -> float:
     return ceiling * min(ratios) if ratios else ceiling
 
 
+def model_digest(model: dict) -> str:
+    """A short, stable identity for the admission decision a model makes.
+
+    Over the intercept, the weights in feature order and the margin -- what
+    `affordable` actually reads -- so a refit that changed only the `fit` block
+    keeps the same digest and the same precomputed coverage.
+    """
+
+    import hashlib
+
+    payload = json.dumps(
+        {
+            "intercept": round(float(model["intercept"]), 12),
+            "margin": round(float(model["margin_decades"]), 12),
+            "coefficients": {
+                name: round(float(value), 12)
+                for name, value in sorted(model["coefficients"].items())
+            },
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def recorded_gap(corpus: dict, model: dict, attempt_nodes: float) -> int | None:
+    """The precomputed count of positions this bar admits that the corpus lacks.
+
+    PRECOMPUTED, because a rented box cannot enumerate it. Enumeration needs the
+    collecting buffer, and that is a run archive -- not in the repository, and
+    absent from a fresh clone. So the count is computed here, once, where the
+    buffer exists, and shipped inside the corpus.
+
+    Keyed by model digest as well as bar: the gap is a property of both, and a
+    count recorded for one model says nothing about another.
+    """
+
+    table = (corpus.get("uncovered_by_model") or {}).get(model_digest(model))
+    if not table:
+        return None
+    return table.get(str(int(attempt_nodes)))
+
+
 def uncovered_positions(
     corpus: dict, model: dict, *, attempt_nodes: float, buffer_path: Path
 ) -> list[dict]:
@@ -288,7 +330,14 @@ def uncovered_positions(
                 float(value)
                 for value in swr.endgame_cost_features(rust_game_from_state(game))
             ]
-            if required(features, collecting) > bar >= required(features, model):
+            # TWO different bars, and conflating them was a bug: the corpus
+            # lacks a position when the COLLECTING run refused it at ITS bar,
+            # and the candidate admits it at the CANDIDATE bar. Using one value
+            # on both sides made every candidate report the same count.
+            if (
+                required(features, collecting) > bar
+                and required(features, model) <= attempt_nodes
+            ):
                 out.append(
                     {
                         "game_seed": _record.seed,
@@ -362,6 +411,11 @@ def price(
     # `admission_ceiling` bound applies and a bar beyond it is refused, because
     # then nothing knows how large the gap is.
     ceiling = admission_ceiling(corpus, model)
+    if uncovered is None:
+        # The shipped count, when one was recorded for this model and bar. A box
+        # has no buffer to enumerate from, so this is the only path that works
+        # there -- and it is the path the launcher takes.
+        uncovered = recorded_gap(corpus, model, attempt_nodes)
     if uncovered is None and attempt_nodes > ceiling * (1.0 + 1e-9):
         raise ValueError(
             f"attempt_nodes {attempt_nodes:,.0f} is above this corpus's "

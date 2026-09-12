@@ -453,3 +453,66 @@ def test_a_candidate_that_only_fits_optimistically_says_so():
                   bars=(10_000_000,), uncovered={10_000_000: 1_000})
     row = _row(result, 10_000_000)
     assert row["fits"] and not row["fits_worst_case"]
+
+
+def test_the_gap_is_shipped_in_the_corpus_not_enumerated_on_the_box():
+    """A rented box is a fresh clone. Enumeration needs the collecting buffer,
+    and that is a RUN ARCHIVE -- `git ls-files runs/.../cloud2` is empty, so it
+    is not there. The count has to travel inside the corpus or the box cannot
+    price the launcher's own bar at all."""
+
+    import json
+    from pathlib import Path
+
+    from .solver_corpus import model_digest, recorded_gap
+
+    corpus = json.loads(
+        (Path(__file__).resolve().parents[2]
+         / "games/seven_wonders_duel/solver_corpus.json").read_text(encoding="utf-8")
+    )
+    model = json.loads(
+        (Path(__file__).resolve().parents[2]
+         / "games/seven_wonders_duel/endgame_cost_model.json").read_text(encoding="utf-8")
+    )
+    assert corpus.get("uncovered_by_model"), "no gap table shipped"
+    assert model_digest(model) in corpus["uncovered_by_model"], (
+        "the shipped gap table is not keyed to the shipped model"
+    )
+    # The launcher's own bar must be priceable with no buffer present.
+    assert recorded_gap(corpus, model, 40_000_000) is not None
+
+
+def test_the_launchers_bar_prices_with_no_collecting_buffer():
+    """The failure this guards: `solver_sizing` exiting on the box after the
+    toolchain, preflight, arena and the whole sweep, because the crude bound
+    rejected a bar the shipped table says is 19 positions short."""
+
+    import json
+    from pathlib import Path
+
+    from .solver_sizing import size
+
+    root = Path(__file__).resolve().parents[2]
+    corpus = json.loads(
+        (root / "games/seven_wonders_duel/solver_corpus.json").read_text(encoding="utf-8"))
+    model = json.loads(
+        (root / "games/seven_wonders_duel/endgame_cost_model.json").read_text(encoding="utf-8"))
+    result = size(corpus, model, rate=857_015, threads=12,
+                  generation_wall_seconds=4422, games=1000, target_share=0.80,
+                  bars=(40_000_000,))
+    assert result["chosen"]["attempt_nodes"] == 40_000_000
+    assert result["chosen"]["uncovered_positions"] == 19
+
+
+def test_the_gap_depends_on_the_CANDIDATE_bar_not_only_the_collecting_one():
+    """Conflating them made every candidate report the same count -- 19 at 5M,
+    10M, 20M and 40M alike, which is impossible: a narrower bar admits less."""
+
+    import json
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    corpus = json.loads(
+        (root / "games/seven_wonders_duel/solver_corpus.json").read_text(encoding="utf-8"))
+    table = next(iter(corpus["uncovered_by_model"].values()))
+    assert table["5000000"] == 0 and table["40000000"] == 19, table
