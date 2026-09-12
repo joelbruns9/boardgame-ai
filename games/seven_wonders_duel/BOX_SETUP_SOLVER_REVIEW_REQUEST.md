@@ -320,9 +320,38 @@ drain argument (§7) is weakened: a 730s drain does not establish that a 373s
 solve overlaps it, and "idle after the last NN batch" misses a stall followed by
 another batch.
 
-**One consequence the reviewer did not raise but the P1 coverage fix forces.**
-Under the refitted model this corpus can only price bars up to **8,092,786**
-nodes, not 40M — so the 40M bar in §7 is *not* supported by it. The options are
-to reprice at a bar the corpus covers, rebuild the corpus from a run that used
-the refit model, or keep the collecting model for the box run. **This is an open
-decision, not a fixed defect.**
+**A consequence the P1 coverage fix first forced, and then removed.** The fix
+bounded the ceiling by `min(new_required / old_required)` over the corpus — a
+worst ratio of 0.202 — which collapsed a 40M ceiling to 8,092,786 and refused
+the bar this branch sets.
+
+That bound was wrong in the direction that looks safe. The set the refit
+actually newly admits at 40M is **19 positions of 8,032, or 0.24%**, and it is
+ENUMERABLE: the collecting run declined to attempt them, but they were still
+reached and played, so they sit in the same archived buffer as ordinary moves.
+
+`uncovered_positions` enumerates them by replaying that buffer, and `price`
+carries the count as an uncertainty instead of refusing — proofs understated by
+at most `uncovered`, demand by at most `uncovered × timeout`, with
+`fits_worst_case` reported beside `fits`. On the real corpus that immediately
+caught something the point estimate hides: at a 1,280M timeout the 19-position
+gap is worth **+24.32B nodes**, so the candidate fits on the estimate and does
+NOT fit at the worst case — and the sizer was reaching for exactly that timeout.
+At the chosen 320M it fits either way.
+
+Nothing needs rebuilding, and nothing needs new self-play. The positions are
+what a strong net reaches and cannot be regenerated without one — but they
+already exist. Closing the gap entirely is offline SOLVING of 19 positions,
+minutes of CPU, and it is optional: it would tighten the demand bound and change
+no decision made here.
+
+**Found while fixing that, and unrelated to any finding.** §3 and
+`training_parameters.md` both said the solver fires "on a full-search move".
+There is no such gate — `solver_wants` checks Age III and the cost model, and
+nothing in `settle_simulation` consults search width. Measured on cloud2
+iteration 96: **72% of solves and 43% of solver nodes land on cheap
+(policy-excluded) moves.** The behaviour is correct and the documents were
+wrong: `solver_value` attaches to an example independently of `has_policy`, so a
+cheap-move solve supplies an exact VALUE target and no policy target — right,
+since a 100-simulation visit distribution is not a label worth masking.
+Corrected in `training_parameters.md`.
