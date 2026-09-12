@@ -1397,8 +1397,23 @@ numbers. `--endgame-solver-max-nodes 0` disables it, and a disabled run is
 byte-identical to the generator that existed before the feature.
 
 When a position is reached that the solver can settle -- Age III, at most
-`--endgame-solver-max-cards` cards left on the board, on a full-search move --
-it contributes two things. If the proof crossed no chance edge (`regime` is
+`--endgame-solver-max-cards` cards left on the board, on ANY searched move --
+it contributes two things.
+
+**Not only full-search moves**, which this document claimed until 2026-09-11.
+`solver_wants` gates on Age III and the cost model, and nothing in
+`settle_simulation` consults the search width -- so cheap moves are solved too.
+Measured on cloud2 iteration 96: **72% of solves, and 43% of solver nodes, land
+on policy-excluded (cheap) moves.**
+
+That is not a defect, and the difference is what each buys. `solver_value` is
+attached to the example independently of `has_policy`, so a cheap-move solve
+still supplies an exact VALUE target; it contributes no policy target, which is
+correct, because a 100-simulation visit distribution is not a label worth
+masking. A full-search solve supplies both.
+
+Whether that is the best split of a fixed solver budget is a question nobody has
+asked -- the cheaper half buys one target where the dearer half buys two. If the proof crossed no chance edge (`regime` is
 `exact`), its value becomes the value target, **replacing** the realised game
 result rather than blending with it -- the result of a decided endgame is a
 sample of the exact value, produced by two players who may both then err.

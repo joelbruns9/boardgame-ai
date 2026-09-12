@@ -216,15 +216,16 @@ def admission_ceiling(corpus: dict, model: dict) -> float:
     # (required 48,162,395 under the collecting model, above the 40M bar), and
     # the refit puts it at 34,617,215 -- inside the bar, and missing.
     #
-    # The largest bar that is still covered: a position absent from the corpus
-    # had `old_required > ceiling`, so under the new model its required bar
-    # exceeds `ceiling * min(new_required / old_required)`. Taking that minimum
-    # over the corpus bounds it.
+    # A BOUND, and a deliberately crude one: `ceiling * min(new/old)` assumes
+    # every unobserved position moves as far as the worst observed one. On the
+    # shipped corpus that worst ratio is 0.202, which collapses a 40M ceiling to
+    # 8.09M -- while the set the refit actually newly admits at 40M is NINETEEN
+    # positions out of 8,032, or 0.24%.
     #
-    # An EXTRAPOLATION, and stated as one: the minimum is taken over rows the
-    # corpus has, and a position outside it could move further. It is a bound
-    # under the assumption that the two models' disagreement on absent positions
-    # is no worse than on present ones -- not a proof.
+    # So this is the fallback, not the answer. `uncovered_positions` enumerates
+    # the gap exactly from the collecting buffer, and `price` reports it rather
+    # than refusing; a bound that rejects a bar 99.76% covered is not caution,
+    # it is a wrong answer with a safe-sounding shape.
     old_margin = float(collecting["margin_decades"])
     new_margin = float(model["margin_decades"])
     ratios = [
@@ -232,6 +233,72 @@ def admission_ceiling(corpus: dict, model: dict) -> float:
         for old_p, new_p in zip(predictions(corpus, collecting), predictions(corpus, model))
     ]
     return ceiling * min(ratios) if ratios else ceiling
+
+
+def uncovered_positions(
+    corpus: dict, model: dict, *, attempt_nodes: float, buffer_path: Path
+) -> list[dict]:
+    """Positions `attempt_nodes` admits under `model` that the corpus lacks.
+
+    Enumerated, not bounded. The collecting run declined to ATTEMPT these, so
+    they carry no true cost -- but they were still reached and played, so they
+    are in the same buffer as ordinary moves and a replay finds them exactly.
+
+    That is the whole reason the gap is cheap to close: widening coverage needs
+    more offline SOLVING of positions that already exist, never new self-play.
+    The positions themselves are irreplaceable -- they are what a strong net
+    reaches -- and no rerun can produce them without that net.
+    """
+
+    import seven_wonders_rust as swr
+
+    from .buffer import read_records, replay
+    from .game import Phase
+    from .rust_bridge import rust_game_from_state
+
+    collecting = corpus.get("collecting_model")
+    if not collecting:
+        raise SystemExit(
+            "this corpus records no collecting model, so what a different model "
+            "would newly admit cannot be enumerated"
+        )
+    names = corpus["feature_names"]
+
+    def required(features, fitted):
+        weights = [fitted["coefficients"][name] for name in names]
+        predicted = fitted["intercept"] + sum(
+            x * w for x, w in zip(features, weights)
+        )
+        return 10.0 ** (predicted + float(fitted["margin_decades"]))
+
+    bar = float(corpus["collecting_attempt_nodes"])
+    out: list[dict] = []
+    for record in read_records(Path(buffer_path)):
+        moves = {move.i: move for move in record.moves}
+
+        def visit(game, move, _moves=moves, _record=record):
+            # The engine's own eligibility gate: `cost_model::eligible` is Age
+            # III mid-play, and nothing outside it is ever a solve candidate.
+            if game.phase is not Phase.PLAY_AGE or game.age != 3:
+                return
+            recorded = _moves.get(move.i)
+            if recorded is None or recorded.solver_attempted:
+                return
+            features = [
+                float(value)
+                for value in swr.endgame_cost_features(rust_game_from_state(game))
+            ]
+            if required(features, collecting) > bar >= required(features, model):
+                out.append(
+                    {
+                        "game_seed": _record.seed,
+                        "move_index": move.i,
+                        "features": features,
+                    }
+                )
+
+        replay(record, on_state=visit)
+    return out
 
 
 def _same_model(left: dict, right: dict) -> bool:
@@ -262,6 +329,7 @@ def price(
     attempt_nodes: float,
     max_nodes: float,
     games: int,
+    uncovered: int | None = None,
 ) -> dict:
     """What one candidate pair of caps would have bought on this corpus.
 
@@ -286,14 +354,20 @@ def price(
             "this corpus records no collecting game count, so per-game demand "
             "cannot be derived from it. Rebuild it with solver_corpus.py."
         )
+    # COVERAGE, reported rather than refused when the gap is known.
+    #
+    # `uncovered` is the count of positions this bar admits that the corpus
+    # lacks -- enumerated from the collecting buffer, not bounded. Supplied, it
+    # is carried through to the caller as an uncertainty; absent, the crude
+    # `admission_ceiling` bound applies and a bar beyond it is refused, because
+    # then nothing knows how large the gap is.
     ceiling = admission_ceiling(corpus, model)
-    if attempt_nodes > ceiling * (1.0 + 1e-9):
+    if uncovered is None and attempt_nodes > ceiling * (1.0 + 1e-9):
         raise ValueError(
             f"attempt_nodes {attempt_nodes:,.0f} is above this corpus's "
-            f"admission ceiling of {ceiling:,.0f}: the collecting run refused "
-            "everything more expensive, so those positions are absent and a "
-            "wider bar cannot be priced from here. Build a corpus from a run "
-            "that used at least this bar."
+            f"admission ceiling of {ceiling:,.0f}, and the size of the gap is "
+            "unknown. Enumerate it with `uncovered_positions` against the "
+            "collecting buffer and pass the count, or lower the bar."
         )
     bar = math.log10(attempt_nodes) - margin
     proofs = attempts = 0
@@ -327,6 +401,17 @@ def price(
         "proofs_per_game": proofs / collecting_games,
         "nodes_for_games": nodes / collecting_games * games,
         "proofs_for_games": proofs / collecting_games * games,
+        # The gap, as an uncertainty rather than a refusal. A position the
+        # corpus lacks has no true cost, so the honest bound is "it might fail
+        # at the full timeout": proofs are understated by at most `uncovered`,
+        # and nodes by at most `uncovered * max_nodes`. Demand is what decides
+        # fits/does-not-fit, so the node figure is the one that can change an
+        # answer -- proofs move by a fraction of a percent.
+        "uncovered_positions": uncovered,
+        "proofs_understated_by_at_most": uncovered or 0,
+        "nodes_understated_by_at_most": (
+            (uncovered or 0) / collecting_games * games * max_nodes
+        ),
     }
 
 

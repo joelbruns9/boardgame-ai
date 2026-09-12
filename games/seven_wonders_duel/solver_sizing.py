@@ -87,13 +87,29 @@ def candidates(
     games: int,
     bars: tuple[int, ...],
     multiples: tuple[int, ...] = TIMEOUT_MULTIPLES,
+    uncovered: dict[int, int] | None = None,
 ) -> list[dict]:
-    """Every (bar, timeout) pair worth pricing, priced."""
+    """Every (bar, timeout) pair worth pricing, priced.
 
+    `uncovered` maps a bar to how many positions it admits that the corpus
+    lacks, enumerated from the collecting buffer. A bar with an entry is priced
+    with that uncertainty attached; one without falls back to
+    `admission_ceiling`'s crude bound and is dropped above it.
+    """
+
+    uncovered = uncovered or {}
     ceiling = admission_ceiling(corpus, model)
     out = []
     dropped = []
     for bar in bars:
+        if bar in uncovered:
+            for multiple in multiples:
+                out.append(
+                    price(corpus, model, attempt_nodes=bar,
+                          max_nodes=bar * multiple, games=games,
+                          uncovered=uncovered[bar])
+                )
+            continue
         if bar > ceiling * (1.0 + 1e-9):
             # Not an error and not a zero result: the corpus simply has no rows
             # for what this bar would admit, because the run that produced it
@@ -139,6 +155,7 @@ def size(
     target_share: float,
     bars: tuple[int, ...],
     drain_fraction: float = DEFAULT_DRAIN_FRACTION,
+    uncovered: dict[int, int] | None = None,
 ) -> dict:
     """The best pair that fits the box's solver budget, and the runners-up.
 
@@ -154,12 +171,17 @@ def size(
         )
     budget = threads * generation_wall_seconds * rate * target_share
     drain_seconds = generation_wall_seconds * drain_fraction
-    priced = candidates(corpus, model, games=games, bars=bars)
+    priced = candidates(corpus, model, games=games, bars=bars, uncovered=uncovered)
     for row in priced:
         # `nodes_for_games` is already normalised by the corpus's own game
         # count and scaled to this iteration; `nodes_per_game * games` cancelled.
         row["demand_nodes"] = row["nodes_for_games"]
         row["fits"] = row["demand_nodes"] <= budget
+        # Against the WORST case for an uncovered gap, since demand is what
+        # decides this and an unpriced position may cost the whole timeout.
+        row["fits_worst_case"] = (
+            row["demand_nodes"] + row["nodes_understated_by_at_most"]
+        ) <= budget
         row["share_of_capacity"] = row["demand_nodes"] / budget * target_share
         # Thread-seconds the solver would spend per game, which is the number to
         # compare against a run's own profile once it exists.
@@ -275,10 +297,44 @@ def main(argv: list[str] | None = None) -> int:
         help="candidate attempt bars, comma separated",
     )
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument(
+        "--collecting-buffer",
+        type=Path,
+        default=None,
+        help="the buffer the corpus was collected from. Given it, a bar above "
+        "the corpus's admission ceiling is ENUMERATED rather than refused: the "
+        "positions a different model newly admits are found by replaying it, "
+        "and the count is carried as an uncertainty. Without it the crude "
+        "min-ratio bound applies, which on the shipped corpus rejects a 40M bar "
+        "that is 99.76%% covered.",
+    )
     args = parser.parse_args(argv)
 
     corpus = json.loads(args.corpus.read_text(encoding="utf-8"))
     model = json.loads(args.model.read_text(encoding="utf-8"))
+    bars = tuple(int(part) for part in args.bars.split(",") if part.strip())
+
+    uncovered = None
+    if args.collecting_buffer is not None:
+        from .solver_corpus import uncovered_positions
+
+        ceiling = admission_ceiling(corpus, model)
+        uncovered = {}
+        for bar in bars:
+            if bar <= ceiling * (1.0 + 1e-9):
+                continue
+            missing = uncovered_positions(
+                corpus, model, attempt_nodes=bar,
+                buffer_path=args.collecting_buffer,
+            )
+            uncovered[bar] = len(missing)
+            print(
+                f"bar {bar:,}: {len(missing)} position(s) it admits are absent "
+                f"from the corpus ({len(missing)/max(1, corpus['positions']):.2%} "
+                "of it) -- priced with that as an uncertainty rather than refused",
+                flush=True,
+            )
+
     result = size(
         corpus,
         model,
@@ -287,8 +343,9 @@ def main(argv: list[str] | None = None) -> int:
         generation_wall_seconds=args.generation_wall_seconds,
         games=args.games,
         target_share=args.target_share,
-        bars=tuple(int(part) for part in args.bars.split(",") if part.strip()),
+        bars=bars,
         drain_fraction=args.drain_fraction,
+        uncovered=uncovered,
     )
     chosen = result["chosen"]
     print(
@@ -319,6 +376,16 @@ def main(argv: list[str] | None = None) -> int:
         f"\nchosen: bar {chosen['attempt_nodes']:,} / timeout "
         f"{chosen['max_nodes']:,} / clock {chosen['max_secs']:.0f}s"
     )
+    if chosen.get("uncovered_positions"):
+        print(
+            f"! the chosen bar admits {chosen['uncovered_positions']} position(s) "
+            "the corpus lacks. They carry no true cost, so demand is understated "
+            f"by at most {chosen['nodes_understated_by_at_most']/1e9:.2f}B nodes "
+            f"and proofs by at most {chosen['proofs_understated_by_at_most']} "
+            f"({'fits' if chosen['fits_worst_case'] else 'DOES NOT FIT'} the "
+            "budget even at that worst case). Solve them into the corpus to "
+            "tighten it."
+        )
     if chosen["stall_exceeds_drain"]:
         print(
             f"! worst-case stall {chosen['worst_stall_seconds']:,.0f}s against a "

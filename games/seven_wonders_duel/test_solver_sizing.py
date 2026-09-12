@@ -401,3 +401,55 @@ def test_a_corpus_without_a_game_count_is_refused():
     del corpus["collecting_games"]
     with pytest.raises(SystemExit, match="collecting game count"):
         price(corpus, MODEL, attempt_nodes=1e8, max_nodes=1e9, games=100)
+
+
+def test_a_known_gap_is_priced_with_an_uncertainty_not_refused():
+    """The `min(ratio)` bound assumes every unobserved position moves as far as
+    the worst observed one. On the shipped corpus that rejected a 40M bar whose
+    real gap is 19 positions of 8,032 -- 0.24%. A bound that refuses a bar
+    99.76% covered is a wrong answer with a safe-sounding shape."""
+
+    from .solver_corpus import price
+
+    corpus = _corpus([1e5, 1e6], collecting_games=10)
+    corpus["collecting_attempt_nodes"] = 1_000
+    corpus["collecting_model"] = dict(MODEL, intercept=MODEL["intercept"] + 3.0)
+    # Far above the shrunken ceiling: refused without a count...
+    with pytest.raises(ValueError, match="size of the gap is unknown"):
+        price(corpus, MODEL, attempt_nodes=1e9, max_nodes=1e10, games=10)
+    # ...and priced with one.
+    out = price(corpus, MODEL, attempt_nodes=1e9, max_nodes=1e10, games=10,
+                uncovered=2)
+    assert out["proofs"] == 2
+    assert out["uncovered_positions"] == 2
+
+
+def test_the_gap_bounds_demand_from_ABOVE():
+    """An uncovered position carries no true cost, so the honest bound is that
+    it fails at the full timeout. Demand is what decides fits/does-not-fit, so
+    understating it is what can change an answer."""
+
+    from .solver_corpus import price
+
+    corpus = _corpus([1e5], collecting_games=1)
+    out = price(corpus, MODEL, attempt_nodes=1e8, max_nodes=5e8, games=10,
+                uncovered=3)
+    assert out["proofs_understated_by_at_most"] == 3
+    assert out["nodes_understated_by_at_most"] == pytest.approx(3 * 10 * 5e8)
+
+
+def test_a_candidate_that_only_fits_optimistically_says_so():
+    """Reproduced on the real corpus: at a 1,280M timeout the 19-position gap is
+    worth +24.32B nodes, so the point estimate fits and the worst case does
+    not."""
+
+    from .solver_sizing import size
+
+    # Budget is 10 x 1,000s x 1e6 x 0.8 = 8.0B. The corpus itself demands
+    # almost nothing, so the gap alone has to exceed the budget: 1,000 absent
+    # positions at a 10M timeout is 10.0B.
+    result = size(_corpus([1e5]), MODEL, rate=1e6, threads=10,
+                  generation_wall_seconds=1000, games=1, target_share=0.8,
+                  bars=(10_000_000,), uncovered={10_000_000: 1_000})
+    row = _row(result, 10_000_000)
+    assert row["fits"] and not row["fits_worst_case"]
