@@ -1234,6 +1234,12 @@ Fix the knobs above; nothing was measured and nothing was launched."
     SWEEP_SOLVER_ARGS+=(
       --solver-max-nodes "$ENDGAME_SOLVER_MAX_NODES"
       --solver-max-secs "$ENDGAME_SOLVER_MAX_SECS"
+      # THE BAR TOO. The harness falls back to the manifest only for values it
+      # was not given, and this stage gives it an explicit timeout -- so passing
+      # the timeout alone left the bar defaulting to it, and the split vanished
+      # for the sweep. The sweep would then measure admission at the timeout
+      # while the run admits at the bar: a solver load no run carries.
+      --solver-attempt-nodes "$ENDGAME_SOLVER_ATTEMPT_NODES"
     )
   else
     # The solver is off for this run, so a split has nothing to divide.
@@ -1347,6 +1353,19 @@ if not on:
     print("  no sweep point ran with the solver on; nothing to check")
     raise SystemExit(0)
 attempted = sum(row.get("solves_attempted", 0) for row in on)
+# PREDICTIONS, not just attempts. Only the cost model produces one, so a nonzero
+# count is what says the model was installed rather than the card cap having let
+# something through -- and with `max_cards = 0` the card cap admits nothing at
+# all, which is how every point came to attempt zero solves while dutifully
+# reporting its thread count.
+predicted = sum(row.get("solves_with_prediction", 0) for row in on)
+if attempted and not predicted:
+    print(
+        f"  {attempted} solves attempted and NONE carried a cost-model "
+        "prediction: the model was not installed in the sweep process",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
 if attempted == 0:
     print(
         f"  {len(on)} points configured solver threads and attempted ZERO "
@@ -1355,7 +1374,8 @@ if attempted == 0:
     )
     raise SystemExit(1)
 answered = sum(row.get("solves_answered", 0) for row in on)
-print(f"  solver LIVE across {len(on)} points: {attempted} attempted, {answered} answered")
+print(f"  solver LIVE across {len(on)} points: {attempted} attempted, "
+      f"{answered} answered, {predicted} with a model prediction")
 PYSOLVES
   fi
 
@@ -1401,27 +1421,120 @@ PYSOLVES
   # Skipped, loudly, when the corpus is absent: sizing the caps off nothing would
   # produce numbers indistinguishable from measured ones.
   SOLVER_CORPUS="${SOLVER_CORPUS:-$REPO_DIR/games/seven_wonders_duel/solver_corpus.json}"
-  if [ ! -f "$SOLVER_CORPUS" ]; then
+  if [ "$ENDGAME_SOLVER_MAX_NODES" -le 0 ]; then
+    # The run turned the solver OFF, and the sweep above measured a geometry
+    # without it. Sizing caps anyway would write positive numbers into
+    # measured_env.sh, and pass 2 would source them and launch WITH a solver, on
+    # a geometry measured without one. An operator who disabled it must not have
+    # it handed back by the stage that was supposed to tune it.
+    warn "ENDGAME_SOLVER_MAX_NODES=0: the solver is off for this run, so no caps"
+    warn "are sized. The sweep measured a geometry without it."
+  elif [ ! -f "$SOLVER_CORPUS" ]; then
     warn "No solver corpus at $SOLVER_CORPUS; leaving the solver caps at the"
     warn "launcher's defaults (attempt bar $ENDGAME_SOLVER_ATTEMPT_NODES, timeout"
     warn "$ENDGAME_SOLVER_MAX_NODES). Build one with solver_corpus.py."
   else
-    _GEN_WALL="$("$PY" - "$SWEEP_DIR/generation/phase_d_sweep.json" "$GAMES_PER_ITERATION" <<'PYWALL'
+    # ── The WINNER's geometry, not stage 6b's guess ──────────────────────────
+    #
+    # `_total_solver` and `NODE_RATE` came from stage 6b, which ran BEFORE the
+    # sweep varied the worker and solver axes. Sizing against them budgets for a
+    # thread count `measured_env.sh` will not launch -- a 12-thread allocation
+    # followed by a 4-thread winner still receives a 12-thread budget, three
+    # times the capacity the run will actually have.
+    #
+    # The wall is read at the FULL simulation budget for the same reason. The
+    # sweep ran at SWEEP_SIMS_DIVISOR, and this file says in three places that a
+    # divided sweep's games/hour is not the run's rate -- then used it as one.
+    # At the default divisor that supplies roughly a quarter of production
+    # generation wall, so the budget comes out a quarter of the truth and
+    # affordable candidates are rejected, or setup aborts.
+    read -r _WIN_WORKERS _WIN_SOLVER_TOTAL <<<"$("$PY" - "$SWEEP_DIR/generation/phase_d_sweep.json" <<'PYWIN'
 import json, sys
-# Seconds of GENERATION per iteration at the winning geometry. Not the whole
-# iteration: solving happens during generation, and charging the solver for
-# training time would inflate its budget by however long the learner runs.
 payload = json.loads(open(sys.argv[1], encoding="utf-8").read())
 best = (payload.get("staged") or {}).get("winner") or payload["summary"][0]
-rate = float(best["median_games_per_hour"])
-print(int(int(sys.argv[2]) / rate * 3600) if rate > 0 else 0)
+print(int(best.get("scheduler_workers") or 0),
+      int(best.get("solver_threads_total") or 0))
+PYWIN
+)"
+    if [ "${_WIN_SOLVER_TOTAL:-0}" -le 0 ]; then
+      warn "The sweep's winner ran no solver threads, so there is no split to"
+      warn "size caps against. Leaving the solver caps at the launcher's values."
+      _GEN_WALL=0
+    else
+      say "Sizing against the WINNING geometry: $_WIN_WORKERS shards, $_WIN_SOLVER_TOTAL solver threads"
+      # Re-measure the rate at the thread count that won. Contention is what
+      # this measures, and it is a function of the thread count -- stage 6b's
+      # figure belongs to a different one.
+      NODE_RATE_WIN="$("$PY" - "$_WIN_SOLVER_TOTAL" <<'PYRATE2'
+import sys
+from games.seven_wonders_duel.endgame_trigger_study import measure_node_rate_contended
+out = measure_node_rate_contended(max(1, int(sys.argv[1])))
+print(int(out["nodes_per_second_per_thread"]))
+print(f"  {out['threads']} threads: {out['nodes_per_second_per_thread']:,.0f} "
+      f"nodes/s/thread (efficiency {out['parallel_efficiency']:.2f})",
+      file=sys.stderr)
+PYRATE2
+)"
+      NODE_RATE_WIN="$(printf '%s' "$NODE_RATE_WIN" | head -1)"
+      [ "${NODE_RATE_WIN:-0}" -gt 0 ] || NODE_RATE_WIN="$NODE_RATE"
+
+      # GENERATION WALL AT FULL SIMULATIONS. One confirmation point at the
+      # winning geometry with the divisor off -- a measurement, not an
+      # extrapolation from a divided one.
+      # ONE point, at the winner's exact geometry, divisor off. It costs a
+      # full-cost iteration and it is the only honest source of a production
+      # generation wall. A failure degrades to the extrapolation below rather
+      # than losing the whole setup, which is why this warns and does not die.
+      say "Confirmation point at FULL simulations (one point, the winner's geometry)"
+      "$PY" -m games.seven_wonders_duel.f4_phase_d_sweep \
+        --checkpoint "$SWEEP_CHECKPOINT" \
+        --output "$SWEEP_DIR/full_sims" \
+        --games "$SWEEP_GENERATION_GAMES" \
+        --repetitions 1 --warmup-games 0 \
+        --config-from-manifest "$RUN_CONFIG_JSON" \
+        --sims-divisor 1 \
+        --slots "$_WIN_SLOTS" --caps "$_WIN_CAP" \
+        --inflight "$_WIN_INFLIGHT" --workers "$_WIN_WORKERS" \
+        --inference-wait-ms "$_WIN_WAIT" \
+        --solver-threads-total "$_WIN_SOLVER_TOTAL" \
+        --solver-max-nodes "$ENDGAME_SOLVER_MAX_NODES" \
+        --solver-attempt-nodes "$ENDGAME_SOLVER_ATTEMPT_NODES" \
+        --device cuda --precision "$PRECISION" \
+        || warn "The full-simulation confirmation point did not complete; the wall will be EXTRAPOLATED."
+      _GEN_WALL="$("$PY" - "$SWEEP_DIR/full_sims/phase_d_sweep.json" "$SWEEP_DIR/generation/phase_d_sweep.json" "$GAMES_PER_ITERATION" "$SWEEP_SIMS_DIVISOR" <<'PYWALL'
+import json, pathlib, sys
+# Seconds of GENERATION per iteration. Not the whole iteration: solving happens
+# during generation, and charging the solver for training time would inflate its
+# budget by however long the learner runs.
+#
+# Preference order: a point measured at the FULL simulation budget, else the
+# divided sweep scaled by the divisor -- which is an EXTRAPOLATION and says so,
+# because simulations are not the only per-game cost and the scaling is not
+# exact.
+full = pathlib.Path(sys.argv[1])
+games, divisor = int(sys.argv[3]), max(1, int(sys.argv[4]))
+if full.is_file():
+    payload = json.loads(full.read_text(encoding="utf-8"))
+    best = (payload.get("staged") or {}).get("winner") or payload["summary"][0]
+    rate = float(best["median_games_per_hour"])
+    print(int(games / rate * 3600) if rate > 0 else 0)
+    print("measured at the full simulation budget", file=sys.stderr)
+else:
+    payload = json.loads(open(sys.argv[2], encoding="utf-8").read())
+    best = (payload.get("staged") or {}).get("winner") or payload["summary"][0]
+    rate = float(best["median_games_per_hour"])
+    print(int(games / rate * 3600) * divisor if rate > 0 else 0)
+    print(f"EXTRAPOLATED from a {divisor}x divided sweep, not measured",
+          file=sys.stderr)
 PYWALL
 )"
+      _GEN_WALL="$(printf '%s' "$_GEN_WALL" | head -1)"
+    fi
     if [ "${_GEN_WALL:-0}" -gt 0 ]; then
       "$PY" -m games.seven_wonders_duel.solver_sizing \
         --corpus "$SOLVER_CORPUS" \
-        --rate "$NODE_RATE" \
-        --threads "$_total_solver" \
+        --rate "$NODE_RATE_WIN" \
+        --threads "$_WIN_SOLVER_TOTAL" \
         --generation-wall-seconds "$_GEN_WALL" \
         --games "$GAMES_PER_ITERATION" \
         --target-share "$SOLVER_TARGET_SHARE" \

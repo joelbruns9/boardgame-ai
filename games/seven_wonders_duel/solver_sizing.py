@@ -156,12 +156,15 @@ def size(
     drain_seconds = generation_wall_seconds * drain_fraction
     priced = candidates(corpus, model, games=games, bars=bars)
     for row in priced:
-        row["demand_nodes"] = row["nodes_per_game"] * games
+        # `nodes_for_games` is already normalised by the corpus's own game
+        # count and scaled to this iteration; `nodes_per_game * games` cancelled.
+        row["demand_nodes"] = row["nodes_for_games"]
         row["fits"] = row["demand_nodes"] <= budget
         row["share_of_capacity"] = row["demand_nodes"] / budget * target_share
         # Thread-seconds the solver would spend per game, which is the number to
         # compare against a run's own profile once it exists.
         row["solver_seconds_per_game"] = row["nodes_per_game"] / rate
+        row["proofs_expected"] = row["proofs_for_games"]
         row["max_secs"] = (row["max_nodes"] / rate) * CLOCK_SLACK
         # WORST-CASE STALL: one solve running the cap to exhaustion, alone,
         # while the iteration waits for its game to finish. Reported rather than

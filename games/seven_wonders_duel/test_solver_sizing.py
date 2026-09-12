@@ -20,17 +20,27 @@ MODEL = {
 }
 
 
-def _corpus(costs, *, collecting_attempt_nodes: int | None = 1_000_000_000):
+def _corpus(costs, *, collecting_attempt_nodes: int | None = 1_000_000_000,
+            collecting_games: int = 1, collecting_model: dict | None = MODEL):
     """`None` cost means the position never completed at any budget measured.
 
     The collecting bar defaults WIDE so these fixtures exercise pricing rather
     than the admission ceiling; the ceiling tests set it deliberately. Pass
-    `None` to get a corpus that has to infer it.
+    `None` for the bar to get a corpus that has to infer it.
+
+    `collecting_model` defaults to MODEL -- the same one the tests price with --
+    so coverage holds and the fixtures exercise pricing. The coverage tests pass
+    a different one deliberately.
+
+    `collecting_games` is 1 so per-game figures equal per-corpus ones and the
+    arithmetic in these tests stays readable; the scaling has its own test.
     """
 
     return {
         "feature_names": ["f0", "f1"],
         "collecting_attempt_nodes": collecting_attempt_nodes,
+        "collecting_games": collecting_games,
+        "collecting_model": collecting_model,
         "rows": [
             {"features": [0.0, 0.0], "true_nodes": c, "declined": c is None}
             for c in costs
@@ -315,3 +325,79 @@ def test_a_measured_drain_overrides_the_cloud2_default():
                     320_000_000)["stall_exceeds_drain"]
     assert _row(_sized(10_000_000, drain_fraction=0.01),
                 320_000_000)["stall_exceeds_drain"]
+
+
+# --- review findings, each with the case that reproduced it ----------------
+
+
+def test_coverage_is_a_property_of_the_bar_AND_the_model():
+    """A recorded 40M bar does not establish coverage under a refitted model.
+
+    Reproduced on the shipped corpus: seed 116260767 move 64 was NOT attempted
+    -- required 48,162,395 under the collecting model, above the 40M bar -- and
+    the refit puts it at 34,617,215, inside the bar and absent from the corpus.
+
+    It also disproves the "none newly admitted" claim I made when comparing the
+    two models ON the corpus: the corpus contains only what the old model
+    admitted, so newly-admitted positions cannot appear in it by construction.
+    """
+
+    from .solver_corpus import admission_ceiling
+
+    corpus = _corpus([1e5])
+    corpus["collecting_attempt_nodes"] = 40_000_000
+    assert admission_ceiling(corpus, MODEL) == 40_000_000
+    # A model that predicts one decade CHEAPER admits positions the collecting
+    # run refused, so the ceiling must shrink by that factor.
+    cheaper = dict(MODEL, intercept=MODEL["intercept"] - 1.0)
+    assert admission_ceiling(corpus, cheaper) == pytest.approx(4_000_000)
+
+
+def test_an_identical_model_does_not_shrink_the_ceiling():
+    """The guard must not penalise the case it was not written for."""
+
+    from .solver_corpus import admission_ceiling
+
+    corpus = _corpus([1e5])
+    corpus["collecting_attempt_nodes"] = 40_000_000
+    assert admission_ceiling(corpus, dict(MODEL)) == 40_000_000
+
+
+def test_a_model_that_only_differs_in_its_fit_block_is_the_same_model():
+    """`affordable` reads the intercept, the weights and the margin. A refit
+    that changed none of them changes no decision, and a whole-file comparison
+    would shrink the ceiling for nothing."""
+
+    from .solver_corpus import admission_ceiling
+
+    corpus = _corpus([1e5])
+    corpus["collecting_attempt_nodes"] = 40_000_000
+    annotated = dict(MODEL, fit={"held_out_r2": 0.99}, comment="rewritten")
+    assert admission_ceiling(corpus, annotated) == 40_000_000
+
+
+def test_demand_scales_with_the_target_iteration_size():
+    """`price` divided corpus nodes by the REQUESTED games and `size`
+    multiplied by the same number, so they cancelled: 100, 1,000 and 10,000
+    games all reported identical demand while capacity grew with the wall,
+    making larger iterations look free."""
+
+    from .solver_corpus import price
+
+    corpus = _corpus([1e5, 1e6], collecting_games=10)
+    small = price(corpus, MODEL, attempt_nodes=1e8, max_nodes=1e9, games=10)
+    large = price(corpus, MODEL, attempt_nodes=1e8, max_nodes=1e9, games=100)
+    assert large["nodes_for_games"] == pytest.approx(10 * small["nodes_for_games"])
+    assert small["nodes_per_game"] == pytest.approx(large["nodes_per_game"])
+
+
+def test_a_corpus_without_a_game_count_is_refused():
+    """Per-game demand cannot be derived from it, and guessing would reinstate
+    exactly the cancellation above."""
+
+    from .solver_corpus import price
+
+    corpus = _corpus([1e5])
+    del corpus["collecting_games"]
+    with pytest.raises(SystemExit, match="collecting game count"):
+        price(corpus, MODEL, attempt_nodes=1e8, max_nodes=1e9, games=100)

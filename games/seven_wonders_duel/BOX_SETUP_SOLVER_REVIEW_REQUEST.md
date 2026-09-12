@@ -12,6 +12,12 @@ apart:
 3. the solver's caps are now SIZED from the box rather than pinned, using a
    corpus priced once off-box.
 
+**Reviewed 2026-09-11: seven findings, all reproduced, all fixed.** Five were
+defects that would have produced wrong numbers on a rented box, including one
+that made the sweep's entire solver axis measure ZERO solves. Two claims in this
+document were disproved and are corrected in place (§6, §7). See §11 for the
+audit trail. Sections 1-10 describe the code as it now stands.
+
 **Status: built, tested, and all of it has now RUN at least once** — the laptop
 soak (20/20 iterations, clean) exercised the mechanisms end to end, and
 `rehearse_sweep_laptop.sh` runs the box's stage 6b/8b/8c pipeline green. What has
@@ -183,7 +189,7 @@ settings — the one candidate that must always be priceable.
 | Staged sweep | on | Stage B cannot reorder stage A (§2) |
 | `--exclude-parked-from-budget` | **on** (phase_d defaults off) | Redefines `--rust-slots` from concurrent games to concurrent SEARCHING games, so slot counts are not comparable across the two. Set before stage 8b for that reason. Records are byte-identical either way (`test_excluding_parked_slots_changes_no_record`) |
 | Attempt bar 40M / timeout 320M | **changed from 40M/40M** | §7 |
-| Cost model refitted | on | **Target-changing**: at a 40M bar the refit admits 7,799 where the old model admitted 8,013 — 214 newly refused, none newly admitted. Buffers either side do not share a target definition |
+| Cost model refitted | on | **Target-changing**: at a 40M bar the refit refuses 214 of the corpus's 8,013. "None newly admitted" was **wrong** and is withdrawn — it was computed ON the corpus, which by construction holds only what the old model admitted, so newly-admitted positions cannot appear in it. Counterexample: seed 116260767 move 64, required bar 48,162,395 under the collecting model and 34,617,215 under the refit. Buffers either side do not share a target definition |
 
 ---
 
@@ -202,18 +208,30 @@ Priced on `solver_corpus.json` at cloud2's rate and 12 solver threads:
 filters on predicted cost, so it drops the expensive positions first, which are
 the ones worth proving (at a 5M bar, hard proofs fall 1,572 -> 592).
 
-**The stall is real and knowingly accepted.** The scheduler cannot end an
-iteration while a game is parked on a solve (`work_remaining()` is
-`active_count > 0`). But across 97 cloud2 iterations the drain tail below 25% of
-peak occupancy was already a median **16.5%** of generation wall (~730s) at a 40M
-cap — games finishing unevenly once the queue empties — while idle after the last
-NN batch, where a solve-induced stall WOULD show, was **3s median and 3s worst**.
-A 373s solve lands inside a window the run already idles through. `solver_sizing`
-flags it anyway (it exceeds half the drain), which is why this is a decision
-rather than a default.
+**The stall is real and accepted with a weaker justification than I first
+gave.** The scheduler cannot end an iteration while a game is parked on a solve
+(`work_remaining()` is `active_count > 0`).
 
-I revised this view during the work: I first claimed 747s was "16.9% of an
-iteration" as though additive. It is not, and the counters say so.
+What is measured: across 97 cloud2 iterations the drain tail below 25% of peak
+occupancy was a median **16.5%** of generation wall (~730s) at a 40M cap, and
+idle after the last NN batch was **3s median, 3s worst**.
+
+What that does NOT establish, and I previously implied it did:
+
+* A 730s drain does not show that a 373s solve overlaps it. A solve that STARTS
+  late extends the iteration by however much of it remains when everything else
+  has finished, and the drain's existence says nothing about when solves begin.
+* "Idle after the last NN batch" only catches a stall at the very end. A stall
+  in the middle of the drain, followed by another batch, is invisible to it.
+
+So the honest claim is narrower: at a 40M cap the solver contributes ~3s of
+end-of-iteration idle, and the run already has a large low-occupancy tail that a
+longer solve *may* overlap. Whether a 373s solve is absorbed is **not measured**.
+`solver_sizing` flags it (it exceeds half the drain), and the box's own
+`parked_slot_fraction` and batch timings are what would settle it.
+
+I revised this twice: first claiming 747s was "16.9% of an iteration" as though
+additive, then over-correcting to "absorbed". Neither is supported.
 
 ---
 
@@ -278,3 +296,33 @@ python -m games.seven_wonders_duel.solver_sizing \
   --rate 857015 --threads 12 --generation-wall-seconds 4422 \
   --games 1000 --target-share 0.80     # reproduces the §7 table
 ```
+
+
+---
+
+## 11. Review audit trail (2026-09-11)
+
+Seven findings, every one reproduced against the code before it was fixed.
+
+| # | Finding | Reproduced | Fix |
+|---|---|---|---|
+| P1 | The sweep never installed the manifest's cost model, so `solver_wants` fell back to `cards_left <= max_cards` with `max_cards = 0` — a test no Age III position passes. **Every point attempted zero solves.** | Structural: `cards_left >= 1` in mid-play, and `grep` shows `set_endgame_cost_model` was never called | `f4_phase_d_sweep` installs the model from the manifest into THIS process; the liveness check now requires `solves_with_prediction > 0`, which only the model can produce |
+| P1 | `SWEEP_SOLVER_ARGS` passed the timeout but not the bar, and the harness's manifest fallback for the bar was nested inside the timeout's `if` — so an explicit timeout suppressed it and the split vanished for the sweep | Read: the `if solver_max_nodes <= 0` block encloses the bar lookup | Bar passed explicitly; each fallback resolves on its own absence |
+| P1 | A recorded bar does not establish coverage under a **refitted** model | seed 116260767 move 64: unattempted, required 48,162,395 under the collecting model, 34,617,215 under the refit | The corpus records the collecting MODEL; `admission_ceiling` shrinks by `min(new_required / old_required)` when they differ, and says it is an extrapolation |
+| P1 | `price` divided by the REQUESTED games and `size` multiplied by the same number, so they cancelled — demand was identical at 100 / 1,000 / 10,000 games while capacity grew with the wall | 28.494B at all three | The corpus records `collecting_games`; demand normalises by that and scales to the target |
+| P1 | Stage 8c sized against stage 6b's PRELIMINARY thread split and rate, before the worker and solver axes were swept | Read: `_total_solver` and `NODE_RATE` are set at 6b and never replaced | Reads the winner's `scheduler_workers` / `solver_threads_total`, and re-measures the contended rate at that thread count |
+| P2 | The generation wall came from a DIVIDED sweep, so at divisor 4 the budget was ~¼ of the truth — this file says three times that a divided sweep's games/hour is not the run's rate, then used it as one | Read: `median_games_per_hour` used directly | One confirmation point at the winner's geometry with `--sims-divisor 1`; the fallback scales and labels itself `EXTRAPOLATED` |
+| P2 | Sizing was conditional only on the corpus existing, so a run with `ENDGAME_SOLVER_MAX_NODES=0` still got positive caps written into `measured_env.sh` | Read: the branch tests only `-f "$SOLVER_CORPUS"` | Skips sizing and preserves zero when the solver is off |
+
+**Two claims withdrawn.** "None newly admitted" (§6) was circular — computed on
+a corpus that by construction holds only what the old model admitted. And the
+drain argument (§7) is weakened: a 730s drain does not establish that a 373s
+solve overlaps it, and "idle after the last NN batch" misses a stall followed by
+another batch.
+
+**One consequence the reviewer did not raise but the P1 coverage fix forces.**
+Under the refitted model this corpus can only price bars up to **8,092,786**
+nodes, not 40M — so the 40M bar in §7 is *not* supported by it. The options are
+to reprice at a bar the corpus covers, rebuild the corpus from a run that used
+the refit model, or keep the collecting model for the box run. **This is an open
+decision, not a fixed defect.**

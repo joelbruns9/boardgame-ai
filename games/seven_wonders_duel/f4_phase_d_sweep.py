@@ -503,6 +503,16 @@ def run_point(
         "solves_attempted": sum(
             1 for record in records for move in record.moves if move.solver_attempted
         ),
+        # Attempts carrying a PREDICTION, which is what says the cost model was
+        # actually installed rather than the card cap having admitted something.
+        # An attempt count alone cannot tell those apart, and the card-cap path
+        # is exactly how this harness measured zero solves while looking busy.
+        "solves_with_prediction": sum(
+            1
+            for record in records
+            for move in record.moves
+            if move.solver_attempted and move.solver_predicted_nodes is not None
+        ),
         "solves_answered": sum(
             1
             for record in records
@@ -788,24 +798,30 @@ def main(argv: list[str] | None = None) -> dict:
     # (`THROUGHPUT_LEVERS.md` class D).
     solver_max_nodes = args.solver_max_nodes
     solver_attempt_nodes = args.solver_attempt_nodes
-    if solver_max_nodes <= 0 and args.config_from_manifest:
+    if args.config_from_manifest:
         import json as _json
 
         manifest = _json.loads(
             pathlib.Path(args.config_from_manifest).read_text(encoding="utf-8")
         )
-        found = _find_manifest_value(manifest, "endgame_solver_max_nodes")
-        if found:
-            solver_max_nodes = int(found)
-            print(f"solver budget from manifest: {solver_max_nodes:,} nodes", flush=True)
+        # EACH fallback resolves on its OWN absence. Nesting the bar inside the
+        # timeout's `if` meant a caller that passed an explicit timeout -- which
+        # the launcher does -- never reached the bar, so the split silently
+        # vanished for the sweep and admission widened to the timeout.
+        if solver_max_nodes <= 0:
+            found = _find_manifest_value(manifest, "endgame_solver_max_nodes")
+            if found:
+                solver_max_nodes = int(found)
+                print(f"solver budget from manifest: {solver_max_nodes:,} nodes", flush=True)
         # The ATTEMPT BAR, which is a different number from the timeout on any
         # run that split them. Left at 0 it falls back to the timeout, which is
         # what one shared number always meant -- but on a run that narrowed the
         # bar, defaulting to the timeout admits a much larger set of positions
         # and measures a solver load the run does not carry.
-        bar = _find_manifest_value(manifest, "endgame_solver_attempt_nodes")
-        if bar:
-            solver_attempt_nodes = int(bar)
+        if solver_attempt_nodes <= 0:
+            bar = _find_manifest_value(manifest, "endgame_solver_attempt_nodes")
+            if bar:
+                solver_attempt_nodes = int(bar)
             print(
                 f"solver attempt bar from manifest: {solver_attempt_nodes:,} "
                 f"nodes ({solver_max_nodes / max(1, solver_attempt_nodes):.1f}x "
@@ -873,6 +889,42 @@ def main(argv: list[str] | None = None) -> dict:
             precision=args.precision,
             **geometry,
         )
+    # THE COST MODEL, installed in this process.
+    #
+    # `config_from_manifest` copies `endgame_cost_model` into the config, and
+    # that does nothing: the trigger reads a RUST GLOBAL, and the `--emit-config`
+    # subprocess that produced the manifest cannot reach this process's. With no
+    # model installed `solver_wants` falls back to `cards_left <= max_cards`, and
+    # `run_point` passes `max_cards = 0` -- a test no Age III mid-play position
+    # can pass. Every point then attempted ZERO solves while reporting the thread
+    # count it had configured, which is the defect THROUGHPUT_LEVERS 3.1 records,
+    # in the one harness written to avoid it.
+    if run_config is not None and getattr(run_config, "endgame_cost_model", None):
+        stored = run_config.endgame_cost_model
+        if isinstance(stored, dict) and "coefficients" in stored:
+            import seven_wonders_rust as _swr
+
+            names = list(_swr.endgame_cost_model_features())
+            _swr.set_endgame_cost_model(
+                names,
+                float(stored["intercept"]),
+                [float(stored["coefficients"][n]) for n in names],
+                float(stored["margin_decades"]),
+            )
+            print(
+                f"cost model installed from the manifest: margin "
+                f"{stored['margin_decades']} decades over {len(names)} features",
+                flush=True,
+            )
+        else:
+            print(
+                "WARNING: the manifest's cost model has no coefficients, so the "
+                "trigger falls back to the card cap -- which run_point sets to "
+                "0, refusing every position. The solver axis will measure "
+                "nothing.",
+                flush=True,
+            )
+
     config = apply_config_overrides(config, args.config_override)
     # LAST, so an explicit --config-override names the budget the operator
     # meant and the divisor is applied to that rather than to whatever the
@@ -1029,6 +1081,9 @@ def main(argv: list[str] | None = None) -> dict:
                 ),
                 "solves_answered": sum(
                     row.get("solves_answered", 0) for row in matching
+                ),
+                "solves_with_prediction": sum(
+                    row.get("solves_with_prediction", 0) for row in matching
                 ),
                 "median_seconds": statistics.median(row["wall_seconds"] for row in matching),
                 "median_games_per_hour": statistics.median(

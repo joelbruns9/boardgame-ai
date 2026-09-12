@@ -50,6 +50,7 @@ def build(
     study_path: Path | None,
     *,
     collecting_attempt_nodes: int | None = None,
+    collecting_model: dict | None = None,
 ) -> dict:
     """Replay a buffer and price every position a solve was attempted at.
 
@@ -78,12 +79,14 @@ def build(
 
     rows: list[dict] = []
     censored_unresolved = 0
+    seen_games: set = set()
     for record in read_records(buffer_path):
         wanted = {
             move.i: move
             for move in record.moves
             if getattr(move, "solver_attempted", False)
         }
+        seen_games.add(record.seed)
         if not wanted:
             continue
 
@@ -118,14 +121,28 @@ def build(
 
         replay(record, on_state=visit)
 
+    collecting_games = len(seen_games)
     return {
         "schema": SCHEMA,
         "source_buffer": str(buffer_path),
         "source_study": str(study_path) if study_path else None,
+        # The model the COLLECTING run admitted positions with. Coverage is a
+        # property of (bar, MODEL) jointly, not of the bar alone: a refit moves
+        # each position's required bar, so the same 40M bar under a new model
+        # admits a different set -- and the ones it newly admits are ABSENT
+        # here, because the collecting run never attempted them.
+        "collecting_model": collecting_model,
         # The bar the COLLECTING run used. `admission_ceiling` needs it exactly:
         # inferring it from the rows lands just under the true value and
         # excludes the run's own settings from being priced.
         "collecting_attempt_nodes": collecting_attempt_nodes,
+        # GAMES the corpus was collected over. `price` normalises by this and
+        # then scales to the target, because the two are different numbers:
+        # dividing corpus nodes by the REQUESTED game count and multiplying by
+        # it again cancels, so demand came out identical at 100, 1,000 and
+        # 10,000 games while capacity grew with the iteration wall -- larger
+        # iterations looked free.
+        "collecting_games": collecting_games,
         "feature_names": list(swr.endgame_cost_model_features()),
         "positions": len(rows),
         "declined": sum(1 for row in rows if row["declined"]),
@@ -182,9 +199,60 @@ def admission_ceiling(corpus: dict, model: dict) -> float:
     """
 
     recorded = corpus.get("collecting_attempt_nodes")
-    if recorded:
-        return float(recorded)
-    return 10.0 ** (max(predictions(corpus, model)) + float(model["margin_decades"]))
+    if not recorded:
+        return 10.0 ** (max(predictions(corpus, model)) + float(model["margin_decades"]))
+    ceiling = float(recorded)
+
+    collecting = corpus.get("collecting_model")
+    if not collecting or _same_model(collecting, model):
+        return ceiling
+
+    # A DIFFERENT MODEL. Coverage is a property of (bar, model) jointly: a refit
+    # moves every position's required bar `10**(predict + margin)`, so the same
+    # numeric bar admits a different set -- and whatever it newly admits is
+    # absent here, because the collecting run never attempted it.
+    #
+    # Reproduced on the shipped corpus: seed 116260767 move 64 was NOT attempted
+    # (required 48,162,395 under the collecting model, above the 40M bar), and
+    # the refit puts it at 34,617,215 -- inside the bar, and missing.
+    #
+    # The largest bar that is still covered: a position absent from the corpus
+    # had `old_required > ceiling`, so under the new model its required bar
+    # exceeds `ceiling * min(new_required / old_required)`. Taking that minimum
+    # over the corpus bounds it.
+    #
+    # An EXTRAPOLATION, and stated as one: the minimum is taken over rows the
+    # corpus has, and a position outside it could move further. It is a bound
+    # under the assumption that the two models' disagreement on absent positions
+    # is no worse than on present ones -- not a proof.
+    old_margin = float(collecting["margin_decades"])
+    new_margin = float(model["margin_decades"])
+    ratios = [
+        10.0 ** ((new_p + new_margin) - (old_p + old_margin))
+        for old_p, new_p in zip(predictions(corpus, collecting), predictions(corpus, model))
+    ]
+    return ceiling * min(ratios) if ratios else ceiling
+
+
+def _same_model(left: dict, right: dict) -> bool:
+    """Do these two describe the same admission decision?
+
+    Compared on what `affordable` actually reads -- the intercept, the weights
+    in feature order, and the margin -- rather than on the whole file, which
+    carries a `fit` block that changes with every refit without changing a
+    single decision.
+    """
+
+    if abs(float(left["intercept"]) - float(right["intercept"])) > 1e-12:
+        return False
+    if abs(float(left["margin_decades"]) - float(right["margin_decades"])) > 1e-12:
+        return False
+    names = set(left["coefficients"]) | set(right["coefficients"])
+    return all(
+        abs(float(left["coefficients"].get(n, 0.0))
+            - float(right["coefficients"].get(n, 0.0))) <= 1e-12
+        for n in names
+    )
 
 
 def price(
@@ -212,6 +280,12 @@ def price(
     """
 
     margin = float(model["margin_decades"])
+    collecting_games = int(corpus.get("collecting_games") or 0)
+    if collecting_games <= 0:
+        raise SystemExit(
+            "this corpus records no collecting game count, so per-game demand "
+            "cannot be derived from it. Rebuild it with solver_corpus.py."
+        )
     ceiling = admission_ceiling(corpus, model)
     if attempt_nodes > ceiling * (1.0 + 1e-9):
         raise ValueError(
@@ -244,8 +318,15 @@ def price(
         "nodes": nodes,
         "wasted_nodes": wasted,
         "wasted_fraction": wasted / nodes if nodes else 0.0,
-        "nodes_per_game": nodes / games if games else 0.0,
-        "proofs_per_game": proofs / games if games else 0.0,
+        # PER COLLECTING GAME, then scaled by the caller. Dividing by the
+        # REQUESTED game count and multiplying by it again cancelled, so demand
+        # was the corpus total whatever iteration size was asked for -- while
+        # capacity grew with the wall, making bigger iterations look free.
+        "collecting_games": collecting_games,
+        "nodes_per_game": nodes / collecting_games,
+        "proofs_per_game": proofs / collecting_games,
+        "nodes_for_games": nodes / collecting_games * games,
+        "proofs_for_games": proofs / collecting_games * games,
     }
 
 
@@ -276,27 +357,37 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="override, when there is no manifest to read it from.",
     )
+    parser.add_argument(
+        "--collecting-model",
+        type=Path,
+        default=None,
+        help="the cost model the COLLECTING run admitted positions with, when "
+        "the manifest does not carry it. Coverage depends on the model as well "
+        "as the bar: a refit moves each position's required bar, so the same "
+        "bar admits a different set and whatever it newly admits is absent.",
+    )
     args = parser.parse_args(argv)
+
+    def find(node, key):
+        """First occurrence of `key` anywhere in a nested manifest."""
+
+        if isinstance(node, dict):
+            if key in node:
+                return node[key]
+            for value in node.values():
+                found = find(value, key)
+                if found is not None:
+                    return found
+        elif isinstance(node, list):
+            for value in node:
+                found = find(value, key)
+                if found is not None:
+                    return found
+        return None
 
     bar = args.collecting_attempt_nodes
     if bar is None and args.manifest is not None:
         manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
-
-        def find(node, key):
-            if isinstance(node, dict):
-                if key in node:
-                    return node[key]
-                for value in node.values():
-                    found = find(value, key)
-                    if found is not None:
-                        return found
-            elif isinstance(node, list):
-                for value in node:
-                    found = find(value, key)
-                    if found is not None:
-                        return found
-            return None
-
         # A run predating the split recorded only one number, and it served as
         # both -- so the timeout IS that run's attempt bar.
         bar = find(manifest, "endgame_solver_attempt_nodes") or find(
@@ -310,7 +401,32 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
 
-    corpus = build(args.buffer, args.study, collecting_attempt_nodes=bar)
+    # The model the COLLECTING run used -- not whatever is shipped today. A
+    # corpus that recorded today's model would claim coverage it does not have
+    # the moment the model is refitted.
+    collecting_model = None
+    if args.collecting_model is not None:
+        collecting_model = json.loads(
+            args.collecting_model.read_text(encoding="utf-8")
+        )
+    elif args.manifest is not None:
+        stored = find(json.loads(args.manifest.read_text(encoding="utf-8")),
+                      "endgame_cost_model")
+        if isinstance(stored, dict) and "coefficients" in stored:
+            collecting_model = stored
+    if collecting_model is None:
+        print(
+            "WARNING: no collecting model recorded. Coverage is a property of "
+            "(bar, MODEL) jointly, so without it this corpus cannot tell a "
+            "refit that its repricing is unsupported.",
+            flush=True,
+        )
+
+    corpus = build(
+        args.buffer, args.study,
+        collecting_attempt_nodes=bar,
+        collecting_model=collecting_model,
+    )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(corpus), encoding="utf-8")
     print(

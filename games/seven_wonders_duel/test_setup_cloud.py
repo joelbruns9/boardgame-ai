@@ -2658,7 +2658,9 @@ def test_a_missing_corpus_is_reported_rather_than_guessed_around(setup_text):
     measured ones -- the same failure the pass-2 guard exists for."""
 
     index = setup_text.index("SOLVER_CORPUS=")
-    block = setup_text[index : index + 700]
+    # Widened: the disabled-solver branch now sits between the assignment and
+    # the missing-corpus branch.
+    block = setup_text[index : index + 1200]
     assert "No solver corpus" in block
     assert "warn " in block
 
@@ -2758,3 +2760,98 @@ def test_the_attempt_bar_stays_inside_what_the_corpus_can_price(setup_text):
         f"the launcher's bar ({bar:,}) is above what solver_corpus.json can "
         f"price ({corpus['collecting_attempt_nodes']:,})"
     )
+
+
+# ---------------------------------------------------------------------------
+# Review findings: the sweep must measure a solver that RUNS the run's trigger
+# ---------------------------------------------------------------------------
+
+
+def test_the_sweep_installs_the_manifest_cost_model(setup_text):
+    """`config_from_manifest` copies the model into PhaseDConfig and that does
+    nothing: the trigger reads a RUST GLOBAL, and the `--emit-config` subprocess
+    cannot reach this process's. With none installed `solver_wants` falls back
+    to `cards_left <= max_cards`, and `run_point` passes max_cards=0 -- a test
+    no Age III mid-play position can pass, so every point attempts ZERO."""
+
+    del setup_text
+    source = (REPO_ROOT / "games/seven_wonders_duel/f4_phase_d_sweep.py").read_text(
+        encoding="utf-8"
+    )
+    assert "set_endgame_cost_model" in source, (
+        "the sweep never installs the run's cost model, so its solver axis "
+        "measures the card cap at max_cards=0, which admits nothing"
+    )
+
+
+def test_the_liveness_check_requires_a_model_prediction(setup_text):
+    """An attempt COUNT cannot distinguish "the model admitted this" from "the
+    card cap did". Only the model produces a prediction, so a nonzero count of
+    those is what says it was installed."""
+
+    block = setup_text[setup_text.index("<<'PYSOLVES'"):]
+    block = block[: block.index("PYSOLVES\n", 20)]
+    assert "solves_with_prediction" in block
+    assert "was not installed" in block
+
+
+def test_the_sweep_is_given_the_runs_attempt_bar_explicitly(setup_text):
+    """The harness falls back to the manifest only for values it was NOT given,
+    and this stage gives it an explicit timeout -- so passing the timeout alone
+    left the bar defaulting to it and the split vanished for the sweep."""
+
+    block = _block(setup_text, "SWEEP_SOLVER_ARGS=()", "  else")
+    assert "--solver-attempt-nodes" in block
+    assert "$ENDGAME_SOLVER_ATTEMPT_NODES" in block
+
+
+def test_each_manifest_solver_fallback_resolves_independently():
+    """Nesting the bar's fallback inside the timeout's `if` made an explicit
+    timeout suppress the bar entirely."""
+
+    source = (REPO_ROOT / "games/seven_wonders_duel/f4_phase_d_sweep.py").read_text(
+        encoding="utf-8"
+    )
+    block = source[source.index("if args.config_from_manifest:"):][:2200]
+    assert "if solver_max_nodes <= 0:" in block
+    assert "if solver_attempt_nodes <= 0:" in block
+
+
+def test_the_caps_are_sized_against_the_sweeps_WINNING_thread_count(setup_text):
+    """Stage 6b's split is preliminary -- it runs before the worker and solver
+    axes are swept. A 12-thread allocation followed by a 4-thread winner still
+    received a 12-thread budget, three times the capacity the run will have."""
+
+    assert "_WIN_SOLVER_TOTAL" in setup_text
+    assert '--threads "$_WIN_SOLVER_TOTAL"' in setup_text
+    # And the rate belongs to that thread count too -- contention is a function
+    # of it, so stage 6b's figure is for a different machine shape.
+    assert "NODE_RATE_WIN" in setup_text
+    assert '--rate "$NODE_RATE_WIN"' in setup_text
+
+
+def test_the_generation_wall_is_not_taken_from_a_divided_sweep(setup_text):
+    """This file says in three places that a divided sweep's games/hour is not
+    the run's rate, and then used it as one. At the default divisor that is a
+    quarter of production wall, so the budget comes out a quarter of the truth
+    and affordable candidates are rejected."""
+
+    assert "--sims-divisor 1" in setup_text, (
+        "no confirmation point at the full simulation budget"
+    )
+    block = setup_text[setup_text.index("<<'PYWALL'"):]
+    block = block[: block.index("PYWALL\n", 20)]
+    assert "EXTRAPOLATED" in block, (
+        "the fallback must say it is an extrapolation rather than a measurement"
+    )
+
+
+def test_a_disabled_solver_is_not_handed_caps_by_the_sizer(setup_text):
+    """The sweep correctly measures a geometry without solving when
+    ENDGAME_SOLVER_MAX_NODES=0. Writing positive caps anyway means pass 2
+    sources them and launches WITH a solver on a geometry measured without one."""
+
+    index = setup_text.index("SOLVER_CORPUS=")
+    block = setup_text[index : index + 900]
+    assert '[ "$ENDGAME_SOLVER_MAX_NODES" -le 0 ]' in block
+    assert "the solver is off for this run" in block
