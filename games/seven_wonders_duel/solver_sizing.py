@@ -55,6 +55,30 @@ TIMEOUT_MULTIPLES = (1, 2, 4, 8, 16, 32)
 #: clock must never be the thing that stops a solve.
 CLOCK_SLACK = 5.0
 
+#: Fraction of the DRAIN TAIL a single solve may occupy before it is flagged.
+#:
+#: The scheduler cannot end an iteration until every game finishes -- a slot
+#: parked on a solve keeps `active_count` up -- so the worst-case stall is
+#: `max_nodes / rate`, one thread running alone while the GPU idles.
+#:
+#: That sounds worse than it is, and the run's own counters say so. Across 97
+#: cloud2 iterations the drain tail (below 25% of peak occupancy) was a median
+#: 16.5% of generation wall, worst 23.0%, at a 40M cap -- games finishing
+#: unevenly once the queue empties, nothing to do with solving. Idle after the
+#: LAST NN batch, which is where a solve-induced stall would show since a parked
+#: game submits none, was 3s median and 3s worst.
+#:
+#: So a long solve at the end lands INSIDE a window that is already idle rather
+#: than extending the iteration. The bound that follows is "keep one solve
+#: inside the drain you already have", not "keep it small".
+STALL_FRACTION_OF_DRAIN = 0.5
+
+#: Drain tail as a fraction of generation wall, when the caller does not supply
+#: a measured one. cloud2's median across 97 iterations. It belongs to that
+#: geometry -- 1,000 games over 256 slots -- and the box sweep should supply its
+#: own, which is why this is a default and not a constant.
+DEFAULT_DRAIN_FRACTION = 0.165
+
 
 def candidates(
     corpus: dict,
@@ -114,6 +138,7 @@ def size(
     games: int,
     target_share: float,
     bars: tuple[int, ...],
+    drain_fraction: float = DEFAULT_DRAIN_FRACTION,
 ) -> dict:
     """The best pair that fits the box's solver budget, and the runners-up.
 
@@ -128,6 +153,7 @@ def size(
             "generation wall; one of them was not measured"
         )
     budget = threads * generation_wall_seconds * rate * target_share
+    drain_seconds = generation_wall_seconds * drain_fraction
     priced = candidates(corpus, model, games=games, bars=bars)
     for row in priced:
         row["demand_nodes"] = row["nodes_per_game"] * games
@@ -137,6 +163,18 @@ def size(
         # compare against a run's own profile once it exists.
         row["solver_seconds_per_game"] = row["nodes_per_game"] / rate
         row["max_secs"] = (row["max_nodes"] / rate) * CLOCK_SLACK
+        # WORST-CASE STALL: one solve running the cap to exhaustion, alone,
+        # while the iteration waits for its game to finish. Reported rather than
+        # filtered on -- it is absorbed by the drain when it fits inside it, and
+        # a filter would cost hard proofs to avoid a cost that is already idle.
+        row["worst_stall_seconds"] = row["max_nodes"] / rate
+        row["stall_share_of_drain"] = (
+            row["worst_stall_seconds"] / drain_seconds if drain_seconds else None
+        )
+        row["stall_exceeds_drain"] = bool(
+            drain_seconds
+            and row["worst_stall_seconds"] > drain_seconds * STALL_FRACTION_OF_DRAIN
+        )
 
     affordable = [row for row in priced if row["fits"]]
     if not affordable:
@@ -151,6 +189,8 @@ def size(
     best = max(affordable, key=lambda row: (row["proofs"], -row["nodes"]))
     return {
         "budget_nodes": budget,
+        "drain_seconds": drain_seconds,
+        "drain_fraction": drain_fraction,
         "rate_nodes_per_second_per_thread": rate,
         "solver_threads": threads,
         "generation_wall_seconds": generation_wall_seconds,
@@ -217,6 +257,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--games", type=int, required=True)
     parser.add_argument("--target-share", type=float, default=0.80)
     parser.add_argument(
+        "--drain-fraction",
+        type=float,
+        default=DEFAULT_DRAIN_FRACTION,
+        help="the iteration's drain tail as a fraction of generation wall, used "
+        "to judge whether one solve's worst-case stall is absorbed by idle time "
+        "the run already has. Default is cloud2's median across 97 iterations "
+        "(16.5%%, worst 23.0%%) and belongs to its geometry; read this box's own "
+        "from the sweep's batch_live_slots/batch_submit_ns.",
+    )
+    parser.add_argument(
         "--bars",
         default="5000000,10000000,20000000,40000000,80000000",
         help="candidate attempt bars, comma separated",
@@ -235,6 +285,7 @@ def main(argv: list[str] | None = None) -> int:
         games=args.games,
         target_share=args.target_share,
         bars=tuple(int(part) for part in args.bars.split(",") if part.strip()),
+        drain_fraction=args.drain_fraction,
     )
     chosen = result["chosen"]
     print(
@@ -243,19 +294,37 @@ def main(argv: list[str] | None = None) -> int:
         f"{args.rate:,.0f}/s x {args.target_share:.0%})"
     )
     print(
+        f"drain tail ~{result['drain_seconds']:,.0f}s "
+        f"({result['drain_fraction']:.1%} of generation wall) -- a solve shorter "
+        "than that lands in a window the scheduler is already idling through"
+    )
+    print(
         f"{'bar':>10} {'timeout':>11} {'proofs':>7} {'nodes/iter':>11} "
-        f"{'wasted':>7} {'fits':>5}"
+        f"{'wasted':>7} {'stall':>8} {'fits':>5}"
     )
     for row in result["considered"][:12]:
+        stall = f"{row['worst_stall_seconds']:.0f}s"
+        if row["stall_exceeds_drain"]:
+            stall = "!" + stall
         print(
             f"{row['attempt_nodes'] / 1e6:>9.0f}M {row['max_nodes'] / 1e6:>10.0f}M "
             f"{row['proofs']:>7,} {row['demand_nodes'] / 1e9:>10.2f}B "
-            f"{row['wasted_fraction']:>6.1%} {'yes' if row['fits'] else 'NO':>5}"
+            f"{row['wasted_fraction']:>6.1%} {stall:>8} "
+            f"{'yes' if row['fits'] else 'NO':>5}"
         )
     print(
         f"\nchosen: bar {chosen['attempt_nodes']:,} / timeout "
         f"{chosen['max_nodes']:,} / clock {chosen['max_secs']:.0f}s"
     )
+    if chosen["stall_exceeds_drain"]:
+        print(
+            f"! worst-case stall {chosen['worst_stall_seconds']:,.0f}s against a "
+            f"{result['drain_seconds']:,.0f}s drain tail. The scheduler cannot "
+            "end an iteration while a game is parked on a solve, so one solve "
+            "running this cap to exhaustion would hold it open past the window "
+            "it would otherwise finish in. Lower --bars, or pass a measured "
+            "--drain-fraction if this box drains more slowly than cloud2 did."
+        )
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(render_env(chosen), encoding="utf-8")

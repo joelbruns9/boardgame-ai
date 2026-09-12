@@ -244,3 +244,74 @@ def test_a_grid_entirely_above_the_ceiling_stops_rather_than_returning_nothing()
     with pytest.raises(SystemExit, match="above this corpus"):
         size(corpus, MODEL, rate=1e6, threads=4, generation_wall_seconds=100,
              games=1, target_share=0.8, bars=(50_000_000,))
+
+
+# --- the drain tail: a stall that is absorbed is not a stall ----------------
+#
+# The scheduler cannot end an iteration while a game is parked on a solve, so
+# the worst case is `max_nodes / rate` with one thread running alone. Measured
+# across 97 cloud2 iterations, though, the drain tail below 25% of peak
+# occupancy was a median 16.5% of generation wall at a 40M cap -- games
+# finishing unevenly, nothing to do with solving -- while idle after the last NN
+# batch, where a solve-induced stall WOULD show, was 3s median and 3s worst.
+#
+# So a solve shorter than the drain lands in a window that is already idle. The
+# sizer reports the stall and flags the ones that exceed it; it does not filter,
+# because filtering would cost hard proofs to avoid a cost the run already pays.
+
+
+def _sized(bar, **kwargs):
+    """Drive the real inputs rather than patching TIMEOUT_MULTIPLES.
+
+    `candidates(..., multiples=TIMEOUT_MULTIPLES)` binds the module constant as
+    a DEFAULT ARGUMENT, so rebinding it on the module after import changes
+    nothing -- a test that patched it silently measured the 1x row.
+    """
+
+    from .solver_sizing import size
+
+    return size(_corpus([1e5]), MODEL, rate=1e6, threads=10,
+                generation_wall_seconds=1000, games=1, target_share=0.8,
+                bars=(bar,), **kwargs)
+
+
+def _row(result, max_nodes):
+    return next(r for r in result["considered"] if r["max_nodes"] == max_nodes)
+
+
+def test_the_worst_case_stall_is_reported_for_every_candidate():
+    """`max_nodes / rate`: one solve running the cap to exhaustion, alone."""
+
+    result = _sized(10_000_000)
+    for row in result["considered"]:
+        assert row["worst_stall_seconds"] == pytest.approx(row["max_nodes"] / 1e6)
+
+
+def test_a_stall_inside_the_drain_is_not_flagged():
+    """1,000s wall x 16.5% = 165s of drain; half of that is the threshold."""
+
+    result = _sized(10_000_000)
+    assert result["drain_seconds"] == pytest.approx(165.0)
+    # 10M at 1e6 nodes/s is 10s, comfortably inside.
+    assert not _row(result, 10_000_000)["stall_exceeds_drain"]
+
+
+def test_a_stall_beyond_the_drain_is_flagged_but_still_offered():
+    """Flagged, not filtered. The operator decides; a filter would silently cost
+    hard proofs to avoid a cost the run may already be paying in idle time."""
+
+    result = _sized(10_000_000)
+    # 320M at 1e6 nodes/s is 320s against a 165s drain.
+    row = _row(result, 320_000_000)
+    assert row["stall_exceeds_drain"]
+    assert row in result["considered"], "a flagged candidate must stay selectable"
+
+
+def test_a_measured_drain_overrides_the_cloud2_default():
+    """The default belongs to cloud2's geometry -- 1,000 games over 256 slots --
+    and the box sweep picks a different one."""
+
+    assert not _row(_sized(10_000_000, drain_fraction=0.90),
+                    320_000_000)["stall_exceeds_drain"]
+    assert _row(_sized(10_000_000, drain_fraction=0.01),
+                320_000_000)["stall_exceeds_drain"]
