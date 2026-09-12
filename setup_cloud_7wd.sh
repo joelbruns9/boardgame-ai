@@ -401,7 +401,7 @@ FULL_SEARCH_EVERY_GAMES="${FULL_SEARCH_EVERY_GAMES:-25}"
 # budget -- so this buys DEPTH, not merely a longer leash on the same positions.
 #
 # The clock follows automatically: stage 6b derives max_secs from this number.
-ENDGAME_SOLVER_MAX_NODES="${ENDGAME_SOLVER_MAX_NODES:-40000000}"
+ENDGAME_SOLVER_MAX_NODES="${ENDGAME_SOLVER_MAX_NODES:-320000000}"
 # The ATTEMPT BAR, separate from the timeout above.
 #
 # Measured on cloud2 iteration 96, where one number served both: 8,013 solves
@@ -410,13 +410,35 @@ ENDGAME_SOLVER_MAX_NODES="${ENDGAME_SOLVER_MAX_NODES:-40000000}"
 # decline costs exactly the timeout, so the timeout is the price of being wrong
 # about a position and the bar is what decides how often that happens.
 #
-# 0 keeps them equal, which is what every run before the split did. Set it BELOW
-# the timeout to admit fewer positions while giving each admitted one more room:
-# the bar filters on a PREDICTION, and a timeout equal to the bar discards every
-# position the model underestimated, including ones nearly finished. The
-# effective bar is this divided by 10^margin_decades (0.4 in the shipped model),
-# so 40M here is really a 15.9M predicted-node bar.
-ENDGAME_SOLVER_ATTEMPT_NODES="${ENDGAME_SOLVER_ATTEMPT_NODES:-0}"
+# 0 would keep them equal, which is what every run before the split did. They
+# are deliberately 8x apart instead, and BOTH numbers move together or not at
+# all -- raising the timeout alone widens admission by the same factor, which is
+# the coupling the split exists to break.
+#
+# 40M bar / 320M timeout, priced on `solver_corpus.json` at cloud2's measured
+# rate and 12 solver threads:
+#
+#     bar   timeout  proofs  nodes/iter  wasted   stall
+#     40M       40M   7,636      16.60B   39.3%     47s   <- one number, before
+#     40M      320M   7,786      28.49B   14.6%    373s   <- here
+#     40M     1280M   7,798      32.05B    4.0%   1494s
+#
+# 40M is the widest bar this corpus can price: cloud2 ran there, so anything it
+# refused is ABSENT from the corpus rather than recorded as expensive. Narrowing
+# the bar is possible and costs hard proofs -- it filters on predicted cost, so
+# it drops the expensive positions first, which are the ones worth proving.
+#
+# The 373s stall is accepted knowingly. The scheduler cannot end an iteration
+# while a game is parked on a solve, but across 97 cloud2 iterations the drain
+# tail below 25% occupancy was already a median 16.5% of generation wall (~730s)
+# with the solver contributing 3s of post-batch idle. A 373s solve lands inside
+# a window the run is already idling through. `solver_sizing` flags it anyway --
+# it exceeds half the drain -- and that flag is why this is a decision rather
+# than a default.
+#
+# The effective bar is this divided by 10^margin_decades (0.4 in the shipped
+# model), so 40M here is really a 15.9M predicted-node bar.
+ENDGAME_SOLVER_ATTEMPT_NODES="${ENDGAME_SOLVER_ATTEMPT_NODES:-40000000}"
 # A parked slot's --rust-slots token goes back to the pool for the duration of
 # the solve. ON here, where phase_d defaults it off: it shipped behind a flag and
 # nobody flipped it, so until now a slot parked on a solve held its token AND

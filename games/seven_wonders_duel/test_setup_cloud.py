@@ -2450,11 +2450,11 @@ def test_the_emitted_config_is_the_search_the_sweep_then_measures(tmp_path):
 
 
 def test_the_attempt_bar_is_reachable_from_the_launcher(setup_text):
-    """A knob the launcher cannot set is a decision nobody can make. The bar
-    defaults to the timeout, so leaving it unreachable would be invisible --
-    the run would work, and would simply never narrow admission."""
+    """A knob the launcher cannot set is a decision nobody can make. An unset
+    bar silently equals the timeout, so leaving it unreachable would be
+    invisible -- the run would work and would simply never narrow admission."""
 
-    assert 'ENDGAME_SOLVER_ATTEMPT_NODES="${ENDGAME_SOLVER_ATTEMPT_NODES:-0}"' in setup_text
+    assert "ENDGAME_SOLVER_ATTEMPT_NODES=" in setup_text
     block = _block(setup_text, "SOLVER_FLAGS=()", "fi")
     assert "--endgame-solver-attempt-nodes" in block
 
@@ -2719,4 +2719,42 @@ def test_the_unexercised_wait_axis_reports_the_actionable_cause(rehearsal_text):
     generic = rehearsal_text.index("coalescing wait did not vary")
     assert specific < generic, (
         "the generic branch runs first and swallows the specific diagnosis"
+    )
+
+
+def test_the_solver_caps_are_set_as_a_PAIR(setup_text):
+    """Raising the timeout alone widens admission by the same factor -- that is
+    the coupling the split exists to break, and the launcher must not
+    demonstrate it. The bar must be strictly below the timeout, and both must be
+    real numbers rather than the 0 sentinel that means "same as the timeout"."""
+
+    cap = re.search(
+        r'^ENDGAME_SOLVER_MAX_NODES="\$\{ENDGAME_SOLVER_MAX_NODES:-(\d+)\}"$',
+        setup_text, re.M)
+    bar = re.search(
+        r'^ENDGAME_SOLVER_ATTEMPT_NODES="\$\{ENDGAME_SOLVER_ATTEMPT_NODES:-(\d+)\}"$',
+        setup_text, re.M)
+    assert cap and bar, "both caps must be knobs with defaults"
+    cap, bar = int(cap.group(1)), int(bar.group(1))
+    assert 0 < bar < cap, f"attempt bar {bar:,} must sit below the timeout {cap:,}"
+
+
+def test_the_attempt_bar_stays_inside_what_the_corpus_can_price(setup_text):
+    """A bar above the collecting run's is unpriceable: everything that run
+    refused is ABSENT from the corpus rather than recorded as expensive, so the
+    sizing would be reporting the collecting bar's numbers under a wider label.
+    """
+
+    import json
+
+    bar = int(re.search(
+        r'^ENDGAME_SOLVER_ATTEMPT_NODES="\$\{ENDGAME_SOLVER_ATTEMPT_NODES:-(\d+)\}"$',
+        setup_text, re.M).group(1))
+    corpus = json.loads(
+        (REPO_ROOT / "games/seven_wonders_duel/solver_corpus.json").read_text(
+            encoding="utf-8")
+    )
+    assert bar <= corpus["collecting_attempt_nodes"], (
+        f"the launcher's bar ({bar:,}) is above what solver_corpus.json can "
+        f"price ({corpus['collecting_attempt_nodes']:,})"
     )
