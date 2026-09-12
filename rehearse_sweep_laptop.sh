@@ -156,16 +156,25 @@ fi
 #
 # ⚠ NOTE ON SCALE, and why this is not the box's command.
 #
-# `--config-from-manifest` is deliberately NOT passed here. The run's budget is
-# 1600 full simulations; four warmup games at that budget did not finish in 20
-# minutes on this laptop, which is the correct answer for a production budget on
-# a laptop GPU and a useless one for a plumbing check. Without it the harness
-# takes its own defaults (64-128 full, 16-24 cheap), which exercise every code
-# path at a scale a laptop can finish.
+# `--config-from-manifest` IS passed, whenever REHEARSE_MANIFEST names one, and
+# that reverses the reasoning this block used to carry.
 #
-# On the BOX the manifest flag is mandatory, for exactly the reason §3.1 gives.
-# Dropping it there would repeat the defect that sweep once committed: measuring
-# Gumbel at 24/128 to configure a PUCT run at 100/1600.
+# It was omitted because the run's budget is 1600 full simulations and four
+# warmup games at that budget did not finish in 20 minutes on this laptop. True
+# then. `--sims-divisor` is what changed it: the manifest's search can now run
+# shallow enough for a laptop while staying the RUN's search in algorithm, mix
+# and trigger.
+#
+# And omitting it was not free, which is the part that matters. The launcher
+# passes the flag, and `f4_phase_d_sweep` installs the run's COST MODEL only on
+# that path -- so a rehearsal without it ran the one configuration the box never
+# uses, with no model installed and `max_cards = 0`. `solver_wants` then falls
+# back to `cards_left <= 0`, reachable at exactly one position per game: the end
+# of Age III, when no cards remain. Three consecutive rehearsals reported
+# "solver LIVE: 1 attempted" and passed while the solver axis measured nothing.
+#
+# So the manifest path is the one that has to be rehearsed. A divisor keeps it
+# affordable; REHEARSE_SIMS_DIVISOR is the knob.
 # The coalescing wait is swept here for the same reason the solver split is:
 # it is an axis the box will run, and this script exists to prove the plumbing
 # of that axis before it is rented. A wait that reaches the harness and merges
@@ -193,6 +202,7 @@ say "Generation sweep (STAGED toy grid; solver split and wait as axes, LAPTOP-SC
   --solver-max-nodes "${REHEARSE_SOLVER_NODES:-2000000}" \
   --stage-a-inflight 1 --stage-a-wait-ms 0 \
   --sims-divisor "${REHEARSE_SIMS_DIVISOR:-2}" \
+  ${REHEARSE_MANIFEST:+--config-from-manifest "$REHEARSE_MANIFEST"} \
   --device "$DEVICE" --precision bf16 \
   || die "generation sweep did not complete"
 
@@ -318,6 +328,19 @@ elif not any(row.get("solves_attempted", 0) > 0 for row in on):
     problems.append(
         "solver configured but ZERO solves attempted -- the axis measured a "
         "solver that never ran"
+    )
+elif not any(row.get("solves_with_prediction", 0) > 0 for row in on):
+    # ATTEMPTS ARE NOT ENOUGH, and this is the check three green rehearsals
+    # needed. Only the cost model produces a prediction. With none installed the
+    # trigger falls back to `cards_left <= max_cards`, and at max_cards = 0 that
+    # admits exactly the end-of-Age-III position where no cards remain -- one
+    # degenerate solve per run, reported as "solver LIVE".
+    problems.append(
+        "solves were attempted but NONE carried a cost-model prediction: the "
+        "model was not installed, so the trigger is the card cap and the solver "
+        "axis measures a configuration the box never runs. Set "
+        "REHEARSE_MANIFEST so the sweep takes the manifest path the launcher "
+        "takes."
     )
 if any(row.get("solves_attempted", 0) > 0 for row in off):
     problems.append("a solver-off point still attempted solves")

@@ -901,7 +901,9 @@ def main(argv: list[str] | None = None) -> dict:
     # in the one harness written to avoid it.
     if run_config is not None and getattr(run_config, "endgame_cost_model", None):
         stored = run_config.endgame_cost_model
+        installed = None
         if isinstance(stored, dict) and "coefficients" in stored:
+            # Inline weights, if a manifest ever carries them.
             import seven_wonders_rust as _swr
 
             names = list(_swr.endgame_cost_model_features())
@@ -911,17 +913,25 @@ def main(argv: list[str] | None = None) -> dict:
                 [float(stored["coefficients"][n]) for n in names],
                 float(stored["margin_decades"]),
             )
-            print(
-                f"cost model installed from the manifest: margin "
-                f"{stored['margin_decades']} decades over {len(names)} features",
-                flush=True,
-            )
+            installed = "the manifest's inline coefficients"
+        elif isinstance(stored, dict) and stored.get("path"):
+            # THE PATH, which is what a manifest actually records. It stores the
+            # feature NAMES, the intercept and the margin -- but not the weights,
+            # so there is nothing to install inline and the file is the source.
+            # Repo-relative, as the launcher passes it.
+            model_path = Path(stored["path"])
+            if not model_path.is_absolute():
+                model_path = Path(__file__).resolve().parents[2] / model_path
+            if model_path.is_file():
+                pd.configure_endgame_cost_model(model_path)
+                installed = str(model_path)
+        if installed:
+            print(f"cost model installed from {installed}", flush=True)
         else:
             print(
-                "WARNING: the manifest's cost model has no coefficients, so the "
-                "trigger falls back to the card cap -- which run_point sets to "
-                "0, refusing every position. The solver axis will measure "
-                "nothing.",
+                "WARNING: could not install the run's cost model, so the trigger "
+                "falls back to the card cap -- which run_point sets to 0, "
+                "refusing every position. The solver axis will measure nothing.",
                 flush=True,
             )
 

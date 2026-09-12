@@ -2855,3 +2855,74 @@ def test_a_disabled_solver_is_not_handed_caps_by_the_sizer(setup_text):
     block = setup_text[index : index + 900]
     assert '[ "$ENDGAME_SOLVER_MAX_NODES" -le 0 ]' in block
     assert "the solver is off for this run" in block
+
+
+def test_the_cost_model_is_installed_from_the_manifests_PATH(setup_text):
+    """A run manifest records the feature NAMES, the intercept and the margin --
+    not the weights. Those live at `path`, so an install that only handled
+    inline coefficients handled a shape no manifest produces: it warned and
+    installed nothing, and the sweep kept running the card-cap fallback.
+
+    Only the manifest-path rehearsal could see it. The dry run stubs python, the
+    unit test checks `set_endgame_cost_model` appears somewhere, and the earlier
+    rehearsals took a path where the block never executed."""
+
+    del setup_text
+    source = (REPO_ROOT / "games/seven_wonders_duel/f4_phase_d_sweep.py").read_text(
+        encoding="utf-8"
+    )
+    block = source[source.index('if run_config is not None and getattr'):][:1800]
+    assert 'stored.get("path")' in block, (
+        "the install handles only inline coefficients, which no manifest carries"
+    )
+    assert "configure_endgame_cost_model" in block
+
+
+def test_a_real_manifest_carries_a_path_and_no_coefficients():
+    """The fixture for the bug above, asserted against a real archived manifest
+    so a future manifest format change fails here rather than on a box."""
+
+    import json
+    from pathlib import Path
+
+    manifest = Path(
+        "runs/seven_wonders_duel/cloud2/7wd_cloud_20260825T005745Z/logs/run_manifest.json"
+    )
+    if not manifest.is_file():
+        pytest.skip("the cloud2 archive is not on this machine")
+
+    def find(node, key):
+        if isinstance(node, dict):
+            if key in node:
+                return node[key]
+            for value in node.values():
+                found = find(value, key)
+                if found is not None:
+                    return found
+        elif isinstance(node, list):
+            for value in node:
+                found = find(value, key)
+                if found is not None:
+                    return found
+        return None
+
+    stored = find(json.loads(manifest.read_text(encoding="utf-8")), "endgame_cost_model")
+    assert stored and stored.get("path"), "a manifest must name the model file"
+    assert "coefficients" not in stored, (
+        "this manifest DOES carry coefficients; the inline branch is now the "
+        "live one and this test's premise has changed"
+    )
+
+
+def test_the_rehearsal_takes_the_manifest_path_the_launcher_takes(rehearsal_text):
+    """The launcher passes --config-from-manifest and the cost-model install is
+    gated on it, so a rehearsal without it runs the one configuration the box
+    never uses. Three consecutive green runs reported "solver LIVE: 1 attempted"
+    while the axis measured nothing -- `cards_left <= 0` is reachable at exactly
+    one position per game, the end of Age III."""
+
+    assert "REHEARSE_MANIFEST:+--config-from-manifest" in rehearsal_text
+    assert "solves_with_prediction" in rehearsal_text, (
+        "the liveness check still accepts an attempt count, which cannot tell a "
+        "model-admitted solve from a degenerate card-cap one"
+    )
