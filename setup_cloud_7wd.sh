@@ -81,6 +81,11 @@
 #   LAUNCH=1        set 0 to stop after verification
 #   SKIP_SMOKE=0    set 1 to skip the Phase D plumbing smoke
 #   SKIP_EQUIV=0    set 1 to skip the equivalence suite (do not do this)
+#   INIT_CHECKPOINT=<path>  warm-start a NEW run from these weights
+#                   (`phase_d --init-checkpoint`: additive migration, so the
+#                   encoder's appended columns and every new module start
+#                   inert). Unset means random initialisation. Ignored on
+#                   resume. Use an ABSOLUTE path: phase_d runs from $REPO_DIR.
 #   SWEEP_CHECKPOINT=<path>  runs the generation + gate scheduler sweeps
 #                   (two-pass: stage 8b writes sweeps/measured_env.sh;
 #                    source it and re-run to launch on those numbers)
@@ -124,6 +129,9 @@
 #   SWD_CONTROL_FEATURES=1  W3 control channels (on by default; pinned here)
 #   HIERARCHICAL_VALUE=0 HIER_VALUE_WEIGHT=0 HIER_VALUE_DETACH=1   W4
 #   ACTION_RESIDUAL=0 ACTION_EXPOSES=0 ACTION_POLICY_WEIGHT=0      W5
+#     FIT_ACTION_ALPHA=0 ACTION_ALPHA_MAX=2.0 ACTION_ALPHA_STEP=0.1
+#                         W5's served weight fitted to held-out targets each
+#                         iteration; off keeps the scorer in shadow
 #   SPECIALISTS=""          W7, name:share:LAMBDA, e.g. "science:0.15:3".
 #                         Lambda 3 is MEASURED, not chosen: pursuit peaks there
 #                         and declines above. Needs HIERARCHICAL_VALUE=1 -- the
@@ -623,6 +631,13 @@ HIER_VALUE_DETACH="${HIER_VALUE_DETACH:-1}"
 ACTION_RESIDUAL="${ACTION_RESIDUAL:-0}"        # W5
 ACTION_EXPOSES="${ACTION_EXPOSES:-0}"
 ACTION_POLICY_WEIGHT="${ACTION_POLICY_WEIGHT:-0}"
+# W5's served weight. Off = the scorer trains in shadow and never moves play.
+# On = after each training step the weight is FITTED to held-out search targets
+# and stepped toward, at most ACTION_ALPHA_STEP per iteration, up to
+# ACTION_ALPHA_MAX (above 1 lets W5 outvote the flat head). See action_alpha.py.
+FIT_ACTION_ALPHA="${FIT_ACTION_ALPHA:-0}"
+ACTION_ALPHA_MAX="${ACTION_ALPHA_MAX:-2.0}"
+ACTION_ALPHA_STEP="${ACTION_ALPHA_STEP:-0.1}"
 # W7. Empty is HOF-only league play with no biased search, which is what every
 # run before this one did.
 SPECIALISTS="${SPECIALISTS:-}"
@@ -679,6 +694,7 @@ require_operator_files() {
 }
 
 require_operator_files \
+  "INIT_CHECKPOINT=${INIT_CHECKPOINT:-}" \
   "PRECISION_ARENA_CHECKPOINT=${PRECISION_ARENA_CHECKPOINT:-}" \
   "SWEEP_CHECKPOINT=${SWEEP_CHECKPOINT:-}" \
   "LAUNCH_FLAGS_JSON=${LAUNCH_FLAGS_JSON:-}"
@@ -995,6 +1011,12 @@ fi
 [ "$ACTION_RESIDUAL" = "1" ] && ARCH_FLAGS+=(--action-residual)
 [ "$ACTION_EXPOSES" = "1" ] && ARCH_FLAGS+=(--action-exposes)
 ARCH_FLAGS+=(--action-policy-weight "$ACTION_POLICY_WEIGHT")
+if [ "$FIT_ACTION_ALPHA" = "1" ]; then
+  # Architecture, not just a schedule: the ceiling is built into the model's gate.
+  ARCH_FLAGS+=(--fit-action-alpha
+    --action-alpha-max "$ACTION_ALPHA_MAX"
+    --action-alpha-step "$ACTION_ALPHA_STEP")
+fi
 
 # W7 specialist league. Separate from ARCH_FLAGS because these change the
 # TRAINING ARRANGEMENT rather than the model shape: the same weights, played and
@@ -1044,6 +1066,17 @@ if [ "$ENDGAME_SOLVER_MAX_NODES" -gt 0 ]; then
   # rather than putting a knob on the line that changes nothing.
   [ "$EXCLUDE_PARKED_FROM_BUDGET" = "1" ] &&
     SOLVER_FLAGS+=(--exclude-parked-from-budget)
+fi
+
+# Warm start. A run meant to carry a trained net forward that omits this trains
+# from random weights with nothing failing to say so, so the unset case is
+# announced rather than silent.
+INIT_FLAGS=()
+if [ -n "${INIT_CHECKPOINT:-}" ]; then
+  INIT_FLAGS=(--init-checkpoint "$INIT_CHECKPOINT")
+  ok "Warm start: a new run is seeded from $INIT_CHECKPOINT (ignored on resume)."
+else
+  warn "INIT_CHECKPOINT unset: a new run starts from RANDOM weights."
 fi
 
 LADDER_FLAG=()
@@ -1098,6 +1131,7 @@ TRAIN_CMD=(
   # nobody here decided to turn back on. --hof-opponent-fraction is the knob
   # that governs archived opponents.
   --opponent-fraction "$OPPONENT_FRACTION"
+  ${INIT_FLAGS[@]+"${INIT_FLAGS[@]}"}
   "${ARCH_FLAGS[@]}"
   "${SPECIALIST_FLAGS[@]}"
   "${SOLVER_FLAGS[@]}"

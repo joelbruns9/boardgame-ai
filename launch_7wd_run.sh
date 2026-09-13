@@ -36,9 +36,33 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # off RUN_DIR_REL, so naming the run here is what keeps two runs on one box from
 # resuming into each other.
 export RUN_DIR_REL="${RUN_DIR_REL:-runs/seven_wonders_duel/run07_bundle}"
+
+# The branch the box builds. Everything this run carries -- W1-W7, S2b, the
+# warm-start knob, this file itself -- lives on this branch and is NOT on main,
+# and a clone without a branch lands on main, builds, and launches none of it
+# while every sentinel check still passes. Change this when the work is merged.
+export REPO_BRANCH="${REPO_BRANCH:-sevenwd-w9-prototype}"
 export ITERATIONS="${ITERATIONS:-200}"
 export GAMES_PER_ITERATION="${GAMES_PER_ITERATION:-1000}"
 export SEED_GAMES="${SEED_GAMES:-5000}"
+
+# ── Warm start ──────────────────────────────────────────────────────────────
+#
+# This run carries the trained net forward. The encoder's new features were
+# APPENDED so an existing checkpoint migrates additively, and W1/W2/W4/W5 all
+# start inert: seeding `candidate_0085.pt` into a model with every switch below
+# reproduced its moves on 68 real BGA positions (top move 100% identical, policy
+# within 0.05%, value within 0.0002). Without this the run starts from random
+# weights, so it is REQUIRED rather than defaulted. Upload the checkpoint and
+# give its absolute path on the box.
+export INIT_CHECKPOINT="${INIT_CHECKPOINT:-}"
+if [ -z "$INIT_CHECKPOINT" ] && [ "${ALLOW_COLD_START:-0}" != "1" ]; then
+  echo "[FATAL] INIT_CHECKPOINT is unset. This run warm-starts; set it to the" >&2
+  echo "        uploaded checkpoint's absolute path, e.g." >&2
+  echo "        INIT_CHECKPOINT=\$HOME/candidate_0085.pt bash launch_7wd_run.sh" >&2
+  echo "        (ALLOW_COLD_START=1 launches from random weights deliberately.)" >&2
+  exit 1
+fi
 
 # ── Architecture: the workstreams this run carries ──────────────────────────
 #
@@ -53,6 +77,16 @@ export SWD_CONTROL_FEATURES="${SWD_CONTROL_FEATURES:-1}"  # W3
 export ACTION_RESIDUAL="${ACTION_RESIDUAL:-1}"          # W5
 export ACTION_EXPOSES="${ACTION_EXPOSES:-1}"
 export ACTION_POLICY_WEIGHT="${ACTION_POLICY_WEIGHT:-0.5}"
+# W5 affects play once held-out evidence says it should. The weight starts at 0
+# (an untrained scorer at 0.5 changed the warm net's top move on 8.8% of real
+# positions), is refitted after every training step to the value that best
+# predicts held-out search targets, moves at most 0.1 per iteration, and may
+# reach 2 -- W5 outvoting the flat head. `alpha=` on the heartbeat is the run's
+# own verdict; sustained above 1, run the W5-only arena
+# (`arena --policy-source-a action`).
+export FIT_ACTION_ALPHA="${FIT_ACTION_ALPHA:-1}"
+export ACTION_ALPHA_MAX="${ACTION_ALPHA_MAX:-2.0}"
+export ACTION_ALPHA_STEP="${ACTION_ALPHA_STEP:-0.1}"
 
 # W4. Required by W7 below: the specialist leaf bias reads the seven-way
 # outlook, and a leaf without one is a hard error rather than a silent zero
@@ -95,10 +129,12 @@ export SPECIALISTS="${SPECIALISTS:-science:0.15:3,military:0.10:3}"
 export HOF_FRACTION="${HOF_FRACTION:-0.15}"
 export SPECIALIST_BOOTSTRAP_GAMES="${SPECIALIST_BOOTSTRAP_GAMES:-0}"   # 0 = follow HOF_START_GAMES
 export SPECIALIST_FLOOR_EVERY="${SPECIALIST_FLOOR_EVERY:-5}"
-# S2b is an ARM of the pilot, not a setting. On, the general also learns to
-# execute the attacks; off, it only learns to defend them. Leave it off unless
-# this run is the transfer comparison.
-export SPECIALIST_REANALYSIS="${SPECIALIST_REANALYSIS:-0}"
+# S2b: on, the general also learns to EXECUTE the attacks the specialists find;
+# off, it only learns to defend them. ON for this run -- the attacking half is
+# the one the human losses to ZeusAI point at, and the coalesced backend brought
+# reanalysis from 2539 to 45 ms/position. The cost is that this run cannot also
+# be S5's defence-only vs defence+transfer comparison.
+export SPECIALIST_REANALYSIS="${SPECIALIST_REANALYSIS:-1}"
 
 # ── Scheduler geometry ──────────────────────────────────────────────────────
 #

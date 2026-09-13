@@ -241,11 +241,24 @@ def test_operator_supplied_paths_are_checked_before_anything_is_built(setup_text
         "operator files are checked after the build has already started"
     )
     for name in (
+        "INIT_CHECKPOINT",
         "PRECISION_ARENA_CHECKPOINT",
         "SWEEP_CHECKPOINT",
         "LAUNCH_FLAGS_JSON",
     ):
         assert f'"{name}=${{{name}:-}}"' in setup_text
+
+
+def test_the_warm_start_reaches_the_training_command(setup_text):
+    """No launcher could pass `--init-checkpoint`, so every cloud run started
+    from random weights while the encoder work existed to make a warm start
+    possible. The flag must be on the launch line, and the run decision must
+    refuse to go without it."""
+
+    assert '--init-checkpoint "$INIT_CHECKPOINT"' in setup_text
+    assert '${INIT_FLAGS[@]+"${INIT_FLAGS[@]}"}' in _block(setup_text, "TRAIN_CMD=(")
+    decision = RUN_FILE.read_text(encoding="utf-8")
+    assert 'if [ -z "$INIT_CHECKPOINT" ] && [ "${ALLOW_COLD_START:-0}" != "1" ]' in decision
 
 
 def test_nothing_before_the_clone_depends_on_the_shared_library(setup_text):
@@ -1553,6 +1566,20 @@ def test_every_workstream_is_reachable_from_the_launcher(setup_text):
         "--specialist-reanalysis",
     ):
         assert flag in setup_text, f"{flag} is not reachable from the launcher"
+
+
+def test_the_fitted_w5_weight_reaches_the_launch_and_is_the_run_decision(setup_text):
+    """Without the controller W5 trains in shadow for the whole run: its gate is
+    frozen at zero and no launcher could move it. The ceiling is architecture
+    (built into the gate), so it must ride in ARCH_FLAGS, not a schedule."""
+
+    block = _block(setup_text, 'if [ "$FIT_ACTION_ALPHA" = "1" ]; then', "fi")
+    for flag in ("--fit-action-alpha", "--action-alpha-max", "--action-alpha-step"):
+        assert flag in block, f"{flag} is not reachable from the launcher"
+    assert "ARCH_FLAGS+=(--fit-action-alpha" in block
+    decision = RUN_FILE.read_text(encoding="utf-8")
+    assert 'export FIT_ACTION_ALPHA="${FIT_ACTION_ALPHA:-1}"' in decision
+    assert 'export ACTION_ALPHA_MAX="${ACTION_ALPHA_MAX:-2.0}"' in decision
 
 
 def test_w3_control_is_pinned_rather_than_inherited(setup_text):
