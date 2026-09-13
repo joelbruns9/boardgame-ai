@@ -591,6 +591,11 @@ def load_evaluator(
             # Nothing changed shape, so the stored state dict still fits and
             # re-loading it is a no-op assertion that it does.
             model.load_state_dict(checkpoint["model_state"])
+    # A training-recipe fact the advisor must see: under the replacement arm the
+    # flat `joint7` head received no gradient, so its outputs are stale and W4's
+    # are the victory-type read. Carried on the model because the evaluator is
+    # all a consumer holds.
+    model.joint7_replaced = bool(config.get("hier_value_replaces_joint7", False))
     return Evaluator(model, device=device, precision=precision)
 
 

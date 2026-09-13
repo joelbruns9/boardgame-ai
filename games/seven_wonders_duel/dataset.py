@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import dataclasses
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -1152,6 +1153,37 @@ def _examples_from_rust_payload(
     return examples, stats
 
 
+def usable_root_outlook(example) -> list[float] | None:
+    """The search outlook a W4 soft target may blend in, or None.
+
+    Refused, so the row keeps its hard label:
+
+    * no outlook at all -- a cheap move, a bot, or a record older than the
+      backup (cloud2's buffers carry none);
+    * a malformed one: wrong length, non-finite, negative, or no mass;
+    * a BIASED search. A specialist's leaf bonus funds its own victory type, so
+      the visits -- and the visit-weighted outlook -- over-weight exactly the
+      class the bias chases. The leaf values are unshaped; the averaging is not.
+      Same reason `bootstrap_root_value` refuses a shaped root.
+
+    Normalised on the way out: the accumulation is a mean of distributions and
+    should already sum to one, and a target must.
+    """
+
+    outlook = getattr(example, "root_outlook", None)
+    if outlook is None or getattr(example, "search_lambda", 0.0):
+        return None
+    if len(outlook) != 7:
+        return None
+    values = [float(value) for value in outlook]
+    if not all(math.isfinite(value) and value >= 0.0 for value in values):
+        return None
+    total = sum(values)
+    if total <= 0.0:
+        return None
+    return [value / total for value in values]
+
+
 def derive_records_rust(
     records: list[GameRecord],
     *,
@@ -1456,6 +1488,11 @@ def collate(
     value_solver = torch.zeros((size, 3), dtype=torch.float32)
     value_solver_valid = torch.zeros(size, dtype=torch.bool)
     joint7 = torch.zeros(size, dtype=torch.long)
+    # Search's own seven-way outlook at this root, for W4's soft target. Only the
+    # outcome LABEL existed before, and it is game-constant: every row of a game
+    # that ended scientifically reads `my_scientific`, move 3 included.
+    outlook_soft = torch.zeros((size, 7), dtype=torch.float32)
+    outlook_soft_valid = torch.zeros(size, dtype=torch.bool)
     margin = torch.zeros(size)
     margin_valid = torch.zeros(size, dtype=torch.bool)
     military_final = torch.zeros(size)
@@ -1497,6 +1534,10 @@ def collate(
             value_solver[row] = torch.tensor(proven)
             value_solver_valid[row] = True
         joint7[row] = example.joint7_class
+        outlook = usable_root_outlook(example)
+        if outlook is not None:
+            outlook_soft[row] = torch.tensor(outlook)
+            outlook_soft_valid[row] = True
         margin[row] = example.margin
         margin_valid[row] = example.margin_valid
         military_final[row] = example.military_final
@@ -1522,6 +1563,8 @@ def collate(
         "value_solver": value_solver,
         "value_solver_valid": value_solver_valid,
         "joint7": joint7,
+        "outlook_soft": outlook_soft,
+        "outlook_soft_valid": outlook_soft_valid,
         "margin": margin,
         "margin_valid": margin_valid,
         "military_final": military_final,

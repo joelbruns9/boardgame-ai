@@ -86,6 +86,7 @@ from .dataset import (
     examples_from_records,
     project_examples,
     is_fast_search_move,
+    usable_root_outlook,
 )
 from .game import Phase
 from .inference import Evaluator
@@ -494,6 +495,21 @@ class PhaseDConfig:
     head: replacing the flat term with a detached one would remove the trunk's
     only victory-type supervision and put nothing back.
     """
+
+    outlook_bootstrap: float = 0.0
+    """Blend weight of search's seven-way root outlook into W4's victory-type
+    target: ``(1 - b) * realised class + b * outlook``. Zero keeps the hard label.
+
+    The victory-type counterpart of ``value_bootstrap``. Rows without a usable
+    outlook (cheap moves, imported buffers that predate the backup, biased
+    specialist searches) keep the hard label; validation always scores the hard
+    label, so the held-out number means the same thing at any setting."""
+
+    outlook_bootstrap_games: int = 0
+    """Games over which ``outlook_bootstrap`` ramps up from zero (0 = full from
+    the start). The outlook is averaged from W4's OWN leaf predictions, so while
+    the head is untrained -- a warm start adds it fresh -- the soft target would
+    feed the head its own noise."""
 
     value_source: str = "flat"
     """Which head's W/D/L the scalar search value is read from.
@@ -1089,6 +1105,11 @@ class PhaseDConfig:
                 break
         return value
 
+    def outlook_bootstrap_schedule(self) -> GameSchedule:
+        """W4's soft-target weight, ramped from zero on the training clock."""
+
+        return GameSchedule(0.0, self.outlook_bootstrap, self.outlook_bootstrap_games)
+
     def curriculum_schedule(self) -> GameSchedule:
         """Curriculum-bot mix against the games clock."""
 
@@ -1496,6 +1517,15 @@ class PhaseDConfig:
             raise ValueError("hier_value_weight requires --hierarchical-value")
         if self.value_source not in ("flat", "hierarchical"):
             raise ValueError("value_source must be 'flat' or 'hierarchical'")
+        if not math.isfinite(self.outlook_bootstrap) or not 0.0 <= self.outlook_bootstrap <= 1.0:
+            raise ValueError("outlook_bootstrap must lie in [0, 1]")
+        if self.outlook_bootstrap > 0 and not self.hierarchical_value:
+            raise ValueError(
+                "--outlook-bootstrap trains W4's victory-type target and "
+                "requires --hierarchical-value"
+            )
+        if self.outlook_bootstrap_games < 0:
+            raise ValueError("outlook_bootstrap_games must be non-negative")
         if self.value_source == "hierarchical" and not self.hierarchical_value:
             raise ValueError("value_source='hierarchical' requires --hierarchical-value")
         if self.hier_value_replaces_joint7:
@@ -2963,6 +2993,15 @@ class PhaseDLoop:
 
         return self.games_ledger.total_through(iteration)
 
+    def outlook_bootstrap_amount(self, iteration: int) -> float:
+        """W4's soft-target blend weight for this iteration's training step."""
+
+        if self.config.outlook_bootstrap <= 0:
+            return 0.0
+        return self.config.outlook_bootstrap_schedule().value(
+            self.training_clock(iteration)
+        )
+
     def curriculum_mix_fraction(self, iteration: int) -> float:
         """Share of generation games that pair the net against a curriculum bot."""
 
@@ -3758,6 +3797,8 @@ class PhaseDLoop:
             "value_source": self.config.value_source,
             "action_policy_weight": self.config.action_policy_weight,
             "train_action_gate": self.config.train_action_gate,
+            "outlook_bootstrap": self.config.outlook_bootstrap,
+            "outlook_bootstrap_games": self.config.outlook_bootstrap_games,
             "fit_action_alpha": self.config.fit_action_alpha,
             "action_alpha_max": self.config.action_alpha_max,
             "action_alpha_step": self.config.action_alpha_step,
@@ -4960,6 +5001,7 @@ class PhaseDLoop:
             action_policy_weight=self.config.action_policy_weight,
             hier_value_weight=self.config.hier_value_weight,
             hier_value_replaces_joint7=self.config.hier_value_replaces_joint7,
+            outlook_bootstrap=self.outlook_bootstrap_amount(iteration),
             validate_every=self.config.validate_every,
             optimizer_state=self._load_optimizer_state(),
             restore_best_val=self.config.restore_best_val,
@@ -5023,6 +5065,12 @@ class PhaseDLoop:
             ),
             "buffer_passes": samples / len(train_examples),
             "curriculum_fraction": self.seed_retain_fraction(iteration),
+            # W4's soft-target weight this step, and how much of the window could
+            # use it -- a weight applied to rows with no outlook does nothing.
+            "outlook_bootstrap": self.outlook_bootstrap_amount(iteration),
+            "outlook_rows": sum(
+                1 for example in train_examples if usable_root_outlook(example) is not None
+            ),
             # Every schedule's value and realised effect at this iteration.
             "schedules": self.schedule_state(iteration),
             # How much of the replay window had to be replayed rather than
@@ -5435,6 +5483,7 @@ class PhaseDLoop:
             action_policy_weight=self.config.action_policy_weight,
             hier_value_weight=self.config.hier_value_weight,
             hier_value_replaces_joint7=self.config.hier_value_replaces_joint7,
+            outlook_bootstrap=self.outlook_bootstrap_amount(iteration),
             validate_every=self.config.validate_every,
             optimizer_state=self._specialist_optimizer_state(lineage),
             restore_best_val=False,
@@ -7136,6 +7185,21 @@ def build_parser() -> argparse.ArgumentParser:
         "supervision; requires --no-hierarchical-value-detach",
     )
     parser.add_argument(
+        "--outlook-bootstrap",
+        type=float,
+        default=0.0,
+        help="blend weight of search's seven-way root outlook into W4's "
+        "victory-type target (the value_bootstrap of victory type); 0 keeps the "
+        "realised class. Requires --hierarchical-value.",
+    )
+    parser.add_argument(
+        "--outlook-bootstrap-games",
+        type=int,
+        default=0,
+        help="games over which --outlook-bootstrap ramps up from zero, while a "
+        "freshly added W4 head is still untrained (0 = full from the start)",
+    )
+    parser.add_argument(
         "--value-source",
         choices=("flat", "hierarchical"),
         default="flat",
@@ -7959,6 +8023,8 @@ def main(argv=None) -> int:
         hierarchical_value=args.hierarchical_value,
         hierarchical_value_detach=args.hierarchical_value_detach,
         hier_value_replaces_joint7=args.hier_value_replaces_joint7,
+        outlook_bootstrap=args.outlook_bootstrap,
+        outlook_bootstrap_games=args.outlook_bootstrap_games,
         value_source=args.value_source,
         hier_value_weight=_resolved_hier_value_weight(args),
         train_action_gate=args.train_action_gate,

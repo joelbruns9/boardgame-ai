@@ -634,6 +634,23 @@ class SevenWondersAdvisor:
         # The difference is not a second opinion. `victory_type` and `wdl` come
         # from independent projections, so "62% you win" can sit beside a type
         # split summing to 0.55; these two are one object, so they cannot.
+        # Under the replacement arm the flat head never trained, so its split is
+        # stale: W4 becomes the headline read and the flat numbers are marked.
+        replaced = bool(getattr(getattr(evaluator, "model", None), "joint7_replaced", False))
+        if replaced and row.hier_joint7 is not None:
+            hier = [float(p) for p in row.hier_joint7]
+            outlook.update(
+                {
+                    "victory_type": dict(zip(self._JOINT7_LABELS, hier)),
+                    "you_win": sum(hier[0:3]),
+                    "opponent_wins": sum(hier[3:6]),
+                    "draw": hier[6],
+                    "victory_type_source": "hierarchical",
+                    "flat_joint7_stale": True,
+                }
+            )
+        else:
+            outlook["victory_type_source"] = "flat"
         if row.hier_joint7 is not None:
             hier = [float(p) for p in row.hier_joint7]
             outlook["hierarchical"] = {

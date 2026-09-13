@@ -99,6 +99,7 @@ def compute_losses(
     control_weight: float = CONTROL_WEIGHT_DEFAULT,
     hier_value_weight: float = HIER_VALUE_WEIGHT_DEFAULT,
     hier_value_replaces_joint7: bool = False,
+    outlook_bootstrap: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     log_policy = masked_policy_log_softmax(outputs["policy"], batch["legal_mask"])
     # Targets are zero on illegal actions where log_policy is -inf; read only
@@ -221,7 +222,22 @@ def compute_losses(
         # them. Fitting the marginal separately would double-count the rows and
         # let the two factors disagree, which is the defect this head exists to
         # remove.
-        hier_value_loss = F.nll_loss(outputs["hier_joint7"], batch["joint7"])
+        if outlook_bootstrap > 0.0 and "outlook_soft" in batch:
+            # The value head's bootstrap, applied to the victory type: blend the
+            # realised class with search's own seven-way outlook at this root.
+            # The realised class is one sample and game-constant; the outlook is
+            # position-specific and exact at every terminal the search reached.
+            # Rows without a usable outlook keep the hard label.
+            hard = F.one_hot(batch["joint7"], num_classes=7).float()
+            target = torch.where(
+                batch["outlook_soft_valid"].unsqueeze(1),
+                (1.0 - outlook_bootstrap) * hard
+                + outlook_bootstrap * batch["outlook_soft"],
+                hard,
+            )
+            hier_value_loss = -(target * outputs["hier_joint7"]).sum(dim=-1).mean()
+        else:
+            hier_value_loss = F.nll_loss(outputs["hier_joint7"], batch["joint7"])
     reply_loss = outputs["policy"].new_zeros(())
     if "reply" in outputs and batch.get("has_reply") is not None:
         rows = batch["has_reply"]
@@ -1258,6 +1274,7 @@ def train_steps(
     control_weight: float = CONTROL_WEIGHT_DEFAULT,
     hier_value_weight: float = HIER_VALUE_WEIGHT_DEFAULT,
     hier_value_replaces_joint7: bool = False,
+    outlook_bootstrap: float = 0.0,
     log=print,
 ) -> tuple[list[dict], dict]:
     """Fixed-budget training on uniform random minibatches from the replay.
@@ -1353,6 +1370,7 @@ def train_steps(
                 control_weight=control_weight,
                 hier_value_weight=hier_value_weight,
                 hier_value_replaces_joint7=hier_value_replaces_joint7,
+                outlook_bootstrap=outlook_bootstrap,
             )
         scaler.scale(total).backward()
         scaler.unscale_(optimizer)
