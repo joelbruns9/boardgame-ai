@@ -242,6 +242,7 @@ def test_operator_supplied_paths_are_checked_before_anything_is_built(setup_text
     )
     for name in (
         "INIT_CHECKPOINT",
+        "WARM_BUFFER",
         "PRECISION_ARENA_CHECKPOINT",
         "SWEEP_CHECKPOINT",
         "LAUNCH_FLAGS_JSON",
@@ -259,6 +260,15 @@ def test_the_warm_start_reaches_the_training_command(setup_text):
     assert '${INIT_FLAGS[@]+"${INIT_FLAGS[@]}"}' in _block(setup_text, "TRAIN_CMD=(")
     decision = RUN_FILE.read_text(encoding="utf-8")
     assert 'if [ -z "$INIT_CHECKPOINT" ] && [ "${ALLOW_COLD_START:-0}" != "1" ]' in decision
+
+
+def test_the_warm_buffer_reaches_the_training_command(setup_text):
+    """Without an imported buffer a fixed step budget over an empty window
+    presents the first iterations' positions ~12x against a 5.6x steady state."""
+
+    assert 'INIT_FLAGS+=(--warm-buffer "$WARM_BUFFER")' in setup_text
+    decision = RUN_FILE.read_text(encoding="utf-8")
+    assert 'if [ -z "$WARM_BUFFER" ] && [ "${ALLOW_COLD_BUFFER:-0}" != "1" ]' in decision
 
 
 def test_nothing_before_the_clone_depends_on_the_shared_library(setup_text):
@@ -1580,6 +1590,24 @@ def test_the_fitted_w5_weight_reaches_the_launch_and_is_the_run_decision(setup_t
     decision = RUN_FILE.read_text(encoding="utf-8")
     assert 'export FIT_ACTION_ALPHA="${FIT_ACTION_ALPHA:-1}"' in decision
     assert 'export ACTION_ALPHA_MAX="${ACTION_ALPHA_MAX:-2.0}"' in decision
+
+
+def test_w4_attaches_replaces_joint7_and_bootstraps_its_target(setup_text):
+    """The run decision is W4 attached in place of joint7, at joint7's own weight,
+    trained on the soft outlook target. Each piece must reach the launch line."""
+
+    assert '[ "$HIER_VALUE_REPLACES_JOINT7" = "1" ] && ARCH_FLAGS+=(--hier-value-replaces-joint7)' in setup_text
+    assert '--outlook-bootstrap "$OUTLOOK_BOOTSTRAP"' in setup_text
+    assert '--outlook-bootstrap-games "$OUTLOOK_BOOTSTRAP_GAMES"' in setup_text
+    decision = RUN_FILE.read_text(encoding="utf-8")
+    for line in (
+        'export HIER_VALUE_WEIGHT="${HIER_VALUE_WEIGHT:-0.2}"',
+        'export HIER_VALUE_DETACH="${HIER_VALUE_DETACH:-0}"',
+        'export HIER_VALUE_REPLACES_JOINT7="${HIER_VALUE_REPLACES_JOINT7:-1}"',
+        'export OUTLOOK_BOOTSTRAP="${OUTLOOK_BOOTSTRAP:-0.5}"',
+        'export OUTLOOK_BOOTSTRAP_GAMES="${OUTLOOK_BOOTSTRAP_GAMES:-10000}"',
+    ):
+        assert line in decision, line
 
 
 def test_w3_control_is_pinned_rather_than_inherited(setup_text):

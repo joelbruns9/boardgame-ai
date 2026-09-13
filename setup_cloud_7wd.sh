@@ -86,6 +86,10 @@
 #                   encoder's appended columns and every new module start
 #                   inert). Unset means random initialisation. Ignored on
 #                   resume. Use an ABSOLUTE path: phase_d runs from $REPO_DIR.
+#   WARM_BUFFER=<path>  import replay games into a NEW run (`phase_d
+#                   --warm-buffer`): one JSONL of game records, which re-derive
+#                   through the current encoder and age out through the replay
+#                   window like the run's own iterations. Absolute path.
 #   SWEEP_CHECKPOINT=<path>  runs the generation + gate scheduler sweeps
 #                   (two-pass: stage 8b writes sweeps/measured_env.sh;
 #                    source it and re-run to launch on those numbers)
@@ -128,6 +132,9 @@
 #     GRAPH_LAYERS / GRAPH_BASES / GRAPH_ALPHA
 #   SWD_CONTROL_FEATURES=1  W3 control channels (on by default; pinned here)
 #   HIERARCHICAL_VALUE=0 HIER_VALUE_WEIGHT=0 HIER_VALUE_DETACH=1   W4
+#     HIER_VALUE_REPLACES_JOINT7=0  drop the flat joint7 loss (needs DETACH=0)
+#     OUTLOOK_BOOTSTRAP=0 OUTLOOK_BOOTSTRAP_GAMES=0  W4 soft target from search's
+#                         seven-way root outlook, ramped in over N games
 #   ACTION_RESIDUAL=0 ACTION_EXPOSES=0 ACTION_POLICY_WEIGHT=0      W5
 #     FIT_ACTION_ALPHA=0 ACTION_ALPHA_MAX=2.0 ACTION_ALPHA_STEP=0.1
 #                         W5's served weight fitted to held-out targets each
@@ -628,6 +635,9 @@ export SWD_CONTROL_FEATURES
 HIERARCHICAL_VALUE="${HIERARCHICAL_VALUE:-0}"  # W4
 HIER_VALUE_WEIGHT="${HIER_VALUE_WEIGHT:-0}"
 HIER_VALUE_DETACH="${HIER_VALUE_DETACH:-1}"
+HIER_VALUE_REPLACES_JOINT7="${HIER_VALUE_REPLACES_JOINT7:-0}"
+OUTLOOK_BOOTSTRAP="${OUTLOOK_BOOTSTRAP:-0}"
+OUTLOOK_BOOTSTRAP_GAMES="${OUTLOOK_BOOTSTRAP_GAMES:-0}"
 ACTION_RESIDUAL="${ACTION_RESIDUAL:-0}"        # W5
 ACTION_EXPOSES="${ACTION_EXPOSES:-0}"
 ACTION_POLICY_WEIGHT="${ACTION_POLICY_WEIGHT:-0}"
@@ -695,6 +705,7 @@ require_operator_files() {
 
 require_operator_files \
   "INIT_CHECKPOINT=${INIT_CHECKPOINT:-}" \
+  "WARM_BUFFER=${WARM_BUFFER:-}" \
   "PRECISION_ARENA_CHECKPOINT=${PRECISION_ARENA_CHECKPOINT:-}" \
   "SWEEP_CHECKPOINT=${SWEEP_CHECKPOINT:-}" \
   "LAUNCH_FLAGS_JSON=${LAUNCH_FLAGS_JSON:-}"
@@ -1007,6 +1018,9 @@ fi
 if [ "$HIERARCHICAL_VALUE" = "1" ]; then
   ARCH_FLAGS+=(--hierarchical-value --hier-value-weight "$HIER_VALUE_WEIGHT")
   [ "$HIER_VALUE_DETACH" = "0" ] && ARCH_FLAGS+=(--no-hierarchical-value-detach)
+  [ "$HIER_VALUE_REPLACES_JOINT7" = "1" ] && ARCH_FLAGS+=(--hier-value-replaces-joint7)
+  ARCH_FLAGS+=(--outlook-bootstrap "$OUTLOOK_BOOTSTRAP"
+    --outlook-bootstrap-games "$OUTLOOK_BOOTSTRAP_GAMES")
 fi
 [ "$ACTION_RESIDUAL" = "1" ] && ARCH_FLAGS+=(--action-residual)
 [ "$ACTION_EXPOSES" = "1" ] && ARCH_FLAGS+=(--action-exposes)
@@ -1077,6 +1091,10 @@ if [ -n "${INIT_CHECKPOINT:-}" ]; then
   ok "Warm start: a new run is seeded from $INIT_CHECKPOINT (ignored on resume)."
 else
   warn "INIT_CHECKPOINT unset: a new run starts from RANDOM weights."
+fi
+if [ -n "${WARM_BUFFER:-}" ]; then
+  INIT_FLAGS+=(--warm-buffer "$WARM_BUFFER")
+  ok "Warm buffer: a new run imports replay games from $WARM_BUFFER."
 fi
 
 LADDER_FLAG=()

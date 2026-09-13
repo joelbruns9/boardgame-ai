@@ -44,7 +44,47 @@ export RUN_DIR_REL="${RUN_DIR_REL:-runs/seven_wonders_duel/run07_bundle}"
 export REPO_BRANCH="${REPO_BRANCH:-sevenwd-w9-prototype}"
 export ITERATIONS="${ITERATIONS:-200}"
 export GAMES_PER_ITERATION="${GAMES_PER_ITERATION:-1000}"
-export SEED_GAMES="${SEED_GAMES:-5000}"
+
+# ── No cold-start scaffolding ───────────────────────────────────────────────
+#
+# The bots and the draft prior exist to get a RANDOM net to a playable level:
+# scripted bots teach the instant-win conditions fast, and the draft prior blends
+# a published Wonder tier list (the ZeusAI paper's converged preferences) into
+# draft-node priors. A warm start from candidate_0085 is past both. Removing all
+# three also leaves the league opening as the ONLY scaffold change at 10k games --
+# run 04's value-head collapse followed four changes landing on one knot.
+export SEED_GAMES="${SEED_GAMES:-0}"                          # no bot seed corpus
+export DRAFT_PRIOR_GAMES="${DRAFT_PRIOR_GAMES:-0}"            # no tier-list draft prior
+export CURRICULUM_ANNEAL_GAMES="${CURRICULUM_ANNEAL_GAMES:-0}"  # no bot games in the mix
+# ── Warm buffer: cloud2's last 20 iterations ────────────────────────────────
+#
+# A fixed 190x512 step budget over a replay buffer that starts empty
+# over-presents early positions: at a 50k warm-up the first iteration's
+# positions are seen 11.7x against a steady state of 5.6x. Importing cloud2's
+# final 20 iterations (20,000 games, target_version 3, Rust-derived cleanly)
+# fills the 20-iteration window from iteration 0, so the run's own positions
+# see the steady-state rate from the start, and cloud2's age out one iteration
+# per iteration. Those are the games candidate_0085's lineage trained on, so
+# they are close to on-policy for the warm net.
+#
+# Build it from the cloud2 archive (gitignored, ~700 MB) and upload it:
+#   cat runs/seven_wonders_duel/cloud2/7wd_cloud_20260825T005745Z/buffers/iter_00{77..96}.jsonl \
+#     > runs/seven_wonders_duel/warm_buffers/cloud2_iter0077-0096.jsonl
+#
+# The rows carry no search outlook (`root_outlook`), so a victory-type soft
+# target falls back to the final result on them.
+export WARM_BUFFER="${WARM_BUFFER:-}"
+if [ -z "$WARM_BUFFER" ] && [ "${ALLOW_COLD_BUFFER:-0}" != "1" ]; then
+  echo "[FATAL] WARM_BUFFER is unset. This run imports cloud2's last 20 iterations;" >&2
+  echo "        set it to the uploaded JSONL's absolute path, e.g." >&2
+  echo "        WARM_BUFFER=\$HOME/cloud2_iter0077-0096.jsonl" >&2
+  echo "        (ALLOW_COLD_BUFFER=1 starts from an empty buffer deliberately.)" >&2
+  exit 1
+fi
+# The fallback if the buffer is not imported: 100k starts training at iteration
+# 5 and accepts ~7-8x on the earliest positions. With the warm buffer it is
+# already met at iteration 0 and changes nothing.
+export MIN_BUFFER_POSITIONS="${MIN_BUFFER_POSITIONS:-100000}"
 
 # ── Warm start ──────────────────────────────────────────────────────────────
 #
@@ -90,11 +130,25 @@ export ACTION_ALPHA_STEP="${ACTION_ALPHA_STEP:-0.1}"
 
 # W4. Required by W7 below: the specialist leaf bias reads the seven-way
 # outlook, and a leaf without one is a hard error rather than a silent zero
-# bias. `HIER_VALUE_DETACH=1` keeps the head out of the trunk's gradient, which
-# is what makes enabling it a bounded change rather than a second experiment.
+# bias.
+#
+# ATTACHED and REPLACING joint7 for this run, so the trunk learns victory type
+# through W4 -- whose seven classes sum to its own win probability -- instead of
+# the free flat head. The weight is joint7's own coefficient (value_weight 1 x
+# aux_weight 0.2), so the change is the head's structure and its target, not how
+# hard the trunk is pushed toward victory type. The flat joint7 goes stale; the
+# advisor switches its victory-type read to W4 for these checkpoints.
 export HIERARCHICAL_VALUE="${HIERARCHICAL_VALUE:-1}"
-export HIER_VALUE_WEIGHT="${HIER_VALUE_WEIGHT:-0.5}"
-export HIER_VALUE_DETACH="${HIER_VALUE_DETACH:-1}"
+export HIER_VALUE_WEIGHT="${HIER_VALUE_WEIGHT:-0.2}"
+export HIER_VALUE_DETACH="${HIER_VALUE_DETACH:-0}"
+export HIER_VALUE_REPLACES_JOINT7="${HIER_VALUE_REPLACES_JOINT7:-1}"
+# W4's target: the realised victory type blended 50/50 with search's seven-way
+# root outlook, as VALUE_BOOTSTRAP does for win/loss. Ramped in over the first
+# 10k games because the outlook is averaged from W4's own leaf predictions and
+# the head starts untrained on a warm start. cloud2's imported rows carry no
+# outlook and keep the hard label.
+export OUTLOOK_BOOTSTRAP="${OUTLOOK_BOOTSTRAP:-0.5}"
+export OUTLOOK_BOOTSTRAP_GAMES="${OUTLOOK_BOOTSTRAP_GAMES:-10000}"
 
 # ── W7: the specialist league ───────────────────────────────────────────────
 #
@@ -127,6 +181,13 @@ export HIER_VALUE_DETACH="${HIER_VALUE_DETACH:-1}"
 # on a 5.2M-param net at joint7_acc 0.512.
 export SPECIALISTS="${SPECIALISTS:-science:0.15:3,military:0.10:3}"
 export HOF_FRACTION="${HOF_FRACTION:-0.15}"
+# 10k, not setup's 50k. The 50k was a COLD-start decision: run 04 opened the
+# league against its own near-random bootstrap checkpoint, so league games were
+# lopsided wins pinning value targets near +1. A warm start's iteration-0 best is
+# candidate_0085, so the archive starts strong. 10k gives the new modules about
+# ten iterations to train before specialists (which follow this clock, since
+# SPECIALIST_BOOTSTRAP_GAMES=0) and S2b reanalysis start shaping the general.
+export HOF_START_GAMES="${HOF_START_GAMES:-10000}"
 export SPECIALIST_BOOTSTRAP_GAMES="${SPECIALIST_BOOTSTRAP_GAMES:-0}"   # 0 = follow HOF_START_GAMES
 export SPECIALIST_FLOOR_EVERY="${SPECIALIST_FLOOR_EVERY:-5}"
 # S2b: on, the general also learns to EXECUTE the attacks the specialists find;
