@@ -50,6 +50,7 @@ from .buffer import GameRecord, OPPONENT_TYPES, resolve_opponent_type
 from .dataset import GameDerivationStats
 from .phase_d import summarize_records
 from .train import (
+    ACTION_GATE_MAX_LEGACY,
     ARCHITECTURE_SWITCHES,
     heads_from_config,
     load_checkpoint,
@@ -300,6 +301,21 @@ class SevenWondersDuelLifecycleAdapter:
                         "cannot remove an existing architecture path"
                     )
             load_checkpoint(source, model, migrate=True, checkpoint=payload)
+            scorer = getattr(model, "action_scorer", None)
+            if scorer is not None and stored.get("action_residual", False):
+                # The raw gate was copied, but it means `stored_max * tanh(gate)`
+                # under the ceiling it was trained with. Re-place it so the new
+                # run serves the SAME W5 weight under its own ceiling.
+                inherited = float(
+                    stored.get("action_gate_max", ACTION_GATE_MAX_LEGACY)
+                )
+                weight = inherited * math.tanh(float(scorer.gate.detach()))
+                if weight > scorer.gate_max:
+                    raise ValueError(
+                        f"init checkpoint serves W5 at alpha={weight:.3f}, above "
+                        f"this run's ceiling {scorer.gate_max}"
+                    )
+                scorer.set_alpha(weight)
             migration = payload.get("migration")
             detail = ""
             if migration:
@@ -516,6 +532,11 @@ class SevenWondersDuelLifecycleAdapter:
                 performance.get("replay_derivation_seconds", 0.0)
             ),
             precision=self.loop.config.precision,
+            policy_mix_alpha=(
+                float((performance.get("action_alpha") or {})["applied"])
+                if performance.get("action_alpha")
+                else None
+            ),
         )
 
     def _validate_candidate(self, candidate: Path, iteration: int) -> None:

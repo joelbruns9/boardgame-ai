@@ -567,6 +567,7 @@ def model_from_config(config: dict, *, name: str = "transformer", **fallbacks):
         action_exposes=action_exposes_from_config(config),
         **graph_shape_from_config(config),
         **hierarchical_value_from_config(config),
+        **action_gate_max_from_config(config),
     )
 
 
@@ -611,6 +612,17 @@ def make_checkpoint(model, config: dict) -> dict:
                     "not be able to rebuild its own weights"
                 )
             config[field] = actual
+    # The W5 ceiling, derived from the model on the same argument as W2's alpha.
+    scorer = getattr(model, "action_scorer", None)
+    if scorer is not None:
+        stated = config.get("action_gate_max")
+        if stated is not None and float(stated) != scorer.gate_max:
+            raise ValueError(
+                f"checkpoint config says action_gate_max={stated!r} but the model "
+                f"was built with {scorer.gate_max!r}; the checkpoint would serve a "
+                "different policy from its own weights"
+            )
+        config["action_gate_max"] = scorer.gate_max
     # A TRAINING-recipe fact, not an architecture one, so it is carried through
     # rather than derived from the model: it shapes no parameter, but it changes
     # what the flat `joint7` head MEANS -- under that arm the head is frozen
@@ -909,6 +921,7 @@ def build_model(
     # silently receives `slot_embedding` and every later flag shifts by one --
     # a model that builds cleanly and is not the one asked for.
     action_exposes: bool = False,
+    action_gate_max: float = 1.0,
 ):
     """Build a model. ``heads=None`` derives the width-appropriate head count.
 
@@ -935,6 +948,7 @@ def build_model(
             graph_alpha=graph_alpha,
             hierarchical_value=hierarchical_value,
             hierarchical_value_detach=hierarchical_value_detach,
+            action_gate_max=action_gate_max,
         )
     if name == "mlp":
         return SWDMlp(d_model=d_model)
@@ -988,6 +1002,29 @@ def hierarchical_value_from_config(config: dict) -> dict:
         "hierarchical_value_detach": bool(
             config.get("hierarchical_value_detach", True)
         ),
+    }
+
+
+#: The W5 ceiling every checkpoint was trained under before the fitted-alpha
+#: controller existed. A default that is a FACT about those files, not a guess.
+ACTION_GATE_MAX_LEGACY = 1.0
+
+
+def action_gate_max_from_config(config: dict) -> dict:
+    """W5's served-weight ceiling, ``alpha = gate_max * tanh(gate)``.
+
+    Architecture in the `graph_alpha` sense: it changes what an unchanged gate
+    COMPUTES, so a rebuild that dropped it would serve a different policy from
+    the same weights. Absent means the legacy ceiling, which is what every file
+    without the key was trained under.
+    """
+
+    if not action_residual_from_config(config):
+        return {}
+    return {
+        "action_gate_max": float(
+            config.get("action_gate_max", ACTION_GATE_MAX_LEGACY)
+        )
     }
 
 

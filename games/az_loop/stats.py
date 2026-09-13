@@ -108,6 +108,9 @@ class TrainingStats:
     seconds: float = 0.0
     replay_derivation_seconds: float = 0.0
     precision: str = ""
+    #: Served weight of a secondary policy head mixed into the primary one, for
+    #: games that fit such a mix (7WD's W5 scorer). None when there is none.
+    policy_mix_alpha: float | None = None
 
 
 @dataclass(slots=True)

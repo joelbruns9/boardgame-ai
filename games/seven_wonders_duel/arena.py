@@ -262,6 +262,7 @@ def load_side(
     batch_cap: int,
     migrate: bool = False,
     name: str | None = None,
+    policy_source: str = "combined",
 ) -> Side:
     """Rebuild one checkpoint under the architecture IT names.
 
@@ -295,6 +296,16 @@ def load_side(
             "Pass --migrate to warm-start it into the current schema, and read "
             "the arena as measuring the migrated model, not the trained one."
         ) from error
+    if policy_source != "combined":
+        if not stored.get("action_residual", False):
+            raise ValueError(
+                f"{label}: {path} has no W5 action scorer, so it cannot be played "
+                f"with policy_source={policy_source!r}"
+            )
+        # The pure action-token view: W5 alone serves the priors, the flat head
+        # is ignored. The question it answers is whether W5 would be the stronger
+        # player without the flat head at all.
+    model.policy_source = policy_source
     arm = control_arm(checkpoint)
     # From the CHECKPOINT, not the arena's default: a side generated under the
     # hierarchical value head and played under the flat one is a different
@@ -309,32 +320,43 @@ def load_side(
     evaluator = Evaluator(
         model, device, batch_cap, precision=precision, value_source=value_source
     )
+    architecture = {
+        key: stored.get(key)
+        for key in (
+            "d_model",
+            "layers",
+            "heads",
+            "pooled_readout",
+            "reply_head",
+            "action_residual",
+            "action_exposes",
+            "action_gate_max",
+            "control_head",
+            "slot_embedding",
+            "graph_module",
+            "graph_alpha",
+            "hierarchical_value",
+            # Reported because it changes which player the file IS, not
+            # merely how it was trained.
+            "value_source",
+            "iteration",
+        )
+    }
+    # Reported on the row for the same reason: the same file served two ways is
+    # two players, and a report that dropped this would make them look alike.
+    architecture["policy_source"] = policy_source
+    if model.action_scorer is not None:
+        architecture["action_alpha"] = model.action_scorer.alpha_value()
     return Side(
         label=label,
         source=str(path.resolve()),
         sha256=_file_digest(path),
-        name=name or f"{label}:{path.stem}",
-        architecture={
-            key: stored.get(key)
-            for key in (
-                "d_model",
-                "layers",
-                "heads",
-                "pooled_readout",
-                "reply_head",
-                "action_residual",
-                "action_exposes",
-                "control_head",
-                "slot_embedding",
-                "graph_module",
-                "graph_alpha",
-                "hierarchical_value",
-                # Reported because it changes which player the file IS, not
-                # merely how it was trained.
-                "value_source",
-                "iteration",
-            )
-        },
+        name=name or (
+            f"{label}:{path.stem}"
+            if policy_source == "combined"
+            else f"{label}:{path.stem}[{policy_source}]"
+        ),
+        architecture=architecture,
         control_arm=arm,
         precision=precision,
         migration=checkpoint.get("migration"),
@@ -691,6 +713,8 @@ def run(
     migrate: bool = False,
     min_lcb: float | None = None,
     log=None,
+    policy_source_a: str = "combined",
+    policy_source_b: str = "combined",
 ) -> dict[str, Any]:
     """Play A against B and return the report.  Never writes into a run."""
 
@@ -707,8 +731,14 @@ def run(
         raise ValueError("search must be 'gumbel' or 'puct'")
 
     started = time.monotonic()
-    a = load_side("a", a_path, device=device, precision=precision, batch_cap=batch_cap, migrate=migrate)
-    b = load_side("b", b_path, device=device, precision=precision, batch_cap=batch_cap, migrate=migrate)
+    a = load_side(
+        "a", a_path, device=device, precision=precision, batch_cap=batch_cap,
+        migrate=migrate, policy_source=policy_source_a,
+    )
+    b = load_side(
+        "b", b_path, device=device, precision=precision, batch_cap=batch_cap,
+        migrate=migrate, policy_source=policy_source_b,
+    )
 
     # One process, one encoder.  Emit the control channels whenever ANY side was
     # trained to read them; a side trained without them is masked back to zeros
@@ -977,6 +1007,15 @@ def main(argv: list[str] | None = None) -> int:
                         help="warm-start a checkpoint from an older schema (see --help)")
     parser.add_argument("--min-lcb", type=float,
                         help="exit 3 unless A's Wilson lower bound exceeds this")
+    for side in ("a", "b"):
+        parser.add_argument(
+            f"--policy-source-{side}", default="combined",
+            choices=("combined", "action"),
+            help=f"which policy side {side.upper()} serves: the trained mix, or "
+            "the W5 action scorer alone (the pure action-token player). The same "
+            "checkpoint as --a and --b with different sources asks whether W5 "
+            "would be stronger without the flat head.",
+        )
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
 
@@ -1021,6 +1060,8 @@ def main(argv: list[str] | None = None) -> int:
         migrate=args.migrate,
         min_lcb=args.min_lcb,
         log=log,
+        policy_source_a=args.policy_source_a,
+        policy_source_b=args.policy_source_b,
     )
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

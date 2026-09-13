@@ -838,6 +838,11 @@ class RunController:
             if key in accuracies:
                 parts.append(f"value_acc={float(accuracies[key]):.3f}")
                 break
+        # A fitted policy mix, when the game has one. Its trajectory is the
+        # run's own verdict on whether the secondary head earned its weight.
+        mix_alpha = (stats.get("training") or {}).get("policy_mix_alpha")
+        if mix_alpha is not None:
+            parts.append(f"alpha={float(mix_alpha):.3f}")
         terminal = (stats.get("outcomes") or {}).get("terminal_reason") or {}
         total = sum(int(count) for count in terminal.values())
         if total:

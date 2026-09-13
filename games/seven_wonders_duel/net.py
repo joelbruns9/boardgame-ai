@@ -16,6 +16,8 @@ type later = one new embedding row + one zero-initialized projection.
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
 
@@ -553,9 +555,20 @@ class ContextualActionResidual(nn.Module):
     scatters it back into the frozen 1,202-action interface.
     """
 
-    def __init__(self, d_model: int, exposes: bool = False):
+    def __init__(self, d_model: int, exposes: bool = False, gate_max: float = 1.0):
         super().__init__()
         self.d_model = d_model
+        #: The ceiling on the served weight: ``alpha = gate_max * tanh(gate)``.
+        #:
+        #: 1.0 for every checkpoint that predates the fitted-alpha controller,
+        #: which is what they were trained under -- so it is ARCHITECTURE, like
+        #: `graph_alpha`: the same `gate` value means a different policy under a
+        #: different ceiling, and a rebuild that dropped it would load every
+        #: weight and serve something else. The fitted controller builds at 2.0,
+        #: which lets held-out evidence say "W5 should outvote the flat head".
+        if not math.isfinite(gate_max) or gate_max <= 0:
+            raise ValueError("gate_max must be finite and positive")
+        self.gate_max = float(gate_max)
         #: W5b. The action's CONSEQUENCE, not just its identity: the contextual
         #: tokens of the slots this action uncovers.
         #:
@@ -592,6 +605,33 @@ class ContextualActionResidual(nn.Module):
         # It is frozen for the shadow arm by default; training entry points must
         # opt in before the served policy can move away from the inherited net.
         self.gate = nn.Parameter(torch.zeros(()), requires_grad=False)
+
+    #: How close to the ceiling `set_alpha` may place the gate. `atanh(1)` is
+    #: infinite, so the ceiling itself is approached rather than reached.
+    _GATE_RATIO_LIMIT = 1.0 - 1e-6
+
+    def alpha(self) -> torch.Tensor:
+        """The weight the served policy gives this scorer."""
+
+        return self.gate_max * torch.tanh(self.gate)
+
+    def alpha_value(self) -> float:
+        return float(self.alpha().detach())
+
+    @torch.no_grad()
+    def set_alpha(self, value: float) -> float:
+        """Place the gate so the served weight is ``value``; returns what landed.
+
+        The fitted controller sets the weight directly instead of letting AdamW
+        move the gate, whose step is ~lr per update whatever the evidence --
+        about 0.01 per iteration at the run's learning rate.
+        """
+
+        if not math.isfinite(value):
+            raise ValueError(f"alpha must be finite, got {value!r}")
+        ratio = max(-self._GATE_RATIO_LIMIT, min(self._GATE_RATIO_LIMIT, value / self.gate_max))
+        self.gate.fill_(math.atanh(ratio))
+        return self.alpha_value()
 
     @staticmethod
     def _gather(tokens: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
@@ -923,6 +963,7 @@ class SWDNet(nn.Module):
         graph_layers: int = 2,
         graph_bases: int = 4,
         graph_alpha: float = 1e-3,
+        action_gate_max: float = 1.0,
     ):
         super().__init__()
         heads = default_heads(d_model) if heads is None else int(heads)
@@ -997,10 +1038,21 @@ class SWDNet(nn.Module):
         self.action_exposes = bool(action_exposes and action_residual)
         self.heads = Heads(d_model, reply=self.reply_head)
         self.action_scorer = (
-            ContextualActionResidual(d_model, exposes=self.action_exposes)
+            ContextualActionResidual(
+                d_model, exposes=self.action_exposes, gate_max=action_gate_max
+            )
             if self.action_residual
             else None
         )
+        #: Which policy the model SERVES. Not architecture and never saved: an
+        #: evaluation switch, set by whoever loads the model to play it.
+        #:
+        #: ``"combined"`` is the trained interface, ``flat + alpha * W5``.
+        #: ``"action"`` serves the W5 scorer alone -- the pure action-token
+        #: policy -- so an arena can ask whether it would be stronger without
+        #: the flat head at all. Only the served ``policy`` changes; the flat
+        #: and W5 outputs are both still computed and value is untouched.
+        self.policy_source = "combined"
         self.control_head = bool(control_head)
         self.control_scorer = ControlHead(d_model) if self.control_head else None
         #: W4. Recorded on the model like every other switch, and `detach` with
@@ -1062,8 +1114,18 @@ class SWDNet(nn.Module):
             residual.scatter_add_(1, batch["legal_indices"], candidate_logits)
             residual = residual[:, :NUM_ACTIONS]
             out["action_policy"] = residual
-            alpha = torch.tanh(self.action_scorer.gate)
-            out["policy"] = out["policy"] + alpha * residual
+            if self.policy_source == "action":
+                # Illegal entries are zero here rather than -inf, which is safe:
+                # every consumer softmaxes over the LEGAL logits only.
+                out["policy"] = residual
+            elif self.policy_source == "combined":
+                out["policy"] = out["policy"] + self.action_scorer.alpha() * residual
+            else:
+                raise ValueError(f"unknown policy_source {self.policy_source!r}")
+        elif self.policy_source != "combined":
+            raise ValueError(
+                f"policy_source={self.policy_source!r} needs the W5 action scorer"
+            )
         if self.control_scorer is not None and "control_token_index" in batch:
             out.update(self.control_scorer(normed, batch))
         if self.hier_value is not None:

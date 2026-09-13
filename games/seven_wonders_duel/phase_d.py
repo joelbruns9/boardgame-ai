@@ -117,7 +117,9 @@ from .specialist import (
     route_for,
     steps_for_inflow,
 )
+from .action_alpha import format_alpha_fit, refit_alpha
 from .train import (
+    ACTION_GATE_MAX_LEGACY,
     baselines,
     build_model,
     evaluate as evaluate_model,
@@ -542,6 +544,21 @@ class PhaseDConfig:
 
     train_action_gate: bool = False
     """Allow W5a to affect served logits; false trains it in shadow mode."""
+
+    fit_action_alpha: bool = False
+    """Set W5's served weight from held-out evidence after every training step.
+
+    Instead of training the gate (AdamW moves it ~lr per update, about 0.01 per
+    iteration here), `action_alpha.refit_alpha` fits the alpha that best predicts
+    held-out search targets and steps toward it. See that module."""
+
+    action_alpha_max: float = 2.0
+    """Ceiling on the fitted weight. Above 1 lets W5 outvote the flat head; the
+    model is built with this as its gate ceiling, so it is architecture."""
+
+    action_alpha_step: float = 0.1
+    """Largest change to the fitted weight per iteration. The flat head trains
+    against the combined policy and needs time to re-adapt to a new alpha."""
 
     precision: str = "fp32"
     """Model-call precision. ``bf16`` is opt-in; ``fp32`` preserves defaults."""
@@ -1520,6 +1537,23 @@ class PhaseDConfig:
             raise ValueError("action_policy_weight requires --action-residual")
         if self.train_action_gate and not self.action_residual:
             raise ValueError("--train-action-gate requires --action-residual")
+        if self.fit_action_alpha:
+            if not self.action_residual:
+                raise ValueError("--fit-action-alpha requires --action-residual")
+            if self.train_action_gate:
+                raise ValueError(
+                    "--fit-action-alpha and --train-action-gate both set W5's "
+                    "weight; choose one"
+                )
+            if not math.isfinite(self.action_alpha_max) or self.action_alpha_max <= 0:
+                raise ValueError("action_alpha_max must be finite and positive")
+            if not math.isfinite(self.action_alpha_step) or self.action_alpha_step <= 0:
+                raise ValueError("action_alpha_step must be finite and positive")
+            if self.val_fraction <= 0:
+                raise ValueError(
+                    "--fit-action-alpha fits on held-out games and needs "
+                    "a positive --val-fraction"
+                )
         if self.action_residual and self.action_policy_weight == 0:
             raise ValueError(
                 "--action-residual requires a positive --action-policy-weight "
@@ -2319,6 +2353,21 @@ def _hier_value(source) -> dict:
     }
 
 
+def _run_action_gate_max(config) -> dict:
+    """The W5 gate ceiling a run BUILDS new models with.
+
+    Only for sites that construct from the run config. Anything rebuilding a
+    saved model reads the ceiling from that checkpoint instead: an older file was
+    trained under the legacy 1.0 whatever this run is configured to do.
+    """
+
+    if not getattr(config, "action_residual", False):
+        return {}
+    if getattr(config, "fit_action_alpha", False):
+        return {"action_gate_max": float(config.action_alpha_max)}
+    return {"action_gate_max": ACTION_GATE_MAX_LEGACY}
+
+
 def _graph_shape(source) -> dict:
     """The W2 shape, or nothing when the module is off.
 
@@ -2358,6 +2407,7 @@ def _process_generation_init(
         graph_module=config.graph_module,
         **_graph_shape(config),
         **_hier_value(config),
+        **_run_action_gate_max(config),
     )
     model.load_state_dict(model_state)
     # CPU inference per process: at generation batch sizes the tiny network is
@@ -2416,6 +2466,7 @@ class ModelAgentSpec:
     hierarchical_value: bool = False
     hierarchical_value_detach: bool = True
     value_source: str = "flat"
+    action_gate_max: float = 1.0
     """Architecture switches the weights were built under.
 
     ``value_source`` is not a parameter shape but belongs here for the same
@@ -2462,6 +2513,11 @@ def _model_from_spec(spec: ModelAgentSpec):
         graph_module=spec.graph_module,
         **_graph_shape(spec),
         **_hier_value(spec),
+        **(
+            {"action_gate_max": float(spec.action_gate_max)}
+            if spec.action_residual
+            else {}
+        ),
     )
     model.load_state_dict(spec.model_state)
     return model
@@ -3702,6 +3758,9 @@ class PhaseDLoop:
             "value_source": self.config.value_source,
             "action_policy_weight": self.config.action_policy_weight,
             "train_action_gate": self.config.train_action_gate,
+            "fit_action_alpha": self.config.fit_action_alpha,
+            "action_alpha_max": self.config.action_alpha_max,
+            "action_alpha_step": self.config.action_alpha_step,
             "precision": self.config.precision,
             **extra,
         }
@@ -3720,6 +3779,7 @@ class PhaseDLoop:
             graph_module=self.config.graph_module,
             **_graph_shape(self.config),
             **_hier_value(self.config),
+            **_run_action_gate_max(self.config),
         )
         if model.action_scorer is not None:
             model.action_scorer.gate.requires_grad_(self.config.train_action_gate)
@@ -4906,6 +4966,24 @@ class PhaseDLoop:
             seed=self.config.seed + iteration,
             precision=self.config.precision,
         )
+        alpha_fit = None
+        if self.config.fit_action_alpha:
+            # After training and before the checkpoint, so the candidate carries
+            # the weight fitted to ITS OWN heads -- on the held-out split, which
+            # neither head trained on.
+            alpha_started = time.monotonic()
+            alpha_fit = refit_alpha(
+                model,
+                val_examples,
+                self.config.device,
+                alpha_max=self.config.action_alpha_max,
+                step=self.config.action_alpha_step,
+                batch_size=self.config.train_batch_size,
+                precision=self.config.precision,
+                seed=self.config.seed + iteration,
+            ).as_dict()
+            alpha_fit["seconds"] = time.monotonic() - alpha_started
+            print(format_alpha_fit(alpha_fit), flush=True)
         training_seconds = time.monotonic() - training_started
         self.phase_seconds["training"] = training_seconds
         self._save_optimizer_state(optimizer_state, iteration)
@@ -4954,6 +5032,7 @@ class PhaseDLoop:
             "replay_derivation_seconds": replay_seconds,
             "seconds": training_seconds,
             "precision": self.config.precision,
+            "action_alpha": alpha_fit,
             "steps": history,
         }
         candidate = self.checkpoint_dir / f"candidate_{iteration:04d}.pt"
@@ -5528,6 +5607,11 @@ class PhaseDLoop:
                 getattr(source, "hierarchical_value_detach", True)
             ),
             value_source=self.config.value_source,
+            action_gate_max=(
+                float(source.action_scorer.gate_max)
+                if getattr(source, "action_scorer", None) is not None
+                else 1.0
+            ),
             sims=self.config.gate_sims,
             mode=self.config.search_mode,
             top_k=self.config.top_k,
@@ -7124,6 +7208,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="let W5 alter served policy logits; default trains the scorer in shadow",
     )
     parser.add_argument(
+        "--fit-action-alpha",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="after each training step, set W5's served weight to the value that "
+        "best predicts HELD-OUT search targets, moving at most "
+        "--action-alpha-step per iteration. Replaces a trained gate, which "
+        "AdamW can move only ~0.01 per iteration. Requires --action-residual.",
+    )
+    parser.add_argument(
+        "--action-alpha-max",
+        type=float,
+        default=2.0,
+        help="ceiling on the fitted W5 weight; above 1 lets W5 outvote the flat "
+        "head. Built into the model as its gate ceiling.",
+    )
+    parser.add_argument(
+        "--action-alpha-step",
+        type=float,
+        default=0.1,
+        help="largest change to the fitted W5 weight per iteration",
+    )
+    parser.add_argument(
         "--pooled-readout",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -7856,6 +7962,9 @@ def main(argv=None) -> int:
         value_source=args.value_source,
         hier_value_weight=_resolved_hier_value_weight(args),
         train_action_gate=args.train_action_gate,
+        fit_action_alpha=args.fit_action_alpha,
+        action_alpha_max=args.action_alpha_max,
+        action_alpha_step=args.action_alpha_step,
         forced_playout_k=args.forced_playout_k,
         cheap_search_mode=args.cheap_search_mode,
         dirichlet_epsilon=args.dirichlet_epsilon,
