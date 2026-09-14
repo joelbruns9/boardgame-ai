@@ -99,6 +99,35 @@ each fails tests). Legacy pipeline removed in `053d612`.
 
 ### Phase 1 — Turn solver prototype with a fixed evaluator
 
+**Status: BUILT (2026-09-14), cost gate awaiting sign-off.** `solver.py`,
+`tests/test_solver.py`, `turn_size_probe.py`.
+
+- Correctness: matches a brute-force expectimax on all 10 rule sets, at the
+  runner cap and before it; matches Monte-Carlo rollouts of its own policy.
+  Mutation-checked (ignoring blocking, missing wins, dropping the bust value,
+  menu-signature collision each fail tests).
+- Real bug caught by the pre-cap brute force: a runner at the top of its
+  column shared a menu signature with a claimed column, but still holds a
+  runner slot. Fixed (signature code 5).
+- Roll menus cached by an 11-column status signature: 26 s -> 8 s on the
+  empty board. 109 distinct roll classes (not 126 multisets).
+- **Solve after the first roll, not at turn start**: identical decisions
+  (tested), table rooted at the rolled options only.
+
+Measured cost, Python, heuristic self-play, 1 game per rule set
+(heuristic games are short and aggressive -- 8 to 42 turns -- so the board
+distribution is not what trained play will see):
+
+| Solve rooted at | positions p50 (range over variants) | positions max | seconds p50 | seconds max |
+|---|---|---|---|---|
+| turn start | 8.9k – 46k | 69,038 | 1.3 – 7.0 | 11.0 |
+| after first roll | 1.0k – 13k | 36,839 | 0.1 – 1.9 | 5.2 |
+
+Leaf (evaluator) calls are ~75–100% of positions. After the first move the
+remaining turn is small: 2 runners p50 0.8k–4.3k, 3 runners p50 ~200–460.
+One solve per turn suffices (the table answers every later decision), so
+Python self-play is roughly 1 s per turn on one core.
+
 - Solver as specified above, taking any `evaluate(boards) -> per-seat win
   probs` callable. Develop against `heuristic_value` as the leaf so no net is
   needed yet.
