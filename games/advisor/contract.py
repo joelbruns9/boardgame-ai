@@ -118,6 +118,13 @@ class ActionStats:
 
     ``None`` whenever the move simply ends, which is the common case. A game
     with no such moves never sets it."""
+    outlook: dict[str, float] | None = None
+    """How search expects the game to END after this move, when the game has
+    such a breakdown: a flat ``{label: probability}`` the adapter names (7WD:
+    who wins, and by which victory type). Searched, not a raw evaluation.
+
+    ``None`` when the game has none, or when too few of this move's simulations
+    carried one to be worth showing. The host only carries it."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -148,6 +155,8 @@ class SearchSnapshot:
     root_value: float  # actor-frame edge in [-1, 1]
     entries: dict[str, ActionStats]
     partial: bool = False
+    root_outlook: dict[str, float] | None = None
+    """The same breakdown as :attr:`ActionStats.outlook`, for the root."""
     stop_reason: str | None = None
     """Why this search will not deepen further, short of its target.
 
@@ -241,6 +250,8 @@ class Recommendation:
     follow_up: str | None = None
     """Carried through from :attr:`ActionStats.follow_up` -- the rest of this
     move, when making it raises a second decision for the same player."""
+    outlook: dict[str, float] | None = None
+    """Carried through from :attr:`ActionStats.outlook`."""
     fields: dict[str, Any] = field(default_factory=dict)
     annotations: dict[str, Any] = field(default_factory=dict)
 
@@ -266,6 +277,8 @@ class RecommendResponse:
     summary: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
     meta: dict[str, Any] = field(default_factory=dict)
+    root_outlook: dict[str, float] | None = None
+    """Carried through from :attr:`SearchSnapshot.root_outlook`."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────

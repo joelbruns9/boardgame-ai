@@ -550,6 +550,23 @@ impl RustPuctSearch {
         self.session.follow_ups()
     }
 
+    /// `(root_outlook, root_outlook_count, [(action_index, outlook, count)])`,
+    /// every outlook seven root-actor-relative probabilities or `None`. Kept
+    /// out of `snapshot` for the same reason `follow_ups` is: that tuple's
+    /// shape is pinned by its callers and tests. See `root_outlooks` in
+    /// `tree_resumable.rs` for what the counts are for.
+    fn outlooks(&self) -> (Option<Vec<f64>>, u32, Vec<(usize, Option<Vec<f64>>, u32)>) {
+        let (overall, count, edges) = self.session.root_outlooks();
+        (
+            overall.map(|o| o.to_vec()),
+            count,
+            edges
+                .into_iter()
+                .map(|(action, outlook, n)| (action, outlook.map(|o| o.to_vec()), n))
+                .collect(),
+        )
+    }
+
     fn arena_nodes(&self) -> usize {
         self.session.arena_nodes()
     }

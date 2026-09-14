@@ -187,6 +187,9 @@
       sub.textContent += "  ·  " + warning;
     }
 
+    searchedOutlook = (snap && snap.root_outlook) || null;
+    drawOutlook();
+
     rows.textContent = "";
     for (const r of recs) {
       const solved = exactSolved && r.annotations && r.annotations.exact_endgame;
@@ -227,6 +230,15 @@
         followUp.className = "swd-adv-follow";
         followUp.textContent = r.follow_up;
         text.append(followUp);
+      }
+      // How search expects the game to end AFTER this move -- the pivot read:
+      // a move can keep the win % flat while trading a points loss for a
+      // military chance, or leave the opponent's science where it was.
+      if (r.outlook && !solved) {
+        const line = document.createElement("div");
+        line.className = "swd-adv-move-outlook";
+        line.textContent = moveOutlookText(r.outlook);
+        text.append(line);
       }
       text.append(meta);
       row.append(text, q);
@@ -311,11 +323,46 @@
     draw: "draw",
   };
 
+  // The raw read arrives once per position; the searched one with every poll
+  // and supersedes it once present, because it is search's own backed-up split
+  // rather than one evaluation of the root.
+  let publicOutlook = null;
+  let searchedOutlook = null;
+
   function renderOutlook(outlook) {
+    publicOutlook = outlook;
+    drawOutlook();
+  }
+
+  const OUTLOOK_SHORT = { civilian: "civ", scientific: "sci", military: "mil" };
+
+  function sideSummary(outlook, side) {
+    let total = 0;
+    let bestType = null;
+    let bestP = -1;
+    for (const type of ["civilian", "scientific", "military"]) {
+      const p = outlook[side + "_" + type] || 0;
+      total += p;
+      if (p > bestP) {
+        bestP = p;
+        bestType = type;
+      }
+    }
+    const pct = (x) => (x * 100).toFixed(0) + "%";
+    return pct(total) + " (" + OUTLOOK_SHORT[bestType] + " " + pct(bestP) + ")";
+  }
+
+  function moveOutlookText(outlook) {
+    return "you " + sideSummary(outlook, "you") + "  ·  opp " + sideSummary(outlook, "opponent");
+  }
+
+  function drawOutlook() {
     const box = ensurePanel().querySelector('[data-role="outlook"]');
     box.textContent = "";
-    if (!outlook) return;
-    const rows = Object.entries(outlook.victory_type || {})
+    const outlook = publicOutlook;
+    const split = searchedOutlook || (outlook && outlook.victory_type);
+    if (!split) return;
+    const rows = Object.entries(split)
       .sort((a, b) => b[1] - a[1])
       .filter(([, p]) => p >= 0.01)
       .slice(0, 3);
@@ -334,9 +381,16 @@
     }
     const foot = document.createElement("div");
     foot.className = "swd-adv-vt-foot";
+    const source = searchedOutlook ? "searched" : "net (unsearched)";
+    if (!outlook) {
+      foot.textContent = source;
+      box.appendChild(foot);
+      return;
+    }
     const margin = outlook.vp_margin;
     foot.textContent =
-      "VP margin " +
+      source +
+      "  ·  VP margin " +
       (margin >= 0 ? "+" : "") +
       margin.toFixed(1) +
       "  ·  science " +
@@ -414,6 +468,8 @@
   }
 
   async function fetchOutlook(state) {
+    // A new position: the previous search's split no longer describes it.
+    searchedOutlook = null;
     try {
       const pub = await post("/api/state", { state });
       renderOutlook(pub && pub.victory_outlook);

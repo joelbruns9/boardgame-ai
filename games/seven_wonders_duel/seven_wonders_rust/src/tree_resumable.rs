@@ -886,6 +886,15 @@ pub struct SearchSession {
     /// the scalar value is.
     outlook_sum: Outlook,
     outlook_visits: u32,
+    /// The same accumulation split by ROOT EDGE, so the advisor can show how
+    /// the game is expected to end AFTER each candidate move rather than only
+    /// at the root. Indexed like `arena.nodes[root].edges`; player-0 terms.
+    ///
+    /// Root-only, like the sum above: a simulation already knows which root
+    /// edge it went through (`PendingSimulation::root_edge`), so this is seven
+    /// additions per simulation and no node grows a field.
+    edge_outlook_sum: Vec<Outlook>,
+    edge_outlook_visits: Vec<u32>,
     /// W7: the same root mean under lambda = 0, accumulated over the SAME
     /// visits as `Arena::root.value_sum_p0` rather than reconstructed from it.
     unshaped_sum: f64,
@@ -1049,6 +1058,8 @@ impl SearchSession {
         Ok(Self {
             outlook_sum: root_outlook.unwrap_or([0.0; 7]),
             outlook_visits: u32::from(root_outlook.is_some()),
+            edge_outlook_sum: vec![[0.0; 7]; n],
+            edge_outlook_visits: vec![0; n],
             unshaped_sum: raw_root_value_p0,
             unshaped_visits: 1,
             net_root_value: sign * raw_root_value_p0,
@@ -1288,8 +1299,10 @@ impl SearchSession {
         if let Some(o) = outlook {
             for k in 0..7 {
                 self.outlook_sum[k] += o[k];
+                self.edge_outlook_sum[root_edge][k] += o[k];
             }
             self.outlook_visits += 1;
+            self.edge_outlook_visits[root_edge] += 1;
         }
         self.complete_simulation(root_edge);
         Ok(())
@@ -1588,6 +1601,44 @@ impl SearchSession {
     /// Deliberately raw sums rather than means: the caller divides, and the
     /// p0->actor sign flip stays in the Python adapter, which is the only layer
     /// that knows whose turn it is.
+    /// Search's seven-way outlook, root-actor relative: the whole root, and per
+    /// root action. `(root_mean, root_count, [(action_index, edge_mean,
+    /// edge_count)])`, each mean `None` until at least one contributing leaf
+    /// supplied an outlook.
+    ///
+    /// The counts are returned because coverage is not guaranteed: an evaluator
+    /// without an outlook head contributes values but no outlooks, and a mean
+    /// over the terminals alone would read as a confident forecast. A caller
+    /// compares `edge_count` with the edge's visits before showing anything.
+    ///
+    /// Visit-weighted, like the scalar backup. At an edge whose Q is
+    /// probability-weighted over force-expanded chance children, this is the
+    /// mean over the simulations that went through it, not that weighted Q's
+    /// exact seven-way counterpart.
+    pub fn root_outlooks(&self) -> (Option<Outlook>, u32, Vec<(usize, Option<Outlook>, u32)>) {
+        let root = &self.arena.nodes[self.arena.root_id()];
+        let actor = root.actor;
+        let overall =
+            crate::tree::session_root_outlook(self.outlook_sum, self.outlook_visits, actor);
+        let edges = root
+            .edges
+            .iter()
+            .enumerate()
+            .map(|(j, edge)| {
+                (
+                    edge.action_index,
+                    crate::tree::session_root_outlook(
+                        self.edge_outlook_sum[j],
+                        self.edge_outlook_visits[j],
+                        actor,
+                    ),
+                    self.edge_outlook_visits[j],
+                )
+            })
+            .collect();
+        (overall, self.outlook_visits, edges)
+    }
+
     pub fn root_stats(&self) -> (u32, f64, usize, Vec<(usize, u32, f64, f64)>) {
         let root = &self.arena.nodes[self.arena.root_id()];
         let edges = root

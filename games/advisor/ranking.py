@@ -47,6 +47,7 @@ def build_recommendations(
                 prior=stats.prior,
                 is_legal=view is not None,
                 follow_up=stats.follow_up,
+                outlook=stats.outlook,
                 fields=dict(view.fields) if view is not None else {},
             )
         )
@@ -75,6 +76,7 @@ def response_from_snapshot(
         recommendations=build_recommendations(snapshot, action_views, top_k=top_k),
         warnings=list(warnings or []),
         meta=dict(meta or {}),
+        root_outlook=snapshot.root_outlook,
     )
 
 

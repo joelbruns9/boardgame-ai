@@ -1338,7 +1338,7 @@ def rust_scalar_net_adapter(evaluator):
     return adapter
 
 
-def rust_batched_net_adapter(evaluator):
+def rust_batched_net_adapter(evaluator, *, outlook_source: str | None = None):
     """`[(tokens, actor, legal), ...] -> [(value_actor, priors), ...]`, ONE call.
 
     The counterpart to Rust's `PyBatchEval`. Where `rust_scalar_net_adapter`
@@ -1349,9 +1349,30 @@ def rust_batched_net_adapter(evaluator):
 
     Row order is the contract -- Rust matches results back to leaves by index,
     and validates the count before any of it reaches the tree.
+
+    ``outlook_source`` adds each leaf's seven-way outlook, so the search can
+    back it up to the root and per root move: ``"flat"`` reads the flat
+    ``joint7`` head, ``"hierarchical"`` reads W4. ``None`` sends the historical
+    pair. Only for searches whose outlook is DISPLAYED: a specialist's leaf bias
+    must read W4, and is never driven through this adapter.
     """
 
+    if outlook_source not in (None, "flat", "hierarchical"):
+        raise ValueError(f"unknown outlook_source {outlook_source!r}")
     token_types = list(TokenType)
+
+    def outlook_of(row):
+        if outlook_source == "flat":
+            values = row.joint7
+        else:
+            values = row.hier_joint7
+        if values is None:
+            return None
+        values = [float(p) for p in values]
+        total = sum(values)
+        # Float32 softmax output; renormalise so Rust's strict mass check sees a
+        # distribution rather than rounding.
+        return [p / total for p in values] if total > 0 else None
 
     def adapter(rows):
         encodings = []
@@ -1368,8 +1389,17 @@ def rust_batched_net_adapter(evaluator):
             )
             legals.append(list(legal))
         out = evaluator.evaluate(encodings, legals)
+        if outlook_source is None:
+            return [
+                (float(row.wdl[0] - row.wdl[2]), [float(p) for p in row.policy])
+                for row in out
+            ]
         return [
-            (float(row.wdl[0] - row.wdl[2]), [float(p) for p in row.policy])
+            (
+                float(row.wdl[0] - row.wdl[2]),
+                [float(p) for p in row.policy],
+                outlook_of(row),
+            )
             for row in out
         ]
 

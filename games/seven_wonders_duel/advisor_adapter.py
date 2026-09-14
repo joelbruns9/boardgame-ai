@@ -323,6 +323,45 @@ class _ClosedHandle:
         pass
 
 
+#: Search's seven outlook classes, in the root actor's terms -- the order the
+#: Rust tree and both outlook heads use (`dataset.JOINT7_CLASSES`).
+_OUTLOOK_LABELS = (
+    "you_civilian",
+    "you_scientific",
+    "you_military",
+    "opponent_civilian",
+    "opponent_scientific",
+    "opponent_military",
+    "draw",
+)
+
+#: Show a move's searched outlook only when this share of its simulations
+#: carried one. Below it the mean is dominated by whichever leaves happened to
+#: supply an outlook -- terminals always do -- and reads as a forecast it is not.
+OUTLOOK_MIN_COVERAGE = 0.9
+
+
+def _searched_outlook(values, count: int, visits: int) -> dict[str, float] | None:
+    if values is None or visits <= 0 or count < OUTLOOK_MIN_COVERAGE * visits:
+        return None
+    return {label: float(p) for label, p in zip(_OUTLOOK_LABELS, values)}
+
+
+def outlook_source_for(evaluator) -> str:
+    """Which head's seven-way outlook the advisor's search backs up.
+
+    The same rule the raw victory outlook follows: W4 when the checkpoint's
+    flat `joint7` was replaced (and so is stale), the flat head otherwise --
+    including every checkpoint without W4, which is what makes this work on
+    the served net today.
+    """
+
+    model = getattr(evaluator, "model", None)
+    if getattr(model, "joint7_replaced", False) and getattr(model, "hier_value", None) is not None:
+        return "hierarchical"
+    return "flat"
+
+
 class _RustClosedHandle:
     """SearchHandle over the Rust resumable PUCT tree.
 
@@ -359,6 +398,10 @@ class _RustClosedHandle:
         if not stop_event.is_set() and not self._stop_reason():
             self._search.advance(int(chunk_sims))
         sims_done, root_visits, root_value_sum, _actor, edges = self._search.snapshot()
+        root_outlook, root_outlook_count, edge_outlooks = self._search.outlooks()
+        edge_outlook = {
+            int(action): (values, int(count)) for action, values, count in edge_outlooks
+        }
         follow_ups = {
             int(root_action): (ranked, bool(contingent))
             for root_action, ranked, contingent in self._search.follow_ups()
@@ -373,6 +416,9 @@ class _RustClosedHandle:
                     if action_index in follow_ups
                     else None
                 ),
+                outlook=_searched_outlook(
+                    *edge_outlook.get(action_index, (None, 0)), int(visits)
+                ),
             )
             for action_index, visits, value_sum, prior in edges
         }
@@ -383,6 +429,9 @@ class _RustClosedHandle:
             * (root_value_sum / root_visits if root_visits else 0.0),
             entries=entries,
             partial=stop_event.is_set(),
+            root_outlook=_searched_outlook(
+                root_outlook, int(root_outlook_count), int(root_visits)
+            ),
             stop_reason=self._stop_reason(),
         )
 
@@ -724,8 +773,15 @@ class SevenWondersAdvisor:
             1, int(req.options.get("leaf_batch", ADVISOR_LEAF_BATCH))
         )
         evaluator = self._evaluator(req)
+        # The batched adapter also sends each leaf's seven-way outlook, which the
+        # tree backs up to the root and per root move for the panel. Selection
+        # never reads it: the advisor's search carries no specialist bias. The
+        # scalar bridge sends none, so a leaf_batch=1 search shows no searched
+        # outlook rather than a terminals-only one.
         adapter = (
-            rust_batched_net_adapter(evaluator)
+            rust_batched_net_adapter(
+                evaluator, outlook_source=outlook_source_for(evaluator)
+            )
             if leaf_batch > 1
             else rust_scalar_net_adapter(evaluator)
         )
