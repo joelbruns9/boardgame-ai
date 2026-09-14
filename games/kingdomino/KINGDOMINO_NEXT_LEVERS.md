@@ -2,14 +2,18 @@
 
 - **Status:** Forward plan; experiments require their own frozen configs and
   preregistered gates before expensive training.
-- **Date:** 2026-08-09
+- **Date:** 2026-08-13
 - **Current model:** `runs/kingdomino/best_checkpoint/current_best.pt`
   (sha `4bf07b0c…`, 80x6), placed **3rd in a three-month BGA arena**.
 - **Goal:** make the strongest Kingdomino player in the world, not merely find
   another proxy metric that moves.
-- **Primary workstreams:**
-  1. chance-correct, observation-split enhancement of open-loop search;
+- **Primary next workstreams:**
+  1. diagnose placement headroom and test denser representation/supervision;
   2. high-value BGA positions as restart states in the training loop.
+- **Closed current treatment:** the implemented deck-8/12 cap-16 progressive
+  chance search did not beat open loop at either the 800-sim advisor budget or
+  the 4,800-sim teacher budget. Preserve the code and artifacts, but do not use
+  this treatment for advisor play or another training cycle.
 
 ## 1. Executive decision
 
@@ -23,9 +27,12 @@ is now the interaction between the state distribution and stochastic search:
    different public states after a row reveal. This can suppress the value of
    being able to adapt to the row once it becomes visible.
 
-The two workstreams reinforce one another. BGA restarts supply strategically
-interesting roots; chance-correct search supplies better decisions and training
-targets at those roots.
+The final fixed-network gates changed the priority. BGA restarts still supply
+strategically interesting roots, but the implemented chance-correct search did
+not supply a stronger teacher at matched NN work. The next programme should
+therefore diagnose whether placement geometry is a remaining relative weakness,
+then test supervision or restart treatments independently rather than asking a
+failed search treatment to rescue them.
 
 The design must preserve the lesson that motivated open-loop search in the
 first place: **a decision made before a reveal must not depend on that reveal.**
@@ -1083,10 +1090,43 @@ A low-simulation-only win is therefore not an advisor enhancement, but it can
 still create a stronger learned network. A regression at advisor budget is not
 hidden by averaging the two verdicts.
 
-#### A3 — training-loop treatment
+**Final fixed-network Gate 0, 2026-08-12/13 — current progressive treatment
+closed.** The production cap-16 progressive search was compared directly with
+open loop using the identical incumbent checkpoint, matched NN-row budgets,
+identical deck seeds and complete seat swaps. Only the search treatment differed.
 
-Only after the A1c target-quality gate and corresponding A2 advisor or
-training-search verdict are positive:
+- At 800 simulations, 2,048 games / 1,024 pairs scored progressive at 48.24%.
+  Its one-sided 95% interval was 47.34%-49.15%, mean margin was -0.475, and the
+  preregistered verdict was `fail`.
+- At 4,800 simulations, 4,096 games / 2,048 pairs scored progressive at 49.46%.
+  Its one-sided 95% interval was 48.69%-50.23%, mean margin was -0.059, and the
+  preregistered verdict was formally `inconclusive`.
+- The high-sim mechanism was not starved: mean active width was 15.98/16, mean
+  mature width was 15.93/16, both decks were treated in all expected searches,
+  and bootstrap initialization consumed about 350 rows per treated search
+  (roughly 7.3% of the 4,800-row budget).
+
+Auditable results are stored at
+`runs/kingdomino/chance_progressive_cloud_v1/gate0_incumbent_search_ab_800sims_2048/result.json`
+and
+`runs/kingdomino/chance_progressive_cloud_v1/gate0_teacher_search_ab_4800sims_4096/result.json`;
+the downloaded cloud bundle and both replay buffers are preserved under
+`data/kingdomino/`.
+
+The higher budget recovered most of the 800-sim deficit, consistent with an
+up-front bootstrap tax, but it converged toward parity rather than superiority.
+The high-sim upper bound leaves at most about a 0.23-point pair-score advantage
+under the stated one-sided interval—too small to justify another expensive
+chance-aware training cycle. Do not extend these viewed matches, tune the cap
+against their seeds, or proceed to A3 with this treatment. This closes the
+implemented topology/parameters, not every conceivable information-safe chance
+search architecture.
+
+#### A3 — training-loop treatment (not authorized for the closed treatment)
+
+The following remains a historical contract for a qualitatively new chance
+method only after it independently passes target-quality and frozen-network
+strength gates. The completed progressive treatment did not pass them:
 
 - use chance-correct root visits/completed-Q targets for learner moves;
 - retain standard terminal win, own-score and opponent-score targets;
@@ -1107,7 +1147,7 @@ model-plus-search system with the currently deployed model-plus-open-loop system
 Both use paired decks/seats and the Section 3 `LCB > 50%` rule; the first gate is
 the authoritative network-promotion decision.
 
-#### A4 — expand the observation split only if justified
+#### A4 — expand the observation split only if justified (deferred)
 
 If one reveal helps, extend the same fully initialized/progressively widened
 semantics to later reveals one boundary at a time. Measure active support,
@@ -1329,6 +1369,18 @@ alone is not a promotion result.
 
 ## 6. Supporting levers
 
+> **Update 2026-08-13.** The fixed-incumbent Gate 0 is complete. Progressive
+> search scored 48.24% at 800 sims over 1,024 pairs, with its full interval
+> below 50%, then 49.46% at 4,800 sims over 2,048 pairs, with a one-sided 95%
+> interval of 48.69%-50.23%. The high-sim panels were essentially fully mature
+> at width 16, so lack of activation is not an explanation. Combined with the
+> flat sims-strength curve, the current search treatment offers no useful
+> improvement to distill and is closed. This raises the relative priority of
+> levers that do not depend on a stronger MCTS teacher: network-independent
+> diagnostics/labels (6.2, 6.4) and representation/supervision changes
+> (6.6, 6.7). Reanalysis (6.8) remains conditional on retaining restartable
+> public states and having a genuinely stronger labeler.
+
 ### 6.1 Gumbel sequential halving
 
 Porting the 7WD implementation is attractive because the machinery already
@@ -1343,8 +1395,9 @@ Gumbel and pick-stratified Gumbel at equal NN evaluations. Use completed-Q
 policy targets; a deterministic advisor should not execute a random
 Gumbel-perturbed winner.
 
-This is priority three, after the two primary workstreams have executable
-pilots.
+Keep this behind the placement/supervision and BGA-restart pilots. Its strongest
+case remains low-budget policy improvement, which is a different hypothesis
+from the closed progressive-chance treatment.
 
 ### 6.2 Deck=8 exact solving
 
@@ -1482,22 +1535,133 @@ action gap as if either were a playing-strength ceiling.
 
 ### 6.4 Placement headroom audit
 
-A beam search over a fixed ordered sequence of claimed dominoes can measure
-placement score headroom, but it does not by itself produce a training target
-that controls future draft uncertainty. Keep it as a diagnostic and compare
-model versus high-Elo human gaps. Do not place it ahead of the two primary
-workstreams.
+A beam search over a fixed ordered sequence of claimed dominoes measures
+placement score headroom: replay the player's dominoes in arrival order,
+beam-search the best legal placements, gap = optimum minus actual.
 
-### 6.5 Capacity and distributional value
+**The clairvoyance caveat, stated precisely (2026-08-12).** The beam optimum
+places domino 5 already knowing domino 17 is coming; the real player did not.
+The absolute gap is therefore Jensen-inflated: max-over-placements given a
+*known* future is always at least the best any non-clairvoyant policy achieves
+in expectation. An absolute gap conflates "points lost to bad placement" with
+"points lost to not being psychic." Three design consequences:
+
+1. **Use it as a relative instrument.** Run the identical clairvoyant audit on
+   the top-30 BGA humans (moves reconstruct from consecutive-state deltas).
+   Model and humans are penalized by the same hindsight inflation, so the
+   *difference* in gaps is a fair skill comparison. Model gap ≤ human gap →
+   placement is not the relative weakness; direction closed cheaply. Model gap
+   > human gap → headroom quantified in points.
+2. **Aggregate per-decision regret across many games.** The realized future is
+   a fair random draw of the futures that could have occurred (deck order is
+   independent of placement choices), so averaged hindsight regret locates
+   *where* the loss lives — round, board shape, forced-discard patterns — even
+   though each single gap is inflated. The bias sits in the max step, not in
+   which future was sampled.
+3. **A non-clairvoyant absolute number is computable where the gap
+   concentrates.** The hidden deck's contents are public (only the order is
+   unknown — the chance supports were exactly C(8,4), C(12,4), ...), so
+   expectation-optimal placement is a well-defined expectimax over orderings:
+   exact for the last 2-4 dominoes, sampled-ordering beam completions
+   mid-game. Escalate to this only on the region the cheap hindsight audit
+   flags.
+
+**Do not use hindsight-optimal placements directly as policy labels** without
+first measuring the clairvoyance bias — a placement optimal under the realized
+future can be bad in expectation. The audit is a diagnostic and a
+network-independent arbiter first (methodological rule 6); label generation is
+a separate, separately-gated step, and the expectation-audit variant in (3) is
+the label-safe form if it comes to that.
+
+Deliverables: per-game gap distributions for model and human cohorts, and a
+per-decision regret heatmap. Pure CPU, seconds per game. The high-sim Gate 0
+found no useful progressive-teacher advantage, so this is now the next active
+diagnostic rather than background work.
+
+### 6.5 Capacity
 
 Do not run a larger-capacity background arm on the current buffer: the recorded
 80x6/96x6/80x10 bake-off already closed it. Revisit capacity only after the new
-search or BGA curriculum demonstrably changes the buffer, and make that a fresh
-controlled bake-off.
+search, BGA curriculum, or the supervision changes in 6.6/6.7 demonstrably
+change the buffer or the loss surface, and make that a fresh controlled
+bake-off.
 
-A distributional score/outcome head remains credible for representing
-stochastic returns, but the mean is sufficient for risk-neutral optimal play;
-it is not a substitute for correct chance topology or better state coverage.
+### 6.6 Distributional score-margin head
+
+*(Expanded 2026-08-12.)* Replace/augment the scalar value with a head that
+outputs a probability distribution over the final score margin: a softmax over
+binned margins (for example 2-point bins spanning roughly ±60), trained by
+cross-entropy against the realized bin, with win probability read off as
+P(margin > 0) under the official tiebreak.
+
+Why the distribution earns its place even for risk-neutral play:
+
+- **Representation.** The distributional-RL result (C51/QR-DQN) is that
+  predicting the return distribution learns better features and more stable
+  values even when only the mean drives decisions.
+- **It distinguishes "safely +4" from "coin-flip averaging +4"** — exactly the
+  confusion a scalar head cannot express in a high-variance game, and the
+  quantity the paired-seat variance study (6.3) says matters here.
+- **It subsumes the hand-tuned margin blend.** `margin_gain`/`alpha` hard-code
+  a margin-to-value relationship; the head learns it, and its calibration
+  against realized margins is a network-independent health check
+  (methodological rule 6).
+- **Risk-sensitive play becomes available but is not required.** Phase 1
+  integration backs up scalar P(win) derived from the head — search code
+  unchanged. Tail-aware backup (trailing late → prefer fat right tails) is a
+  separate, separately-gated later experiment.
+
+The earlier caveat stands: the mean is sufficient for risk-neutral optimal
+play, and this head is not a substitute for correct chance topology or better
+state coverage. It is a supervision-quality lever, but the first strength arm
+must remain separate from 6.7 so any gain is attributable.
+
+### 6.7 Auxiliary own-board heads (KataGo-style)
+
+*(Added 2026-08-12.)* Add small heads on the existing trunk supervised by
+quantities known exactly at game end: per-cell final own-board state (covered
+or not, terrain, crowns — a 1x1 conv head), plus final own score and its
+region decomposition. Loss becomes `policy + value + small-lambda * aux`.
+
+This is not "more data"; it is more supervised signal per existing position,
+plus representation shaping:
+
+- **Denser, cleaner gradient.** Each position currently contributes one policy
+  target and one outcome-contaminated scalar. Per-cell ownership adds dozens
+  of targets per position, and the own final board is nearly luck-free
+  relative to win/loss (disjoint boards — the opponent cannot touch it). Same
+  buffer, more learnable signal: a direct counter to the run5 data-exhaustion
+  verdict.
+- **Representation shaping where the weakness is.** Predicting the final board
+  forces the trunk to model region growth, connectivity, dead holes, and the
+  5x5 stranding constraint — the geometry behind the 42% prior/searched-best
+  placement alignment. Policy and value heads read the improved features for
+  free. This is the mechanism behind KataGo's ownership/score auxiliary
+  targets, among the largest sample-efficiency wins in that project.
+- **Free diagnostics.** Render the predicted final board at any position to
+  see the net's plan; drop the head at inference at zero cost.
+
+All targets are ground truth observations, not proxy-arbiter labels (rule 6).
+Run 6.7 first as its own gated training change with a matched continuation
+control and the paired `LCB > 50%` gate. Test a 6.6+6.7 combination only after
+each component has independent positive evidence.
+
+### 6.8 Reanalyze: refresh targets on the existing buffer
+
+*(Added 2026-08-12.)* MuZero-style reanalyze: re-search stored buffer
+positions with the current net and rewrite their policy/value targets, rather
+than generating new games. Pick-group visit floors are already sanctioned as
+low-sim label-generation machinery (Section 7), and the exact solver applies
+wherever its frontier reaches. This attacks label quality instead of data
+mass — the correct axis when new-position generation (BGA mass, more
+self-play) is the bottleneck.
+
+Honest caveat: the flat sims curve and the Gate-0 Arm A result both say
+more-search-alone produces weak label improvements here. The strong version of
+reanalyze therefore pairs it with network-independent labelers — exact deck<=8
+values where computable (6.2) and, if the placement audit finds headroom, the
+expectation-audit placement values (6.4 item 3) — rather than relying on
+deeper MCTS. Gate any reanalyzed-buffer training run like any other treatment.
 
 ## 7. Levers not to revisit without new evidence
 
@@ -1554,67 +1718,41 @@ it is not a substitute for correct chance topology or better state coverage.
 
 ## 9. Execution order
 
-1. Lock the 7WD-style paired `LCB > 50%` promotion procedure and run the
-   paired-seat variance curve early enough to forecast later gate costs. Treat
-   BGA rank as external validation, not a development-loop Elo target.
-2. **Completed 2026-08-07:** measured terminal tie frequency and fixed official
-   tiebreak consistency in Python, Rust, exact solving and batched evaluation.
-3. **Completed through A1b, 2026-08-09:** A-1 found contingency headroom; A0
-   locked the information/probability invariants; A1 built the one-reveal Rust
-   topology; and the reviewed GPU probe found balanced-routing signal without a
-   reference-stable static-`X` winner. Do not rerun the same five-root matrix as
-   if more seeds created more strategic evidence.
-4. **A2a completed 2026-08-09: inconclusive, negative point estimate.** The
-   frozen `X=1` Hájek/balanced treatment scored 46.48% paired points versus
-   `X=0`, with a 95% interval of 40.47%-52.60%. Do not add games adaptively.
-   This does not support the existing lazy one-reveal treatment, while leaving
-   A1c's distinct initialization hypothesis unresolved.
-5. **Deck-8 boundary oracle and fixed eight-position A1c screen completed
-   2026-08-09: valid but inconclusive.** Exact position-11 root solving is millions of tails
-   and is not the laptop oracle. Boundary oracles show `X=1` is light,
-   `X=4`-`X=8` captures most exact-tail sampling benefit, matched IID is at least
-   competitive with balance, and the existing lazy treatment does not improve
-   oracle decisions. Review this slice, then specify and implement A1c. It starts
-   in sampled mode, atomically
-   initializes its first balanced cycle only after `N_init`, caps initialization
-   at 25% of NN work, then widens in whole balanced cycles. Wave-safe advisor
-   admission, `leaf_batch=8` and matched total-NN-work stopping/accounting are
-   complete. The fresh 513-row schema-v5 smoke passed accounting and node
-   reconciliation. The sealed 384-search screen found small `X=4` point-estimate
-   gains, but all target improvement came from one of eight positions; `X=8`
-   regressed. Preserve
-   incumbent and lazy sampled/Hájek paths as ablations. Neither the deck>=12 stronger-
-   search screen nor A2a alone is an A1c target-quality gate.
-6. **Corpus scaffold complete; collection and sealing remain.** The current
-   inventory has 50 ordinary self-play positions and deliberately assigns none
-   to a split. Collect the missing bag-size and strategic-source strata, then
-   freeze the 120-position tuning and 120-position confirmation split before
-   any schedule tuning. Do not optimize batching, exercise `BatchedMCTS`, open
-   confirmation or launch a global `X=8` sweep on the current evidence.
-7. Start B0 passive collection from advisor-logged games and add the versioned
-   Rust start-from-public-state path. Run reconstruction, redeterminization and
-   legal-completion tests; the first training comparison is 0% versus 5% BGA
-   restarts. Seek written permission before any replay corpus automation.
-8. Freeze A1c schedules, open the untouched confirmation set, and run A2b through
-   the asymmetric `BatchedMCTS` harness at matched NN work, plus the wall-time-
-   matched incumbent control. Preserve separate training-budget and advisor-
-   budget verdicts; only deck=8 oracle evidence and paired game outcomes are
-   gates, while deck>=12 reference regret remains diagnostic.
-9. Request final logic/throughput review. Only after the architecture, oracle,
-   laptop smokes, `BatchedMCTS` integration and batch/memory curve pass should an
-   RTX 5090 cloud box be rented.
-10. Resume `current_best` 80x6 for controlled challenger training. First isolate
-    chance-correct targets and the small BGA restart curriculum; do not use a
-    larger net or revive the Q head. Gate the challenger against the incumbent
-    under the same new search, then gate the complete new system against the
-    currently deployed system, both with paired decks/seats and `LCB > 50%`.
-11. Combine BGA restarts with chance-correct targets only if each component has
-    independent positive evidence. Port pick-stratified Gumbel next; reconsider
-    capacity only after a promoted treatment materially changes the buffer.
+1. **Completed:** official-outcome consistency, paired evaluation, the chance
+   topology/progressive implementation, and both fixed-network Gate-0 budgets.
+   Archive the chance artifacts and retain the code as an ablation; do not run
+   another chance-aware training cycle from the current treatment.
+2. Run the placement-headroom audit in 6.4 as the next cheap diagnostic. Compare
+   model and strong-human cohorts with matched or stratified states and future
+   tile sequences, report game-clustered uncertainty, and use it to decide
+   whether board-geometry supervision deserves a training build.
+3. In parallel with passive BGA collection, specify a replay contract that can
+   retain packed terminal-board targets and a versioned restartable public
+   state. Existing saved examples contain final scores/outcomes but cannot
+   reconstruct terminal boards or safely restart search for reanalysis.
+4. If placement headroom is positive, build and gate the own-board auxiliary
+   treatment independently against a matched continuation-training control.
+   Do not initially combine it with distributional margin, BGA restarts, a
+   changed fast-move budget or another search treatment.
+5. Run distributional margin as a separate arm. It can use existing final-score
+   labels, but it should initially augment rather than replace the existing win
+   and score heads; official score-tie outcomes are not recoverable from margin
+   bins alone.
+6. Start B0 passive collection and the versioned Rust start-from-public-state
+   path. After reconstruction, redeterminization and legal-completion tests,
+   run the frozen 0% versus 5% BGA-restart comparison independently. Seek
+   written permission before any replay-corpus automation.
+7. Defer reanalysis until replay examples retain authoritative public states
+   and a stronger search or network-independent oracle exists. Preserve actual
+   terminal outcome/score labels; refresh policy targets rather than replacing
+   ground truth with the current network's own value estimate.
+8. Port pick-stratified Gumbel only after the primary pilots. Reconsider model
+   capacity only after a promoted treatment materially changes the data or loss
+   surface.
 
-The combined treatment is not allowed to rescue two individually negative
-components. Each primary workstream must first pass its own selection and
-non-regression gates.
+No combined treatment may rescue individually negative components. Every
+training change needs a matched continuation-training control and its own
+paired-strength gate before combinations are considered.
 
 ## 10. Reference numbers
 
