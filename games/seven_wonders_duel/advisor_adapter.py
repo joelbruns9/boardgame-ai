@@ -18,8 +18,11 @@ Protocol and swaps only the codec.
 
 from __future__ import annotations
 
+import copy
+import dataclasses
 import hashlib
 import json
+import math
 import random
 from dataclasses import dataclass
 from typing import Any
@@ -27,8 +30,9 @@ from typing import Any
 from games.advisor import ActionStats, ActionView, EngineSpec, SearchSnapshot
 
 from .codec import decode_action, legal_action_indices, pending_choice_name
+from .data import CARD_IDS
 from .engine import Action, ActionUse, apply_action
-from .game import GameState, Phase, new_game
+from .game import COVERING_SLOT_IDS, GameState, Phase, new_game
 from .search import GumbelMCTS, SearchConfig, state_actor
 
 
@@ -43,6 +47,18 @@ class _Position:
     first_player: int = 0
     prefix: tuple[int, ...] = ()
     key: str | None = None
+    #: Tableau slots the capture shows uncovered but still FACE DOWN. BGA flips
+    #: cards uncovered during a move only when the next player's turn starts
+    #: (`Draftpool::revealCards()` in `NextPlayerTurnTrait`), so a capture taken
+    #: at a mid-move choice -- a science-pair token, Zeus or Circus Maximus
+    #: destroying, the Mausoleum, the Great Library -- has them unknown. Our
+    #: engine reveals on the take, so a determinized board carries a GUESS
+    #: there as if it were a revealed card.
+    unflipped_slots: tuple[tuple[int, int], ...] = ()
+    #: One board per guess when `unflipped_slots` is non-empty, `game` first.
+    #: Searched separately and merged, so the advice is the expectation over
+    #: what those cards may be rather than a bet on one guess.
+    worlds: tuple[GameState, ...] = ()
 
 
 def _replay(seed: int, first_player: int, prefix: tuple[int, ...]) -> GameState:
@@ -362,6 +378,250 @@ def outlook_source_for(evaluator) -> str:
     return "flat"
 
 
+#: Boards searched when a capture has unflipped uncovered cards: at least this
+#: many, and more when the unseen pool needs them for every candidate card to
+#: appear in an unflipped slot at least once, up to the cap. Each board gets an
+#: equal share of the simulation budget.
+ADVISOR_REVEAL_WORLDS = 8
+ADVISOR_REVEAL_WORLDS_MAX = 16
+
+
+def _is_guild_back(back) -> bool:
+    return str(getattr(back, "value", back)).lower() == "guild"
+
+
+def _hidden_locations(board: GameState, backs: dict, unflipped, guild: bool):
+    """Every place a card of one back family can be hidden on ``board``.
+
+    Face-down tableau slots, the unflipped slots, and the out-of-play remainder
+    for that family -- the Age's removed cards, or the unused guilds.
+    """
+
+    locations = [
+        ("slot", slot)
+        for slot, card in board.tableau.cards.items()
+        if card.present
+        and (not card.revealed or slot in unflipped)
+        and _is_guild_back(backs.get(slot)) == guild
+    ]
+    if guild:
+        locations += [("unused_guild", i) for i in range(len(board.unused_guilds))]
+    else:
+        locations += [
+            ("removed", i) for i in range(len(board.removed_age_cards.get(board.age, ())))
+        ]
+    return locations
+
+
+def _name_at(board: GameState, location) -> str:
+    kind, where = location
+    if kind == "slot":
+        return board.tableau.cards[where].card_name
+    if kind == "unused_guild":
+        return board.unused_guilds[where]
+    return board.removed_age_cards[board.age][where]
+
+
+def _set_name(board: GameState, location, name: str) -> None:
+    kind, where = location
+    if kind == "slot":
+        old = board.tableau.cards[where].card_name
+        board.tableau.cards[where].card_name = name
+        if _is_guild_name(old) and old in board.selected_guilds:
+            board.selected_guilds = tuple(name if g == old else g for g in board.selected_guilds)
+    elif kind == "unused_guild":
+        guilds = list(board.unused_guilds)
+        guilds[where] = name
+        board.unused_guilds = tuple(guilds)
+    else:
+        removed = list(board.removed_age_cards[board.age])
+        removed[where] = name
+        board.removed_age_cards[board.age] = tuple(removed)
+
+
+def _is_guild_name(name: str) -> bool:
+    return name.endswith("Guild")
+
+
+def stratified_reveal_worlds(
+    boards, unflipped, observation: dict[str, Any], seed: int
+) -> list[GameState]:
+    """Rewrite the unflipped slots so the boards cover the unseen pool evenly.
+
+    Independent random fills put one decisive card -- ZeusAI's science pair, in
+    the case that found this -- on half of eight boards when it belongs on about
+    one in five. Here the candidates are dealt round-robin from one shuffled
+    order: board ``k`` takes the next cards for its unflipped slots, so every
+    candidate appears about equally often. Each rewrite is a SWAP with wherever
+    that card was hidden on the board, which keeps every board a valid deal.
+    """
+
+    backs = {tuple(card["slot_id"]): card.get("back") for card in observation.get("tableau") or ()}
+    rng = random.Random(seed)
+    for guild in (False, True):
+        slots = [slot for slot in unflipped if _is_guild_back(backs.get(slot)) == guild]
+        if not slots:
+            continue
+        pool = sorted(
+            {_name_at(boards[0], loc) for loc in _hidden_locations(boards[0], backs, unflipped, guild)},
+            key=CARD_IDS.__getitem__,
+        )
+        rng.shuffle(pool)
+        for index, board in enumerate(boards):
+            for offset, slot in enumerate(slots):
+                wanted = pool[(index * len(slots) + offset) % len(pool)]
+                here = ("slot", slot)
+                current = _name_at(board, here)
+                if current == wanted:
+                    continue
+                there = next(
+                    loc
+                    for loc in _hidden_locations(board, backs, unflipped, guild)
+                    if _name_at(board, loc) == wanted
+                )
+                _set_name(board, there, current)
+                _set_name(board, here, wanted)
+    return list(boards)
+
+
+def reveal_world_count(pool_size: int, unflipped: int) -> int:
+    if unflipped <= 0:
+        return 1
+    needed = math.ceil(pool_size / unflipped)
+    return max(ADVISOR_REVEAL_WORLDS, min(ADVISOR_REVEAL_WORLDS_MAX, needed))
+
+
+def unflipped_uncovered_slots(observation: dict[str, Any]) -> tuple[tuple[int, int], ...]:
+    """Slots a scraped observation shows present, face down and uncovered.
+
+    Never true of a position BGA has finished updating: it flips every uncovered
+    card when a turn starts. Only a mid-move capture has them.
+    """
+
+    covering = COVERING_SLOT_IDS.get(int(observation.get("age") or 0))
+    if not covering:
+        return ()
+    cards = {tuple(card["slot_id"]): card for card in observation.get("tableau") or ()}
+    unflipped = []
+    for slot, card in cards.items():
+        if not card.get("present") or card.get("revealed"):
+            continue
+        coverers = covering.get(slot)
+        if coverers is None:
+            continue
+        if all(not cards.get(tuple(c), {}).get("present", False) for c in coverers):
+            unflipped.append(slot)
+    return tuple(sorted(unflipped))
+
+
+def _world_request(req, index: int, worlds: int):
+    """The request for one board: its own seed and an equal budget share."""
+
+    changes = {
+        "seed": int(req.seed) + index,
+        "max_sims": max(1, math.ceil(int(req.max_sims) / worlds)),
+        "options": {
+            **dict(req.options),
+            "arena_budget_mb": max(
+                1,
+                int(req.options.get("arena_budget_mb", DEFAULT_ARENA_BUDGET_MB)) // worlds,
+            ),
+        },
+    }
+    if dataclasses.is_dataclass(req) and not isinstance(req, type):
+        return dataclasses.replace(req, **changes)
+    clone = copy.copy(req)
+    for name, value in changes.items():
+        setattr(clone, name, value)
+    return clone
+
+
+def _mean(values):
+    values = list(values)
+    return sum(values) / len(values) if values else 0.0
+
+
+class _MergedWorldsHandle:
+    """One search over several boards that differ only in unknown cards.
+
+    Each board is searched on its own and the snapshots are merged with EQUAL
+    weight per board, since each guess is equally likely. For the choice at the
+    root this is exact in expectation: the cards are flipped after the choice
+    and the choice cannot change what they are.
+
+    Per move: visits are summed (the ranking key), Q and the outlook are the
+    mean over the boards that searched the move. A move's outlook is shown only
+    if every such board produced one, so a merged forecast never rests on some
+    of the boards.
+    """
+
+    def __init__(self, handles, target: int):
+        self._handles = list(handles)
+        self._target = int(target)
+
+    def advance(self, chunk_sims: int, stop_event) -> SearchSnapshot:
+        share = max(1, math.ceil(int(chunk_sims) / len(self._handles)))
+        return merge_world_snapshots(
+            [handle.advance(share, stop_event) for handle in self._handles],
+            self._target,
+        )
+
+    def close(self) -> None:
+        for handle in self._handles:
+            handle.close()
+
+
+def merge_world_snapshots(snapshots, target: int) -> SearchSnapshot:
+    entries = {}
+    for action_id in snapshots[0].entries:
+        per_world = [snap.entries[action_id] for snap in snapshots if action_id in snap.entries]
+        searched = [stats for stats in per_world if stats.visits > 0]
+        outlooks = [stats.outlook for stats in searched]
+        outlook = None
+        if searched and all(o is not None for o in outlooks):
+            outlook = {key: _mean(o[key] for o in outlooks) for key in outlooks[0]}
+        leader = max(per_world, key=lambda stats: stats.visits)
+        entries[action_id] = ActionStats(
+            visits=sum(stats.visits for stats in per_world),
+            q_value=_mean(stats.q_value for stats in searched),
+            prior=_mean(stats.prior for stats in per_world),
+            follow_up=leader.follow_up,
+            outlook=outlook,
+        )
+    root_outlooks = [snap.root_outlook for snap in snapshots]
+    root_outlook = None
+    if all(o is not None for o in root_outlooks):
+        root_outlook = {key: _mean(o[key] for o in root_outlooks) for key in root_outlooks[0]}
+    return SearchSnapshot(
+        sims_done=sum(snap.sims_done for snap in snapshots),
+        sims_target=target,
+        root_value=_mean(snap.root_value for snap in snapshots),
+        entries=entries,
+        partial=any(snap.partial for snap in snapshots),
+        root_outlook=root_outlook,
+        stop_reason=next((snap.stop_reason for snap in snapshots if snap.stop_reason), None),
+    )
+
+
+def _average_outlooks(outlooks):
+    """Element-wise mean of nested outlook dicts; non-numbers from the first."""
+
+    first = outlooks[0]
+    if isinstance(first, bool) or first is None or isinstance(first, str):
+        return first
+    if isinstance(first, (int, float)):
+        return _mean(float(o) for o in outlooks)
+    if isinstance(first, list):
+        return [_average_outlooks([o[i] for o in outlooks]) for i in range(len(first))]
+    if isinstance(first, dict):
+        return {
+            key: _average_outlooks([o[key] for o in outlooks])
+            for key in first
+            if all(isinstance(o, dict) and key in o for o in outlooks)
+        }
+    return first
+
+
 class _RustClosedHandle:
     """SearchHandle over the Rust resumable PUCT tree.
 
@@ -540,18 +800,50 @@ class SevenWondersAdvisor:
             from .advisor_scrape import determinize_observation, observation_from_wire
 
             obs = observation_from_wire(payload["observation"])
-            rng = random.Random(int(payload.get("resample_seed", 0)))
+            resample_seed = int(payload.get("resample_seed", 0))
+            burial_ages = tuple(int(a) for a in payload.get("unknown_burial_ages", ()))
             game = determinize_observation(
-                obs,
-                rng,
-                unknown_burial_ages=tuple(
-                    int(a) for a in payload.get("unknown_burial_ages", ())
-                ),
+                obs, random.Random(resample_seed), unknown_burial_ages=burial_ages
             )
             digest = hashlib.sha256(
                 json.dumps(payload["observation"], sort_keys=True, default=str).encode()
             ).hexdigest()[:16]
-            return _Position(game=game, first_player=game.first_player, key=f"obs:{digest}")
+            unflipped = unflipped_uncovered_slots(payload["observation"])
+            worlds: tuple[GameState, ...] = ()
+            if unflipped:
+                backs = {
+                    tuple(card["slot_id"]): card.get("back")
+                    for card in payload["observation"].get("tableau") or ()
+                }
+                pool_size = max(
+                    len(_hidden_locations(game, backs, unflipped, guild))
+                    for guild in (False, True)
+                )
+                count = reveal_world_count(pool_size, len(unflipped))
+                boards = [game] + [
+                    determinize_observation(
+                        obs,
+                        random.Random(resample_seed + 1_000_003 * index),
+                        unknown_burial_ages=burial_ages,
+                    )
+                    for index in range(1, count)
+                ]
+                boards = stratified_reveal_worlds(
+                    boards, unflipped, payload["observation"], resample_seed
+                )
+                # The guessed cards are not yet anyone's to take, so every board
+                # must offer the same choice. One that does not is not the
+                # position that was captured.
+                legal = legal_action_indices(boards[0])
+                worlds = tuple(b for b in boards if legal_action_indices(b) == legal)
+                game = worlds[0]
+            return _Position(
+                game=game,
+                first_player=game.first_player,
+                key=f"obs:{digest}",
+                unflipped_slots=unflipped,
+                worlds=worlds,
+            )
         seed = int(payload["seed"])
         first_player = int(payload.get("first_player", 0))
         prefix = tuple(int(i) for i in payload.get("prefix", []))
@@ -598,6 +890,10 @@ class SevenWondersAdvisor:
                 for v in self.action_views(state)
             ],
             "victory_outlook": self._victory_outlook(state),
+            # Mid-move capture with cards BGA has not flipped yet: the advice is
+            # averaged over this many guesses at them.
+            "unflipped_cards": len(state.unflipped_slots),
+            "reveal_worlds": len(state.worlds),
         }
 
     # Class order matches `dataset._joint7_class`: my civ/sci/mil, then the
@@ -643,6 +939,14 @@ class SevenWondersAdvisor:
         confident-looking noise. Showing nothing beats showing that. A
         checkpoint trained under the corrected ordering can drop this branch.
         """
+        if len(state.worlds) > 1:
+            per_world = [
+                self._victory_outlook(_Position(game=world, first_player=world.first_player))
+                for world in state.worlds
+            ]
+            if any(outlook is None for outlook in per_world):
+                return None
+            return _average_outlooks(per_world)
         game = state.game
         if game.phase is Phase.COMPLETE:
             return None
@@ -804,6 +1108,19 @@ class SevenWondersAdvisor:
         )
 
     def open_search(self, state: _Position, req):
+        worlds = state.worlds[: max(1, int(req.options.get("reveal_worlds", ADVISOR_REVEAL_WORLDS)))]
+        if len(worlds) > 1:
+            handles = [
+                self._open_one_search(
+                    _Position(game=world, first_player=world.first_player, key=state.key),
+                    _world_request(req, index, len(worlds)),
+                )
+                for index, world in enumerate(worlds)
+            ]
+            return _MergedWorldsHandle(handles, int(req.max_sims))
+        return self._open_one_search(state, req)
+
+    def _open_one_search(self, state: _Position, req):
         engine = "nn" if req.engine in ("auto", "nn") else req.engine
         if engine != "nn":
             raise ValueError(f"unknown engine {req.engine!r}")

@@ -254,6 +254,14 @@ class ExactEndgameAnnotator:
 
     def annotate(self, state, recommendations, req, *, deadline, stop_event):
         game = getattr(state, "game", state)
+        if getattr(state, "unflipped_slots", ()):
+            # A proof over one guess at cards BGA has not flipped yet would be a
+            # proof about a different position, and "guaranteed" would be false.
+            return self._status(
+                "skipped",
+                "unflipped_cards",
+                unflipped=len(state.unflipped_slots),
+            )
         if game.phase is not Phase.PLAY_AGE or game.age != 3:
             return self._status(
                 "ready",

@@ -170,7 +170,10 @@ def _scraped_state(adapter):
 def test_rust_is_the_default_searcher():
     _swr()
     adapter = _new_adapter()
-    handle = adapter.open_search(_scraped_state(adapter), _req())
+    # One board: this capture is mid-move with an unflipped card, which would
+    # otherwise be searched as several boards (see test_reveal_worlds.py). What
+    # is tested here is which searcher a single board gets.
+    handle = adapter.open_search(_scraped_state(adapter), _req(options={"reveal_worlds": 1}))
     try:
         assert type(handle).__name__ == "_RustClosedHandle"
     finally:
@@ -180,7 +183,7 @@ def test_rust_is_the_default_searcher():
 def test_python_searcher_still_selectable():
     adapter = _new_adapter()
     handle = adapter.open_search(
-        _scraped_state(adapter), _req(options={"search_impl": "python"})
+        _scraped_state(adapter), _req(options={"search_impl": "python", "reveal_worlds": 1})
     )
     try:
         assert type(handle).__name__ == "_ClosedHandle"
@@ -195,7 +198,8 @@ def test_explicit_force_expand_falls_back_to_python():
     _swr()
     adapter = _new_adapter()
     handle = adapter.open_search(
-        _scraped_state(adapter), _req(options={"force_expand_root_chance": True})
+        _scraped_state(adapter),
+        _req(options={"force_expand_root_chance": True, "reveal_worlds": 1}),
     )
     try:
         assert type(handle).__name__ == "_ClosedHandle"
