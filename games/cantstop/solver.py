@@ -19,7 +19,11 @@ the reachable configurations form a finite DAG ordered by total runner
 height; values are filled from the highest configurations down.
 
 One solve covers the whole remaining turn: every decision the turn can
-reach is answered from the same table.
+reach is answered from the same table. Solving from a state that has just
+rolled (AWAIT_MOVE) enumerates only what that roll's options can reach,
+not every roll the turn might have started with -- same answers for every
+decision from there on, much smaller table. Ties between moves go to the
+smallest resulting runner configuration.
 
 Evaluator contract: ``evaluate(states) -> ndarray (len(states), players)``.
 Each state is a board at the start of some player's turn (AWAIT_ROLL, no
@@ -121,7 +125,9 @@ class TurnSolver:
     """Solve the active player's turn from ``state``'s current runners.
 
     ``state`` may be in any in-turn phase. The saved board (progress, claims,
-    active player) is fixed for the whole turn.
+    active player) is fixed for the whole turn. In AWAIT_MOVE the table is
+    rooted at the rolled options, so ``state``'s own roll value is not
+    available, but every decision from ``state`` onwards is.
     """
 
     def __init__(self, state, evaluate):
@@ -132,6 +138,10 @@ class TurnSolver:
         self.active = state.active_player
         self.num_players = state.rules.num_players
         self.root = runners_key(state.runners)
+        if state.phase == Phase.AWAIT_MOVE:
+            self.roots = self._child_keys(self.root, state.dice)
+        else:
+            self.roots = [self.root]
         self.evaluator_calls = 0
         self._enumerate()
         self._evaluate_leaves(evaluate)
@@ -150,8 +160,8 @@ class TurnSolver:
         self.bust_prob = {}      # key -> prob
         self.stoppable = {}      # key -> bool
         self.winning = {}        # key -> bool (stoppable and stopping wins)
-        stack = [self.root]
-        seen = {self.root}
+        stack = list(self.roots)
+        seen = set(self.roots)
         while stack:
             key = stack.pop()
             runners = dict(key)
@@ -180,7 +190,7 @@ class TurnSolver:
                 if ck not in seen:
                     seen.add(ck)
                     stack.append(ck)
-            self.menus[key] = [(tuple(children[i] for i in idx), p)
+            self.menus[key] = [(tuple(sorted(children[i] for i in idx)), p)
                                for idx, p in move_menus]
             self.bust_prob[key] = bust_p
         self.keys = sorted(seen, key=lambda k: -sum(pos for _, pos in k))
@@ -243,34 +253,38 @@ class TurnSolver:
 
     def _key(self, state):
         key = runners_key(state.runners)
-        if key not in self.decision_values:
+        if state.phase != Phase.AWAIT_MOVE and key not in self.decision_values:
             raise KeyError(f"runners {key} not reachable from this solve")
         return key
+
+    def _child_keys(self, key, dice):
+        """Sorted distinct runner configurations the roll's moves lead to,
+        and the move reaching each (first in move order)."""
+        scratch = self.base.clone()
+        scratch.runners = dict(key)
+        saved = self.base.progress[self.active]
+        out = {}
+        for move in legal_moves(scratch, dice):
+            child = dict(key)
+            for col in move:
+                child[col] = child.get(col, saved[col]) + 1
+            out.setdefault(runners_key(child), move)
+        return sorted(out)
+
+    def best_child(self, key, dice):
+        children = self._child_keys(key, dice)
+        if not children:
+            raise ValueError("roll has no legal move")
+        return max(children, key=lambda c: self.decision_values[c][self.active])
 
     def value(self, state):
         """Per-seat win probabilities under best play from ``state``."""
         key = self._key(state)
         if state.phase == Phase.AWAIT_MOVE:
-            return self.decision_values[
-                self.best_child(key, state.dice)]
+            return self.decision_values[self.best_child(key, state.dice)]
         if state.phase == Phase.AWAIT_ROLL:
             return self.roll_values[key]
         return self.decision_values[key]
-
-    def best_child(self, key, dice):
-        scratch = self.base.clone()
-        scratch.runners = dict(key)
-        saved = self.base.progress[self.active]
-        best, best_v = None, -1.0
-        for move in legal_moves(scratch, dice):
-            child = dict(key)
-            for col in move:
-                child[col] = child.get(col, saved[col]) + 1
-            ck = runners_key(child)
-            v = self.decision_values[ck][self.active]
-            if v > best_v:
-                best, best_v = ck, v
-        return best
 
     def choose_move(self, state):
         """Best legal move for ``state`` (phase AWAIT_MOVE)."""

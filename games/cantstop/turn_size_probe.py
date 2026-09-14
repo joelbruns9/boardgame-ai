@@ -5,7 +5,8 @@ For each rule set, plays full games with the solver choosing every move
   positions   runner configurations the solve enumerated
   leaves      evaluator calls (end-of-turn boards) -- what a net would cost
   seconds     wall time of the Python solve
-split by runners already placed (0 = turn start, before the first roll).
+split by runners already placed (0 = turn start; with --root roll, the
+solve made right after the first roll).
 
 One solve covers the rest of the turn, so self-play pays the turn-start
 (runners 0) cost once per turn; the 1-3 rows show how fast the table
@@ -25,7 +26,7 @@ from .engine import (ALL_RULESETS, GameState, Phase, apply_move, random_dice,
 from .solver import ProgressHeuristic, TurnSolver
 
 
-def probe(rules, games, rng, evaluate):
+def probe(rules, games, rng, evaluate, root="turn"):
     """rows[runners placed] -> [(positions, leaves, secs, game fraction)]"""
     rows = defaultdict(list)
     turns_per_game = []
@@ -37,6 +38,11 @@ def probe(rules, games, rng, evaluate):
         measured = set()
         while not s.game_over:
             if s.phase == Phase.AWAIT_ROLL and not s.runners:
+                if root == "roll":
+                    turn += 1
+                    if not roll(s, random_dice(rng)):
+                        continue  # busted on the first roll: nothing to solve
+                    turn -= 1
                 t0 = time.perf_counter()
                 solver = TurnSolver(s, evaluate)
                 records.append((0, solver.num_positions,
@@ -73,6 +79,8 @@ def main():
     ap.add_argument("--games", type=int, default=2,
                     help="full games per rule set")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--root", choices=("turn", "roll"), default="turn",
+                    help="solve at turn start, or after the first roll")
     args = ap.parse_args()
     rng = random.Random(args.seed)
     evaluate = ProgressHeuristic()
@@ -82,7 +90,7 @@ def main():
           f"{'leaf p50':>9}{'sec p50':>9}{'sec p90':>9}{'sec max':>9}"
           f"{'sec 1st half':>13}{'sec 2nd half':>13}")
     for rules in ALL_RULESETS:
-        rows, turns = probe(rules, args.games, rng, evaluate)
+        rows, turns = probe(rules, args.games, rng, evaluate, args.root)
         name = (f"{rules.num_players}p to {rules.columns_to_win}"
                 f"{' block' if rules.blocking else ''}")
         print(f"{name}: turns per game {turns}", flush=True)

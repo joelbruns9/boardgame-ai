@@ -376,3 +376,27 @@ def test_solver_matches_brute_force_precap(rules):
         else:
             want, got = bf.roll(s.clone()), sol.value(s)
         np.testing.assert_allclose(got, want, atol=1e-9)
+
+
+@pytest.mark.parametrize("rules", [RuleSet.make(2), RuleSet.make(3, True, True),
+                                   RuleSet.make(4, blocking=True)], ids=repr)
+def test_rooting_at_the_roll_matches_full_turn_solve(rules):
+    """A solve started after the dice are rolled must give the same value
+    and the same decisions as the full turn-start solve, on a smaller table."""
+    rng = random.Random(4)
+    checked = 0
+    for s in synthetic_precap_positions(rules, rng, want=6, lo=200, hi=5000):
+        full = TurnSolver(s, HEUR)
+        for dice, _ in ROLL_CLASSES[::5]:
+            t = s.clone()
+            if not roll(t, dice):
+                continue
+            rooted = TurnSolver(t, HEUR)
+            assert rooted.num_positions <= full.num_positions
+            np.testing.assert_allclose(rooted.value(t), full.value(t), atol=1e-12)
+            assert rooted.choose_move(t) == full.choose_move(t)
+            apply_move(t, rooted.choose_move(t))
+            assert rooted.should_stop(t) == full.should_stop(t)
+            np.testing.assert_allclose(rooted.value(t), full.value(t), atol=1e-12)
+            checked += 1
+    assert checked > 10
