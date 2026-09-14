@@ -82,6 +82,10 @@ is a later option, not part of the baseline.
 
 ### Phase 0 — Rule-parameterized engine (Python)
 
+**Status: DONE (2026-09-14).** `engine.py` + `tests/test_engine.py`, 81 tests;
+mutation-checked (removing blocking, the runner cap, or claim-clears-markers
+each fails tests). Legacy pipeline removed in `053d612`.
+
 - `RuleSet(num_players, columns_to_win, blocking)`, with the variant table
   above as the only constructors. No module-level `COLUMNS_TO_WIN`.
 - Stop legality under blocking; a blocked position offers roll only.
