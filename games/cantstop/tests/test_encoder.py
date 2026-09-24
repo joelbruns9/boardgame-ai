@@ -14,7 +14,7 @@ from games.cantstop.engine import (
 )
 from games.cantstop.encoder import (
     FEATURE_SIZE, MAX_SEATS, NUM_COLUMNS, PER_SEAT, encode_batch,
-    encode_board, seat_order, to_absolute,
+    encode_board, seat_mask, seat_order, seat_to_slot, to_absolute,
 )
 
 
@@ -163,6 +163,31 @@ def test_seat_order_starts_at_the_player_to_move():
     s = fresh(num_players=3)
     s.active_player = 2
     assert seat_order(s) == [2, 0, 1]
+
+
+def test_seat_to_slot_inverts_seat_order():
+    """Training labels go through this: a winner's absolute seat becomes the
+    encoding slot the net is asked to predict. Getting it wrong mislabels
+    every row in a way self-consistent code cannot notice."""
+    for n in (2, 3, 4):
+        for active in range(n):
+            s = fresh(num_players=n, extended=False)
+            s.active_player = active
+            order = seat_order(s)
+            for seat in range(n):
+                assert order[seat_to_slot(s, seat)] == seat
+            assert seat_to_slot(s, active) == 0
+
+
+def test_seat_mask_reads_the_present_flag_not_a_neighbour():
+    """A live seat one column from winning still has columns-needed > 0, so a
+    mask read off the wrong index usually looks right. Pin the index with a
+    seat that needs nothing more: it is still present."""
+    s = fresh(num_players=2, extended=False)     # needs 3
+    for col in (2, 3, 4):
+        s.claimed_by[col] = s.active_player
+    mask = seat_mask(encode_board(s))
+    assert mask.tolist() == [[True, True, False, False]]
 
 
 def test_encoding_is_seat_relative():

@@ -108,6 +108,30 @@ def encode_board(state, out=None):
     return out
 
 
+def seat_present_index(slot):
+    """Index of the seat-present flag for an encoding slot."""
+    return slot * PER_SEAT + 2 * NUM_COLUMNS + 1
+
+
+def seat_mask(features):
+    """Live-seat mask (N, MAX_SEATS) read back out of encoded features.
+
+    The seat-present flags already say which slots are real, so the model can
+    derive its own softmax mask from its input alone -- no separate plumbing,
+    and no way for the mask to disagree with the features it masks.
+    """
+    features = np.asarray(features)
+    if features.ndim == 1:
+        features = features[None, :]
+    idx = [seat_present_index(s) for s in range(MAX_SEATS)]
+    return features[:, idx] > 0.0
+
+
+def seat_to_slot(state, seat):
+    """Absolute seat -> its slot in this state's encoding."""
+    return seat_order(state).index(seat)
+
+
 def encode_batch(states):
     """Encode many boards into one (N, FEATURE_SIZE) float32 array."""
     batch = np.zeros((len(states), FEATURE_SIZE), dtype=np.float32)
