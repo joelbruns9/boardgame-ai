@@ -135,6 +135,30 @@ pub struct Menu {
     pub groups: Vec<(Vec<usize>, f64)>,
 }
 
+impl Menu {
+    /// Heap bytes held, roughly (capacities, not allocator overhead).
+    pub fn approx_bytes(&self) -> usize {
+        std::mem::size_of::<Menu>()
+            + self.moves.capacity() * std::mem::size_of::<Move>()
+            + self.groups.capacity() * std::mem::size_of::<(Vec<usize>, f64)>()
+            + self.groups.iter().map(|(v, _)| v.capacity() * 8).sum::<usize>()
+    }
+}
+
+/// Process-wide counters over every thread's cache: menus built and their
+/// approximate bytes. Diagnostics for cache growth (review item 10).
+pub static MENUS_BUILT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static MENU_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Per-thread cache entry limit; a thread's cache is cleared when a miss
+/// would exceed it. 0 = unbounded.
+///
+/// Measured (review item 10, 320 all-variant games, 64 in flight, GPU):
+/// the cache hits 98.4% of lookups and without it self-play is 6.6x slower
+/// (264 s vs 40 s), but unbounded it grows with every game a pool plays --
+/// 1.5M menus (~1 KB each) across the worker threads, 3.27 GB peak RSS.
+/// A 20k cap was as fast (40.0 s) at 2.00 GB peak; 2k cost 32%.
+pub static MENU_CACHE_CAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(20_000);
+
 type Signature = [u8; 11];
 
 /// `solver.column_signature`: the moves a roll offers depend on each column
@@ -290,10 +314,12 @@ pub enum SolveError {
 }
 
 thread_local! {
-    /// One menu cache per thread for the life of the process, as Python's
-    /// module-level `_MENU_CACHE`: a menu depends only on the column
-    /// signature, so it is valid across solves and games. Per thread rather
-    /// than shared so rayon workers never contend on it; each warms up once.
+    /// One menu cache per thread, as Python keeps its module-level
+    /// `_MENU_CACHE`: a menu depends only on the column signature, so it is
+    /// valid across solves and games. Per thread so rayon workers never
+    /// contend on it. Pool workers belong to a rayon pool created per
+    /// `run_pool`, so their caches die with it; within a pool each is capped
+    /// at `MENU_CACHE_CAP` entries.
     static MENU_CACHE: std::cell::RefCell<MenuCache> = std::cell::RefCell::new(MenuCache::default());
 }
 
@@ -395,10 +421,19 @@ impl TurnSolver {
                 continue;
             }
             let sig = column_signature(&scratch, &saved, &runners);
+            let cap = MENU_CACHE_CAP.load(std::sync::atomic::Ordering::Relaxed);
+            if cap != 0 && cache.menus.len() >= cap && !cache.menus.contains_key(&sig) {
+                cache.menus.clear();
+            }
             let menu = cache
                 .menus
                 .entry(sig)
-                .or_insert_with(|| Arc::new(build_menu(&scratch)))
+                .or_insert_with(|| {
+                    let m = build_menu(&scratch);
+                    MENUS_BUILT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    MENU_BYTES.fetch_add(m.approx_bytes(), std::sync::atomic::Ordering::Relaxed);
+                    Arc::new(m)
+                })
                 .clone();
             let start = self.kids.len() as u32;
             // Reserve the node's slots first: interning children below may

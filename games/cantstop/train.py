@@ -79,7 +79,7 @@ class ReplayBuffer:
 
 
 def generate(rule_sets, games_per_ruleset, evaluate, rng, backend="auto",
-             threads=0, stats=None):
+             threads=0, stats=None, in_flight=None):
     """Play the scheduled games and return every result.
 
     Each game rolls from its own ``PortableRng``, seeded up front in
@@ -95,8 +95,9 @@ def generate(rule_sets, games_per_ruleset, evaluate, rng, backend="auto",
     if backend == "auto":
         backend = "rust" if rust_pool.rust_available() else "python"
     if backend == "rust":
-        return rust_pool.generate(rule_sets, games_per_ruleset, evaluate,
-                                  rng, threads=threads, stats=stats)
+        return rust_pool.generate(
+            rule_sets, games_per_ruleset, evaluate, rng, threads=threads,
+            stats=stats, in_flight=in_flight or rust_pool.DEFAULT_IN_FLIGHT)
     if backend != "python":
         raise ValueError(f"unknown backend {backend!r}")
     schedule = [r for r in rule_sets for _ in range(games_per_ruleset)]
@@ -133,7 +134,7 @@ def train_steps(net, buffer, opt, steps, batch_size, device, rng):
 def run(out_dir, iterations, games, rule_sets=(MVP_RULES,), hidden=(256, 256),
         lr=1e-3, batch_size=256, steps=200, buffer_rows=20000,
         arena_games=60, seed=0, device=None, init_checkpoint=None,
-        backend="auto"):
+        backend="auto", threads=0, in_flight=None):
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     log_path = out / "run.jsonl"
@@ -162,7 +163,8 @@ def run(out_dir, iterations, games, rule_sets=(MVP_RULES,), hidden=(256, 256),
     for it in range(1, iterations + 1):
         started = time.time()
         evaluate = NetEvaluator(net, device=str(device))
-        results = generate(rule_sets, games, evaluate, rng, backend=backend)
+        results = generate(rule_sets, games, evaluate, rng, backend=backend,
+                           threads=threads, in_flight=in_flight)
         gen_seconds = time.time() - started
 
         x, y = stack_rows(results)
@@ -186,10 +188,10 @@ def run(out_dir, iterations, games, rule_sets=(MVP_RULES,), hidden=(256, 256),
             current = NetEvaluator(net, device=str(device))
             record["vs_random_init"] = compare(
                 rule_sets[0], current, baseline, arena_games, rng,
-                backend=backend)
+                backend=backend, threads=threads, in_flight=in_flight)
             record["vs_heuristic"] = compare(
                 rule_sets[0], current, ProgressHeuristic(), arena_games, rng,
-                backend=backend)
+                backend=backend, threads=threads, in_flight=in_flight)
 
         with log_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, default=str) + "\n")
@@ -220,6 +222,11 @@ def main(argv=None):
                    default="auto",
                    help="rust = the M3 pool (many games at once, batched "
                         "forwards); auto = rust when the extension is built")
+    p.add_argument("--threads", type=int, default=0,
+                   help="pool worker threads; 0 = one per logical core")
+    p.add_argument("--in-flight", type=int, default=None,
+                   help="games live at once in the pool (default 64; 128 "
+                        "measured slower on an 8 GB laptop GPU)")
     args = p.parse_args(argv)
 
     run(out_dir=args.out,
@@ -235,7 +242,9 @@ def main(argv=None):
         seed=args.seed,
         device=args.device,
         init_checkpoint=args.init_checkpoint,
-        backend=args.backend)
+        backend=args.backend,
+        threads=args.threads,
+        in_flight=args.in_flight)
 
 
 if __name__ == "__main__":

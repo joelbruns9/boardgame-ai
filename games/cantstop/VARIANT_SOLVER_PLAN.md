@@ -212,6 +212,8 @@ training run.
 
 ### Phase 3 — Rust port and multicore (moved ahead of the full run)
 
+External review brief for M0-M3: `PHASE3_RUST_PORT_REVIEW_REQUEST.md`.
+
 Read [[project_kingdomino_rust]] and [[welcome_to_rust_m1]] first. Crate at
 `games/cantstop/cantstop_rust`, pyo3 0.28, `maturin develop --release`.
 
@@ -362,6 +364,49 @@ batch crosses back.
   round is memory-bandwidth work. Next levers if ever needed: overlap Rust
   and the forward (two half-pools), or send compact leaves (runner keys +
   one template per game) and expand features on the GPU.
+
+**External review of M0-M3 (2026-09-24), outcome.** Brief:
+`PHASE3_RUST_PORT_REVIEW_REQUEST.md`. No soundness blocker; all four
+sign-offs given (GIL release in `pending`, `write_f32_le`, `Pool::resume`;
+per-game seeding without a compatibility flag; the three equivalent
+mutants; proceed to Phase 4 with 64 in flight, overlap and GPU expansion
+deferred). Both findings were reproduced as stated and fixed:
+- **[P2] `backend="auto"` broke plain callable evaluators** (AttributeError:
+  no `evaluate_features`). Fixed with `rust_pool.BoardEvaluator`, which wraps
+  any callable by decoding features back to boards. Decoding is exact, so
+  plain callables run on the pool and play the same games as the Python
+  backend. (The Python path reports `evaluator_rows = 0` for them, because it
+  reads an optional `rows` counter; the pool counts rows itself.)
+- **[P2] mismatched schedule inputs silently dropped games** (`zip`
+  truncation). `run_pool` now raises on unequal lengths and on a seating
+  that names a missing evaluator; the remaining zips are `strict=True`.
+
+Corrections accepted:
+- The third mutant proof was worded too broadly. It is replaced by an
+  exhaustive check of every (position, height) and (columns, 5) division.
+- **The menu cache does not live for the whole process.** Pool workers
+  belong to a rayon pool created per `run_pool`, so their caches die with
+  it; the M2 speed text above says otherwise and is wrong for the pool.
+- NumPy's short-row reduction order is an implementation detail;
+  `test_rust_rotation_is_to_absolute_bit_for_bit` stays in the suite as the
+  upgrade guard.
+
+**Measuring the reviewer's cache question found a real problem.** The
+original M2 "warm cache" speed-up re-solved the same 15 positions, so its
+hit rate was flattering. In real self-play (320 all-variant games, GPU):
+- the cache hits 98.4% of 94M lookups;
+- turning it off makes self-play **6.6x slower** (264 s vs 40 s);
+- but each worker thread builds its own copy, and the caches grow with
+  every game a pool plays: 1.5M menus (~1 KB each), **3.27 GB peak RSS**.
+  An earlier 640-game probe peaked at 4.8 GB, and the process did not
+  return that memory afterwards.
+
+Fix: a per-thread cap (`solver::MENU_CACHE_CAP`, default **20,000**,
+settable with `cantstop_rust.set_menu_cache_cap`). The cache is cleared when
+a miss would exceed the cap. 20k ran in the same time (40.0 s) at **2.00 GB
+peak**; 100k saved nothing; 2k cost 32%. `menu_cache_stats()` reports
+menus built. A test shows a cap of 50 plays exactly the same games.
+`train.py` also gains `--threads` and `--in-flight`.
 
 ### Phase 4 — Full training run, all variants (the original Phase 2 gate)
 

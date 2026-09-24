@@ -56,7 +56,7 @@ def player_of_seat(seat_of, seat):
 
 
 def play_match(rules, players, games, rng=None, max_turns=DEFAULT_MAX_TURNS,
-               backend="auto", threads=0):
+               backend="auto", threads=0, in_flight=None):
     """Play ``games`` games between ``players`` and count wins per player.
 
     ``players`` must have exactly ``rules.num_players`` entries. Game *i*
@@ -77,8 +77,9 @@ def play_match(rules, players, games, rng=None, max_turns=DEFAULT_MAX_TURNS,
     if backend == "auto":
         backend = "rust" if rust_pool.rust_available() else "python"
     if backend == "rust":
-        return rust_pool.play_match(rules, players, games, rng,
-                                    max_turns=max_turns, threads=threads)
+        return rust_pool.play_match(
+            rules, players, games, rng, max_turns=max_turns, threads=threads,
+            in_flight=in_flight or rust_pool.DEFAULT_IN_FLIGHT)
     if backend != "python":
         raise ValueError(f"unknown backend {backend!r}")
     seeds = rust_pool.game_seeds(rng, games)
@@ -140,7 +141,8 @@ def verdict(wins, num_players, player=0):
 
 
 def compare(rules, challenger, incumbent, games, rng=None,
-            max_turns=DEFAULT_MAX_TURNS, backend="auto"):
+            max_turns=DEFAULT_MAX_TURNS, backend="auto", threads=0,
+            in_flight=None):
     """Match one challenger against copies of one incumbent.
 
     Returns the challenger's win rate, its Wilson interval, and the raw wins.
@@ -149,5 +151,6 @@ def compare(rules, challenger, incumbent, games, rng=None,
     """
     n = rules.num_players
     players = [challenger] + [incumbent] * (n - 1)
-    wins = play_match(rules, players, games, rng, max_turns, backend)
+    wins = play_match(rules, players, games, rng, max_turns, backend,
+                      threads, in_flight)
     return verdict(wins, n)

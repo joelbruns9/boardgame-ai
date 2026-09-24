@@ -116,6 +116,32 @@ def relative_for(evaluators, features, blocks):
     return out.tobytes()
 
 
+class BoardEvaluator:
+    """Adapter: any ``evaluate(boards)`` callable as a feature evaluator.
+
+    The pool hands out encoded features only. Decoding is exact
+    (``encoder.decode_features``; gated in ``test_rust_pool``), so the
+    wrapped callable sees the same end-of-turn boards the Python solver
+    would have given it. Added after review: ``backend="auto"`` used to pick
+    the pool for any evaluator and then fail on plain callables."""
+
+    def __init__(self, evaluate):
+        self.evaluate = evaluate
+
+    def evaluate_features(self, features, reference):
+        from .encoder import decode_features
+        return self.evaluate([decode_features(row, reference.active_player)
+                              for row in features])
+
+
+def as_feature_evaluator(evaluate):
+    if hasattr(evaluate, "evaluate_features"):
+        return evaluate
+    if not callable(evaluate):
+        raise TypeError(f"not an evaluator: {evaluate!r}")
+    return BoardEvaluator(evaluate)
+
+
 class PoolStats:
     """What a pool run cost: rounds (= forwards per evaluator), rows, and
     where the wall time went."""
@@ -151,8 +177,19 @@ def run_pool(rules_list, seeds, evaluators, seating=None,
     stats = stats if stats is not None else PoolStats()
     if seating is None:
         seating = [[0] * r.num_players for r in rules_list]
+    # A plain zip would silently truncate the schedule to its shortest
+    # input (found in review: two games with no seeds returned []).
+    if not len(rules_list) == len(seeds) == len(seating):
+        raise ValueError(
+            f"schedule lengths differ: {len(rules_list)} rule sets, "
+            f"{len(seeds)} seeds, {len(seating)} seatings")
+    evaluators = [as_feature_evaluator(e) for e in evaluators]
+    used = {i for seats in seating for i in seats}
+    if used and max(used) >= len(evaluators):
+        raise ValueError(f"seating uses evaluator {max(used)} but only "
+                         f"{len(evaluators)} were given")
     specs = [(snapshot(GameState(r)), s, list(seats))
-             for r, s, seats in zip(rules_list, seeds, seating)]
+             for r, s, seats in zip(rules_list, seeds, seating, strict=True)]
     batched = all(hasattr(e, "relative_probs") for e in evaluators)
     started = time.perf_counter()
     pool = rust.SelfPlayPool(specs, max_turns, threads, in_flight)
@@ -188,7 +225,7 @@ def run_pool(rules_list, seeds, evaluators, seating=None,
                                  dtype="<f4").reshape(-1, FEATURE_SIZE)
     results, at = [], 0
     for (gid, winner, rows, slots, turns, solves, ev_rows, lengths), rules \
-            in zip(pool.results(), rules_list):
+            in zip(pool.results(), rules_list, strict=True):
         feats = all_features[at:at + rows]
         at += rows
         results.append(GameResult(

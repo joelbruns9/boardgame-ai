@@ -695,6 +695,21 @@ impl PySelfPlayPool {
     }
 }
 
+/// `(menus built, approx bytes)` summed over every thread's menu cache since
+/// the process started (never decremented).
+#[pyfunction]
+fn menu_cache_stats() -> (usize, usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (solver::MENUS_BUILT.load(Relaxed), solver::MENU_BYTES.load(Relaxed))
+}
+
+/// Cap every thread's menu cache at `entries` (0 = unbounded; default
+/// 20,000 -- see `solver::MENU_CACHE_CAP` for the measurement).
+#[pyfunction]
+fn set_menu_cache_cap(entries: usize) {
+    solver::MENU_CACHE_CAP.store(entries, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[pymodule]
 fn cantstop_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRng>()?;
@@ -702,6 +717,8 @@ fn cantstop_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTurnSolver>()?;
     m.add_class::<PySelfPlayPool>()?;
     m.add_function(wrap_pyfunction!(encode_snapshots, m)?)?;
+    m.add_function(wrap_pyfunction!(menu_cache_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(set_menu_cache_cap, m)?)?;
     m.add("FEATURE_SIZE", encoder::FEATURE_SIZE)?;
     Ok(())
 }

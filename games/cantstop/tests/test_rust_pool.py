@@ -286,3 +286,72 @@ def test_arena_relative_path_regroups_two_nets():
     slow = play_match(rules, [AbsoluteOnly(a), AbsoluteOnly(b), AbsoluteOnly(b)],
                       3, PortableRng(2))
     assert fast == slow
+
+
+# ---- review findings (PHASE3_RUST_PORT_REVIEW_REQUEST.md) ----
+
+def test_plain_callable_evaluators_work_on_every_backend():
+    """Finding 1: auto picked the pool for any evaluator, then failed on
+    plain callables. They are now adapted (exact board decoding), and play
+    the same games as the Python backend."""
+    h = ProgressHeuristic()
+
+    def plain(boards):
+        return h(boards)
+
+    rules = RuleSet.make(2)
+    rs = train.generate([rules], 1, plain, PortableRng(3), backend="auto")
+    py = train.generate([rules], 1, plain, PortableRng(3), backend="python")
+    # play_game reads evaluator_rows from an optional ``rows`` counter on the
+    # evaluator, so a plain function reports 0 there; the pool counts rows
+    # itself. Everything else must match.
+    assert py[0].evaluator_rows == 0 and rs[0].evaluator_rows > 0
+    py[0].evaluator_rows = rs[0].evaluator_rows
+    compare_results(py[0], rs[0], "plain callable")
+    assert (arena.play_match(rules, [plain, h], 2, PortableRng(6))
+            == arena.play_match(rules, [plain, h], 2, PortableRng(6),
+                                backend="python"))
+
+
+@pytest.mark.parametrize("n_seeds, n_seating", [(0, 2), (1, 2), (3, 2),
+                                                (2, 1)])
+def test_mismatched_schedule_is_refused(n_seeds, n_seating):
+    """Finding 2: zip silently truncated the schedule."""
+    rules = [RuleSet.make(2)] * 2
+    with pytest.raises(ValueError, match="schedule lengths"):
+        run_pool(rules, seeds(n_seeds), [HashedMock()],
+                 seating=[[0, 0]] * n_seating)
+
+
+def test_seating_must_name_a_given_evaluator():
+    with pytest.raises(ValueError, match="evaluator 1"):
+        run_pool([RuleSet.make(2)], seeds(1), [HashedMock()],
+                 seating=[[0, 1]])
+
+
+def test_every_progress_division_rounds_the_same_in_f32_and_f64():
+    """The third 'equivalent mutant': the encoder divides in f64 and casts
+    to f32. Checked exhaustively over every (position, height) and
+    (columns, 5) pair it can see, rather than resting on a general
+    double-rounding argument."""
+    from games.cantstop.engine import COLUMN_HEIGHTS
+    pairs = [(p, h) for h in set(COLUMN_HEIGHTS.values())
+             for p in range(h + 1)]
+    pairs += [(k, 5) for k in range(6)]
+    for p, h in pairs:
+        assert np.float32(p / h) == np.float32(p) / np.float32(h), (p, h)
+
+
+def test_menu_cache_cap_changes_nothing_but_time(mixed_schedule,
+                                                 all_at_once):
+    """The per-thread menu cache is cleared whenever it would pass its cap
+    (review item 10). Menus are pure functions of the column signature, so
+    a tiny cap -- clearing constantly -- must play exactly the same games."""
+    rules_list, s = mixed_schedule
+    rust.set_menu_cache_cap(50)
+    try:
+        got = run_pool(rules_list[::5], s[::5], [HashedMock()])
+    finally:
+        rust.set_menu_cache_cap(20_000)
+    for i, (a, b) in enumerate(zip(got, all_at_once[::5])):
+        compare_results(a, b, f"game {5 * i} with cap 50")
