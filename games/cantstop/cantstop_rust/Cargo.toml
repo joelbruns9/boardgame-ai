@@ -15,6 +15,7 @@ crate-type = ["cdylib", "rlib"]
 # Pinned at 0.28.x deliberately: 0.28 renamed `Python::with_gil` -> `attach`
 # and `allow_threads` -> `detach`, which M3 needs at the evaluator boundary.
 pyo3 = { version = "0.28.3", features = ["extension-module"] }
+rayon = "1"
 
 [profile.release]
 opt-level = 3

@@ -169,3 +169,38 @@ def to_absolute(relative, state):
         raise ValueError("live seats carry no probability mass")
     out /= total
     return out[0] if single else out
+
+
+def decode_features(row, active_player):
+    """Rebuild the end-of-turn board a feature row encodes.
+
+    Exact, not approximate: progress is stored as ``pos / height`` in
+    float32, and with heights of at most 13 the nearest integer to
+    ``value * height`` is always ``pos``. The one thing a row cannot say is
+    which *absolute* seat is to move (slot 0 is relative by design), so the
+    caller supplies it -- every row of one turn solve shares it.
+
+    This is what lets board-level evaluators (``ProgressHeuristic``) score
+    leaves that the Rust solver hands over as features only.
+    """
+    from .engine import GameState, RuleSet     # local: engine imports nothing from here
+
+    row = np.asarray(row, dtype=np.float32)
+    present = [row[seat_present_index(s)] > 0 for s in range(MAX_SEATS)]
+    n = sum(present)
+    if present[:n] != [True] * n or any(present[n:]):
+        raise ValueError(f"seat-present flags are not a prefix: {present}")
+    g = MAX_SEATS * PER_SEAT
+    rules = RuleSet(n, int(round(float(row[g + 1]) * _MAX_COLUMNS_TO_WIN)),
+                    bool(row[g] > 0.5))
+    state = GameState(rules)
+    state.active_player = active_player
+    for slot in range(n):
+        seat = (active_player + slot) % n
+        base = slot * PER_SEAT
+        for i, col in enumerate(COLUMNS):
+            if row[base + NUM_COLUMNS + i] > 0.5:
+                state.claimed_by[col] = seat
+            state.progress[seat][col] = int(round(
+                float(row[base + i]) * COLUMN_HEIGHTS[col]))
+    return state

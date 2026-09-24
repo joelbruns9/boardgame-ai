@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 use std::sync::{Arc, OnceLock};
 
-use crate::encoder::{encode_board, FEATURE_SIZE};
+use crate::encoder::{encode_board, FEATURE_SIZE, MAX_COLUMNS_TO_WIN, NUM_COLUMNS, PER_SEAT};
 use crate::engine::{dice_pairings, GameState, Move, Phase, COLUMN_HEIGHTS, MAX_COL, MIN_COL, MAX_RUNNERS};
 
 /// A runner configuration: up to three (column, position) pairs sorted by
@@ -289,7 +289,20 @@ pub enum SolveError {
     NoLegalMove,
 }
 
+thread_local! {
+    /// One menu cache per thread for the life of the process, as Python's
+    /// module-level `_MENU_CACHE`: a menu depends only on the column
+    /// signature, so it is valid across solves and games. Per thread rather
+    /// than shared so rayon workers never contend on it; each warms up once.
+    static MENU_CACHE: std::cell::RefCell<MenuCache> = std::cell::RefCell::new(MenuCache::default());
+}
+
 impl TurnSolver {
+    /// `new` with this thread's process-lifetime menu cache.
+    pub fn new_cached(state: &GameState) -> Result<TurnSolver, SolveError> {
+        MENU_CACHE.with(|c| TurnSolver::new(state, &mut c.borrow_mut()))
+    }
+
     /// Enumerate the turn from `state` (any in-turn phase). In AWAIT_MOVE
     /// the table is rooted at the rolled options.
     pub fn new(state: &GameState, cache: &mut MenuCache) -> Result<TurnSolver, SolveError> {
@@ -450,9 +463,54 @@ impl TurnSolver {
     /// `num_leaves x FEATURE_SIZE`, in `leaf_boards` order.
     pub fn leaf_features(&self) -> Vec<f32> {
         let mut out = vec![0.0f32; self.num_leaves() * FEATURE_SIZE];
-        let mut rows = out.chunks_exact_mut(FEATURE_SIZE);
-        self.for_each_leaf_board(|s| encode_board(s, rows.next().expect("row per leaf")));
+        self.encode_leaves_into(&mut out);
         out
+    }
+
+    /// Encode every leaf into `out` (`num_leaves * FEATURE_SIZE`) without
+    /// building leaf boards.
+    ///
+    /// Every leaf differs from the bust board only in the mover's runner
+    /// columns: the bust board is encoded once as a template, and each stop
+    /// leaf is the template with those columns patched -- a runner below
+    /// the top becomes the mover's progress, one at the top claims the
+    /// column (flag set, every seat's progress on it zeroed, the mover's
+    /// columns-needed recomputed). Measured as the pool's largest cost when
+    /// each leaf was built with `stop()` and encoded whole. Same f64 -> f32
+    /// arithmetic as `encode_board`, and the gate compares bytes.
+    pub fn encode_leaves_into(&self, out: &mut [f32]) {
+        let n = self.num_players;
+        let (template, rest) = out.split_at_mut(FEATURE_SIZE);
+        let mut bust = self.base.clone();
+        bust.runners = [0; 13];
+        bust.phase = Phase::AwaitDecision;
+        bust.bust().expect("AWAIT_DECISION can bust");
+        encode_board(&bust, template);
+
+        // On a leaf board the next seat is to move, so the mover sits in
+        // the last live slot.
+        let mover_base = (n - 1) * PER_SEAT;
+        let need = self.base.rules.columns_to_win as i32;
+        let already = self.base.claimed_count(self.active) as i32;
+        for (row, &i) in rest.chunks_exact_mut(FEATURE_SIZE).zip(&self.leaf_nodes) {
+            row.copy_from_slice(template);
+            let mut claimed = already;
+            for &(col, pos) in self.nodes[i as usize].key.as_slice() {
+                let c = col as usize - MIN_COL;
+                let height = COLUMN_HEIGHTS[col as usize];
+                if pos >= height {
+                    row[mover_base + NUM_COLUMNS + c] = 1.0;
+                    for slot in 0..n {
+                        row[slot * PER_SEAT + c] = 0.0;
+                    }
+                    claimed += 1;
+                } else {
+                    row[mover_base + c] = (pos as f64 / height as f64) as f32;
+                }
+            }
+            row[mover_base + 2 * NUM_COLUMNS] =
+                ((need - claimed).max(0) as f64 / MAX_COLUMNS_TO_WIN) as f32;
+        }
     }
 
     /// The seat to move on every leaf board (bust and stop alike pass the

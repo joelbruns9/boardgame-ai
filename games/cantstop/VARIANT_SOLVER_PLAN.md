@@ -321,6 +321,48 @@ batch crosses back.
   games/s end-to-end, not just engine microbenchmarks (WT's microbenchmark read
   ~27× while the whole-path ceiling was ~15×).
 
+**M3 BUILT (2026-09-24).** `src/selfplay.rs` (`Game`, `Pool`),
+`PySelfPlayPool`, `rust_pool.py` (driver: `run_pool`, `generate`,
+`play_match`), `rust_pool_equiv.py` (gate + `bench` CLI),
+`tests/test_rust_pool.py`. `train.generate` and `arena.play_match` take
+`backend="auto"|"rust"|"python"`; auto uses the pool when built;
+`train.py --backend`.
+- **Per-game seeds** (behaviour change, both backends): `generate` and
+  `play_match` draw one seed per game up front (`rust_pool.game_seeds`) and
+  each game rolls from its own `PortableRng`. Before, one generator ran
+  through all games in sequence, so game N's dice depended on games 0..N-1
+  -- impossible to parallelize reproducibly.
+- **Gate:** every `GameResult` field, training rows byte for byte, equals
+  `play_game(rules, ev, PortableRng(seed))`, at 1 thread and all cores,
+  with every game in flight or with an in-flight window of 1/4/7 (refill),
+  mixed rule sets in one pool; under `hashed` and `mover_wins` feature
+  mocks. Arena: pool and Python backends give identical wins with two
+  different evaluators. Relative-output fast path == absolute path.
+- **Measured** (RTX 3070 laptop, untrained net, 256 games/rule set, 64 in
+  flight, GPU forward): 2p base **34.5k games/h** vs Python 144 (**~240x**),
+  4p blocking 31.9k vs 134, 2p extended 16.9k vs 207. CPU forward ~9-10k
+  games/h. 128 in flight was SLOWER on this 8 GB GPU (19.6k), so the default
+  is 64. Arena vs the heuristic 61 s -> 3.7 s per 20 games.
+- **Four fixes the measurements forced**, each worth not re-deriving:
+  (1) *refill* -- with every game started at once, long games trailed
+  alone: median round had 6 of 64 games waiting; now `in_flight` slots are
+  refilled from the schedule; (2) *leaf encoding* was the pool's largest
+  cost -- now the bust board is encoded once and each leaf patches only the
+  mover's runner columns (`encode_leaves_into`), written in parallel straight
+  into a Python-owned `bytearray` (no copies); (3) **`seat_mask_tensor` was
+  copying the entire feature tensor to the CPU** to read 4 columns -- 64 of
+  123 ms of a 900k-row GPU forward; now indexed on device (identical mask;
+  also speeds training); (4) `to_absolute` per block moved into Rust
+  (`resume_relative`, bit-identical, gated). `ProgressHeuristic` is now
+  vectorized and scores boards and features through one function; it
+  differs from the old per-board loop by <= 4e-16 (Python 3.12's `sum` is
+  compensated), so heuristic numbers shift by rounding only.
+- **Where the time goes now (GPU):** Rust ~17 s vs eval ~8.5 s per 256
+  games, i.e. Rust-bound again; within Rust, writing ~350 MB of features per
+  round is memory-bandwidth work. Next levers if ever needed: overlap Rust
+  and the forward (two half-pools), or send compact leaves (runner keys +
+  one template per game) and expand features on the GPU.
+
 ### Phase 4 — Full training run, all variants (the original Phase 2 gate)
 
 Now on the Rust engine, and now worth wiring into `games/az_loop` for

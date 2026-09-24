@@ -16,7 +16,8 @@ import torch
 import torch.nn as nn
 
 from .encoder import (
-    FEATURE_SIZE, MAX_SEATS, encode_batch, seat_mask, to_absolute,
+    FEATURE_SIZE, MAX_SEATS, encode_batch, seat_mask, seat_present_index,
+    to_absolute,
 )
 
 DEFAULT_HIDDEN = (256, 256)
@@ -64,9 +65,18 @@ def masked_softmax(logits, mask):
 
 
 def seat_mask_tensor(x):
-    """Live-seat mask for a feature tensor, as a bool tensor on its device."""
-    return torch.as_tensor(
-        seat_mask(x.detach().cpu().numpy()), dtype=torch.bool, device=x.device)
+    """Live-seat mask for a feature tensor, as a bool tensor on its device.
+
+    Indexed on the tensor's own device -- the same ``> 0`` test as
+    ``encoder.seat_mask``. The first version round-tripped the WHOLE feature
+    tensor through numpy to read four columns: measured at 64 of 123 ms of a
+    900k-row GPU forward in the M3 pool.
+    """
+    if x.ndim == 1:
+        x = x[None, :]
+    idx = torch.tensor([seat_present_index(s) for s in range(MAX_SEATS)],
+                       device=x.device)
+    return x.index_select(1, idx) > 0.0
 
 
 def masked_cross_entropy(logits, target_slots, mask):
@@ -109,20 +119,27 @@ class NetEvaluator:
         return self.evaluate_features(encode_batch(states), states[0])
 
     @torch.no_grad()
-    def evaluate_features(self, features, reference):
-        """The same, from already-encoded boards. ``reference`` is any board
-        sharing the batch's rule set and seat to move -- only those two are
-        read, to rotate the output back to absolute seats. This is the entry
-        the Rust solver uses: it encodes leaves itself (``RustTurnSolver``)."""
+    def relative_probs(self, features):
+        """Seat-relative win probabilities (N, MAX_SEATS), float32, for any
+        mix of rule sets and seats to move -- one forward. The Rust pool
+        batches every waiting game's leaves through here, then rotates each
+        game's block back to absolute seats itself."""
         chunks = []
         step = self.batch_size or len(features)
         for start in range(0, len(features), step):
             x = torch.from_numpy(features[start:start + step]).to(self.device)
             chunks.append(self.net.win_probs(x).cpu().numpy())
         probs = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
-
         self.calls += 1
         self.rows += len(features)
+        return probs
+
+    def evaluate_features(self, features, reference):
+        """The same, from already-encoded boards. ``reference`` is any board
+        sharing the batch's rule set and seat to move -- only those two are
+        read, to rotate the output back to absolute seats. This is the entry
+        the Rust solver uses: it encodes leaves itself (``RustTurnSolver``)."""
+        probs = self.relative_probs(features)
         # to_absolute widens to float64, which is the contract the solver
         # needs: backward induction sums these thousands of times, and the
         # Rust port is specified to accumulate in f64 for the same reason.

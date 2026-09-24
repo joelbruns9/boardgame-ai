@@ -17,7 +17,7 @@ pub const FEATURE_SIZE: usize = MAX_PLAYERS * PER_SEAT + NUM_GLOBAL;
 
 /// Both scaled features divide by this constant, never by the rule set's
 /// own threshold -- see `encoder.py` for why that matters.
-const MAX_COLUMNS_TO_WIN: f64 = 5.0;
+pub const MAX_COLUMNS_TO_WIN: f64 = 5.0;
 
 /// Encode one end-of-turn board (no runners) into `out`, which must hold
 /// `FEATURE_SIZE` values. Callers guarantee there are no runners: the

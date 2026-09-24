@@ -321,21 +321,65 @@ class ProgressHeuristic:
         self.temperature = temperature
 
     def __call__(self, states):
-        out = np.empty((len(states), states[0].rules.num_players))
-        for i, s in enumerate(states):
-            need = s.rules.columns_to_win
-            scores = []
-            for p in range(s.rules.num_players):
-                claimed = sum(1 for c in COLUMNS if s.claimed_by[c] == p)
-                climb = sorted((s.progress[p][c] / COLUMN_HEIGHTS[c]
-                                for c in COLUMNS if s.claimed_by[c] is None),
-                               reverse=True)
-                scores.append((claimed + sum(climb[:max(need - claimed, 0)]))
-                              / need)
-            z = np.asarray(scores) / self.temperature
-            z = np.exp(z - z.max())
-            out[i] = z / z.sum()
-        return out
+        n = states[0].rules.num_players
+        progress = np.array([[[s.progress[p][c] for c in COLUMNS]
+                              for p in range(n)] for s in states],
+                            dtype=np.float64)
+        owner = np.array([[-1 if s.claimed_by[c] is None else s.claimed_by[c]
+                           for c in COLUMNS] for s in states])
+        need = np.array([s.rules.columns_to_win for s in states])
+        return self._softmax_scores(progress, owner, need, n)
+
+    def evaluate_features(self, features, reference):
+        """Score already-encoded end-of-turn boards (the Rust pool's leaves)
+        with the same arithmetic as ``__call__``: the encoding is exact
+        (``encoder.decode_features``), so this is the same function of the
+        same board, just read from a different container."""
+        from .encoder import (MAX_SEATS, NUM_COLUMNS, PER_SEAT,
+                              _MAX_COLUMNS_TO_WIN)
+        f = np.asarray(features, dtype=np.float32)
+        n = reference.rules.num_players
+        a = reference.active_player
+        heights = np.array([COLUMN_HEIGHTS[c] for c in COLUMNS])
+        progress = np.empty((len(f), n, NUM_COLUMNS))
+        owner = np.full((len(f), NUM_COLUMNS), -1)
+        for slot in range(n):
+            seat = (a + slot) % n
+            base = slot * PER_SEAT
+            progress[:, seat] = np.rint(
+                f[:, base:base + NUM_COLUMNS].astype(np.float64) * heights)
+            flags = f[:, base + NUM_COLUMNS:base + 2 * NUM_COLUMNS] > 0.5
+            owner[flags] = seat
+        g = MAX_SEATS * PER_SEAT
+        need = np.rint(f[:, g + 1].astype(np.float64)
+                       * _MAX_COLUMNS_TO_WIN).astype(int)
+        return self._softmax_scores(progress, owner, need, n)
+
+    def _softmax_scores(self, progress, owner, need, n):
+        """Vectorized over boards. ``progress`` (N, n, 11) integer-valued
+        positions, ``owner`` (N, 11) claiming seat or -1, ``need`` (N,).
+
+        Per seat: claimed columns plus the largest remaining-column climbs
+        (as many as the seat still needs), over ``need``; softmax over seats
+        at ``temperature``. The climbs are summed largest-first, as the
+        original per-board loop did, and zero-padded columns add exact
+        zeros, so a seat needing more columns than remain is unchanged.
+        Vectorized because the M3 pool made this the slowest thing in an
+        arena match (3 s/game vs 0.2 s against a net)."""
+        heights = np.array([COLUMN_HEIGHTS[c] for c in COLUMNS],
+                           dtype=np.float64)
+        open_col = owner == -1                                  # (N, 11)
+        climb = np.where(open_col[:, None, :], progress / heights, 0.0)
+        climb = -np.sort(-climb, axis=2)                        # descending
+        running = np.cumsum(climb, axis=2)
+        claimed = (owner[:, None, :] == np.arange(n)[None, :, None]).sum(2)
+        k = np.maximum(need[:, None] - claimed, 0)              # (N, n)
+        top = np.where(k > 0, np.take_along_axis(
+            running, np.clip(k - 1, 0, None)[..., None], axis=2)[..., 0], 0.0)
+        scores = (claimed + top) / need[:, None]
+        z = scores / self.temperature
+        z = np.exp(z - z.max(axis=1, keepdims=True))
+        return z / z.sum(axis=1, keepdims=True)
 
 
 def solve_turn(state, evaluate):

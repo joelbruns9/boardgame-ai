@@ -7,14 +7,15 @@
 pub mod encoder;
 pub mod engine;
 pub mod rng;
+pub mod selfplay;
 pub mod solver;
 
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyByteArray, PyBytes};
 
 use engine::{EngineError, GameState, Move, Phase, RuleSet, COLUMN_HEIGHTS, MAX_COL, MIN_COL};
-use solver::{MenuCache, RKey, SolveError, TurnSolver};
+use solver::{RKey, SolveError, TurnSolver};
 
 /// Python-visible handle on the portable stream, so the equivalence gate can
 /// drive both generators in lockstep and compare states after every draw.
@@ -303,10 +304,6 @@ fn snapshot_of(state: &GameState) -> Snapshot {
     PyGameState { inner: state.clone() }.snapshot()
 }
 
-thread_local! {
-    static MENU_CACHE: std::cell::RefCell<MenuCache> = std::cell::RefCell::new(MenuCache::default());
-}
-
 type PyKey = Vec<(i64, i64)>;
 
 fn key_out(key: &RKey) -> PyKey {
@@ -370,10 +367,7 @@ impl PyTurnSolver {
     #[new]
     fn new(snap: Snapshot) -> PyResult<Self> {
         let state = state_from_snapshot(snap)?;
-        // One cache per thread for the life of the process, as Python's
-        // module-level _MENU_CACHE: a menu depends only on the column
-        // signature, so it is valid across solves and games.
-        let inner = MENU_CACHE.with(|c| TurnSolver::new(&state, &mut c.borrow_mut()))?;
+        let inner = TurnSolver::new_cached(&state)?;
         Ok(PyTurnSolver { inner })
     }
 
@@ -499,11 +493,214 @@ fn encode_snapshots<'py>(py: Python<'py>, snaps: Vec<Snapshot>) -> PyResult<Boun
     Ok(f32_bytes(py, &out))
 }
 
+/// Let `fill` write `floats` f32s into `bytes` as little-endian. Writes in
+/// place when the buffer is f32-aligned (CPython's allocator gives at least
+/// 8-byte alignment, so in practice always), else through a temporary.
+fn write_f32_le(bytes: &mut [u8], floats: usize, fill: impl FnOnce(&mut [f32])) {
+    #[cfg(not(target_endian = "little"))]
+    compile_error!("the feature buffer is handed to numpy as little-endian f32");
+    // SAFETY: every bit pattern is a valid f32 and a valid u8.
+    let (pre, mid, post) = unsafe { bytes.align_to_mut::<f32>() };
+    if pre.is_empty() && post.is_empty() && mid.len() == floats {
+        fill(mid);
+    } else {
+        let mut tmp = vec![0.0f32; floats];
+        fill(&mut tmp);
+        for (dst, v) in bytes.chunks_exact_mut(4).zip(&tmp) {
+            dst.copy_from_slice(&v.to_le_bytes());
+        }
+    }
+}
+
+fn f64_from_bytes(raw: &[u8]) -> PyResult<Vec<f64>> {
+    if raw.len() % 8 != 0 {
+        return Err(PyValueError::new_err("byte length is not a multiple of 8"));
+    }
+    Ok(raw
+        .chunks_exact(8)
+        .map(|b| f64::from_le_bytes(b.try_into().expect("8 bytes")))
+        .collect())
+}
+
+type BlockOut = (usize, usize, u8, u8, u8);
+type GameOut = (u64, i64, i64, Vec<i64>, u32, u32, u64, Vec<u32>);
+
+/// Many self-play or arena games advanced together (M3). Python's loop:
+///
+///     pool.advance()
+///     while pool.running:
+///         feats, blocks = pool.pending()
+///         pool.resume(values_for(feats, blocks))
+///
+/// The Python driver lives in `games/cantstop/rust_pool.py`.
+/// The GIL is released for every call that does real work.
+#[pyclass(name = "SelfPlayPool")]
+pub struct PySelfPlayPool {
+    inner: selfplay::Pool,
+    features_taken: bool,
+}
+
+#[pymethods]
+impl PySelfPlayPool {
+    /// `games`: one `(snapshot, seed, evaluator_of_seat)` per game, where the
+    /// snapshot is the starting position (normally a fresh game) and
+    /// `evaluator_of_seat` has one small int per seat. `threads == 0` means
+    /// one per logical core.
+    #[new]
+    #[pyo3(signature = (games, max_turns, threads=0, in_flight=0))]
+    fn new(
+        games: Vec<(Snapshot, u64, Vec<u8>)>,
+        max_turns: u32,
+        threads: usize,
+        in_flight: usize,
+    ) -> PyResult<Self> {
+        let mut out = Vec::with_capacity(games.len());
+        for (i, (snap, seed, seats)) in games.into_iter().enumerate() {
+            let state = state_from_snapshot(snap)?;
+            if seats.len() != state.rules.num_players as usize {
+                return Err(PyValueError::new_err(format!(
+                    "game {i}: {} evaluator seats for {} players",
+                    seats.len(),
+                    state.rules.num_players
+                )));
+            }
+            let mut e = [0u8; 4];
+            e[..seats.len()].copy_from_slice(&seats);
+            out.push(selfplay::Game::new(state, seed, e, i as u64, max_turns));
+        }
+        Ok(PySelfPlayPool { inner: selfplay::Pool::new(out, threads, in_flight), features_taken: false })
+    }
+
+    fn advance(&mut self, py: Python<'_>) {
+        let inner = &mut self.inner;
+        py.detach(|| inner.advance());
+    }
+
+    #[getter]
+    fn running(&self) -> bool {
+        self.inner.running()
+    }
+
+    #[getter]
+    fn failure(&self) -> Option<String> {
+        self.inner.failure()
+    }
+
+    #[getter]
+    fn num_games(&self) -> usize {
+        self.inner.games.len()
+    }
+
+    /// `(features, blocks)`: a writable `bytearray` of LE float32,
+    /// `sum(rows) x FEATURE_SIZE` (for `np.frombuffer`, no copy), and one
+    /// `(game, rows, evaluator, num_players, leaf_active)` per waiting game,
+    /// in buffer order. Rust encodes straight into the bytearray, in
+    /// parallel, with the GIL released.
+    fn pending<'py>(&mut self, py: Python<'py>) -> PyResult<(Bound<'py, PyByteArray>, Vec<BlockOut>)> {
+        let blocks: Vec<BlockOut> = self
+            .inner
+            .pending_blocks()
+            .iter()
+            .map(|b| (b.game, b.rows, b.evaluator, b.num_players, b.leaf_active))
+            .collect();
+        let floats = self.inner.pending_rows() * encoder::FEATURE_SIZE;
+        let inner = &self.inner;
+        let buf = PyByteArray::new_with(py, floats * 4, |bytes| {
+            py.detach(|| write_f32_le(bytes, floats, |out| inner.write_pending(out)));
+            Ok(())
+        })?;
+        self.features_taken = true;
+        Ok((buf, blocks))
+    }
+
+    /// LE float64 bytes: for each block in order, `rows x num_players`
+    /// absolute-seat values.
+    fn resume(&mut self, py: Python<'_>, values: &[u8]) -> PyResult<()> {
+        if !self.features_taken {
+            return Err(PyRuntimeError::new_err("call pending() before resume()"));
+        }
+        let values = f64_from_bytes(values)?;
+        let inner = &mut self.inner;
+        py.detach(|| inner.resume(&values)).map_err(PyValueError::new_err)?;
+        self.features_taken = false;
+        Ok(())
+    }
+
+    /// The rotation `resume_relative` applies, without resuming: LE f64
+    /// bytes. For gating it against `encoder.to_absolute`.
+    fn absolute_from_relative<'py>(&self, py: Python<'py>, relative: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
+        let rel: Vec<f32> = relative
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().expect("4 bytes")))
+            .collect();
+        let v = self.inner.absolute_from_relative(&rel).map_err(PyValueError::new_err)?;
+        let mut raw = Vec::with_capacity(v.len() * 8);
+        for x in v {
+            raw.extend_from_slice(&x.to_le_bytes());
+        }
+        Ok(PyBytes::new(py, &raw))
+    }
+
+    /// `resume` from the net's seat-relative output instead: LE float32,
+    /// `pending_rows x 4`, slot 0 = the leaf boards' seat to move. Rust does
+    /// `to_absolute` per block.
+    fn resume_relative(&mut self, py: Python<'_>, relative: &[u8]) -> PyResult<()> {
+        if !self.features_taken {
+            return Err(PyRuntimeError::new_err("call pending() before resume()"));
+        }
+        if relative.len() % 4 != 0 {
+            return Err(PyValueError::new_err("byte length is not a multiple of 4"));
+        }
+        let rel: Vec<f32> = relative
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().expect("4 bytes")))
+            .collect();
+        let inner = &mut self.inner;
+        py.detach(|| {
+            let values = inner.absolute_from_relative(&rel)?;
+            inner.resume(&values)
+        })
+        .map_err(PyValueError::new_err)?;
+        self.features_taken = false;
+        Ok(())
+    }
+
+    /// One tuple per game, in game order: `(id, winner, rows, winner_slots,
+    /// turns, solves, evaluator_rows, turn_lengths)`, with the features of
+    /// every game concatenated in `features()`. Winner is -1 for a failed
+    /// game.
+    fn results(&self) -> PyResult<Vec<GameOut>> {
+        if self.inner.running() {
+            return Err(PyRuntimeError::new_err("games are still running"));
+        }
+        Ok(self
+            .inner
+            .games
+            .iter()
+            .map(|g| {
+                let rows = (g.features.len() / encoder::FEATURE_SIZE) as i64;
+                let (winner, slots) = match g.winner() {
+                    Some(w) => (w as i64, g.winner_slots().iter().map(|&s| s as i64).collect()),
+                    None => (-1, Vec::new()),
+                };
+                (g.id, winner, rows, slots, g.turns, g.solves, g.evaluator_rows, g.turn_lengths.clone())
+            })
+            .collect())
+    }
+
+    /// Every game's recorded boards, encoded, concatenated in game order.
+    fn features<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        let all: Vec<f32> = self.inner.games.iter().flat_map(|g| g.features.iter().copied()).collect();
+        f32_bytes(py, &all)
+    }
+}
+
 #[pymodule]
 fn cantstop_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRng>()?;
     m.add_class::<PyGameState>()?;
     m.add_class::<PyTurnSolver>()?;
+    m.add_class::<PySelfPlayPool>()?;
     m.add_function(wrap_pyfunction!(encode_snapshots, m)?)?;
     m.add("FEATURE_SIZE", encoder::FEATURE_SIZE)?;
     Ok(())

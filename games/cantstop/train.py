@@ -34,6 +34,7 @@ from .model import (
     seat_mask_tensor,
 )
 from .self_play import play_game, stack_rows, summarize
+from .portable_rng import PortableRng
 from .solver import ProgressHeuristic
 
 # The MVP rule set: fewest seats and fewest columns to win, so games are as
@@ -77,17 +78,31 @@ class ReplayBuffer:
                 np.concatenate([y for _, y in self._chunks]))
 
 
-def generate(rule_sets, games_per_ruleset, evaluate, rng):
+def generate(rule_sets, games_per_ruleset, evaluate, rng, backend="auto",
+             threads=0, stats=None):
     """Play the scheduled games and return every result.
 
-    Kept free of any execution detail so the pool (and later Rust) can slot
-    in underneath without changing what gets played.
+    Each game rolls from its own ``PortableRng``, seeded up front in
+    schedule order, so both backends play exactly the same games:
+
+    * ``"rust"`` -- the M3 pool: every game in flight at once, Rust doing
+      the turns on ``threads`` cores, one batched forward per round;
+    * ``"python"`` -- one game at a time through ``self_play.play_game``,
+      the reference the M3 gate replays;
+    * ``"auto"`` -- rust when the extension is built.
     """
-    results = []
-    for rules in rule_sets:
-        for _ in range(games_per_ruleset):
-            results.append(play_game(rules, evaluate, rng))
-    return results
+    from . import rust_pool
+    if backend == "auto":
+        backend = "rust" if rust_pool.rust_available() else "python"
+    if backend == "rust":
+        return rust_pool.generate(rule_sets, games_per_ruleset, evaluate,
+                                  rng, threads=threads, stats=stats)
+    if backend != "python":
+        raise ValueError(f"unknown backend {backend!r}")
+    schedule = [r for r in rule_sets for _ in range(games_per_ruleset)]
+    seeds = rust_pool.game_seeds(rng, len(schedule))
+    return [play_game(rules, evaluate, PortableRng(seed))
+            for rules, seed in zip(schedule, seeds)]
 
 
 def train_steps(net, buffer, opt, steps, batch_size, device, rng):
@@ -117,7 +132,8 @@ def train_steps(net, buffer, opt, steps, batch_size, device, rng):
 
 def run(out_dir, iterations, games, rule_sets=(MVP_RULES,), hidden=(256, 256),
         lr=1e-3, batch_size=256, steps=200, buffer_rows=20000,
-        arena_games=60, seed=0, device=None, init_checkpoint=None):
+        arena_games=60, seed=0, device=None, init_checkpoint=None,
+        backend="auto"):
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     log_path = out / "run.jsonl"
@@ -146,7 +162,7 @@ def run(out_dir, iterations, games, rule_sets=(MVP_RULES,), hidden=(256, 256),
     for it in range(1, iterations + 1):
         started = time.time()
         evaluate = NetEvaluator(net, device=str(device))
-        results = generate(rule_sets, games, evaluate, rng)
+        results = generate(rule_sets, games, evaluate, rng, backend=backend)
         gen_seconds = time.time() - started
 
         x, y = stack_rows(results)
@@ -169,9 +185,11 @@ def run(out_dir, iterations, games, rule_sets=(MVP_RULES,), hidden=(256, 256),
         if arena_games:
             current = NetEvaluator(net, device=str(device))
             record["vs_random_init"] = compare(
-                rule_sets[0], current, baseline, arena_games, rng)
+                rule_sets[0], current, baseline, arena_games, rng,
+                backend=backend)
             record["vs_heuristic"] = compare(
-                rule_sets[0], current, ProgressHeuristic(), arena_games, rng)
+                rule_sets[0], current, ProgressHeuristic(), arena_games, rng,
+                backend=backend)
 
         with log_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, default=str) + "\n")
@@ -198,6 +216,10 @@ def main(argv=None):
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default=None)
     p.add_argument("--init-checkpoint", default=None)
+    p.add_argument("--backend", choices=("auto", "rust", "python"),
+                   default="auto",
+                   help="rust = the M3 pool (many games at once, batched "
+                        "forwards); auto = rust when the extension is built")
     args = p.parse_args(argv)
 
     run(out_dir=args.out,
@@ -212,7 +234,8 @@ def main(argv=None):
         arena_games=args.arena_games,
         seed=args.seed,
         device=args.device,
-        init_checkpoint=args.init_checkpoint)
+        init_checkpoint=args.init_checkpoint,
+        backend=args.backend)
 
 
 if __name__ == "__main__":

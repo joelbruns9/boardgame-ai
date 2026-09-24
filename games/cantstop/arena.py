@@ -14,6 +14,7 @@ import math
 import random
 
 from .engine import GameState
+from .portable_rng import PortableRng
 from .self_play import DEFAULT_MAX_TURNS, TurnLimitExceeded, play_turn
 
 
@@ -54,12 +55,17 @@ def player_of_seat(seat_of, seat):
     return seat_of.index(seat)
 
 
-def play_match(rules, players, games, rng=None, max_turns=DEFAULT_MAX_TURNS):
+def play_match(rules, players, games, rng=None, max_turns=DEFAULT_MAX_TURNS,
+               backend="auto", threads=0):
     """Play ``games`` games between ``players`` and count wins per player.
 
     ``players`` must have exactly ``rules.num_players`` entries. Game *i*
     seats player *p* at seat ``(p + i) % num_players``, so over a multiple of
     ``num_players`` games every player sits in every seat equally often.
+
+    Each game rolls from its own ``PortableRng`` seeded from ``rng`` up
+    front, so the ``"rust"`` pool and the ``"python"`` loop play the same
+    games (``"auto"``: rust when built).
     """
     n = rules.num_players
     if len(players) != n:
@@ -67,6 +73,15 @@ def play_match(rules, players, games, rng=None, max_turns=DEFAULT_MAX_TURNS):
             f"{rules.num_players}-player rules need {n} players, got "
             f"{len(players)}")
     rng = rng or random.Random()
+    from . import rust_pool
+    if backend == "auto":
+        backend = "rust" if rust_pool.rust_available() else "python"
+    if backend == "rust":
+        return rust_pool.play_match(rules, players, games, rng,
+                                    max_turns=max_turns, threads=threads)
+    if backend != "python":
+        raise ValueError(f"unknown backend {backend!r}")
+    seeds = rust_pool.game_seeds(rng, games)
 
     wins = [0] * n
     for i in range(games):
@@ -74,7 +89,8 @@ def play_match(rules, players, games, rng=None, max_turns=DEFAULT_MAX_TURNS):
         seating = [None] * n
         for player, seat in enumerate(seat_of):
             seating[seat] = players[player]
-        winning_seat = play_match_game(rules, seating, rng, max_turns)
+        winning_seat = play_match_game(rules, seating,
+                                       PortableRng(seeds[i]), max_turns)
         wins[player_of_seat(seat_of, winning_seat)] += 1
     return wins
 
@@ -124,7 +140,7 @@ def verdict(wins, num_players, player=0):
 
 
 def compare(rules, challenger, incumbent, games, rng=None,
-            max_turns=DEFAULT_MAX_TURNS):
+            max_turns=DEFAULT_MAX_TURNS, backend="auto"):
     """Match one challenger against copies of one incumbent.
 
     Returns the challenger's win rate, its Wilson interval, and the raw wins.
@@ -133,5 +149,5 @@ def compare(rules, challenger, incumbent, games, rng=None,
     """
     n = rules.num_players
     players = [challenger] + [incumbent] * (n - 1)
-    wins = play_match(rules, players, games, rng, max_turns)
+    wins = play_match(rules, players, games, rng, max_turns, backend)
     return verdict(wins, n)
