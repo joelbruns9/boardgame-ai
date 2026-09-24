@@ -86,6 +86,12 @@ ABI steps.
 
 ---
 
+### 0.5 Scope: 2+ players, standard rules — DECIDED 2026-09-14
+
+The user's call: **v3 is built for the 2–4 player standard game only.** Solo (real solo rules, the solo marker) and one-seat standard play are out of scope exactly like expert — the encoder and every v3 helper **raise** on them. Every "solo emits …" fallback and solo denominator note below (§6.4, §7.1, §7.5, §9.4) is **superseded**: do not implement it. The engine keeps its solo support; nothing in training or serving reaches it (`loop_adapter`, `datagen` and `self_play` all build `players>=2, solo_rules=False`).
+
+---
+
 ## 1. Shape
 
 | | v2 shipped | v2 spec | **v3** |
@@ -1301,7 +1307,7 @@ shipped block.
 | `fit_rate(supply)` | `Σ_n card_demand[n] · supply_number[n] / max(33 · Σ supply, EPS)` | [0,1] |
 | `number_demand[v]` | `count / NUM_BOXES` | [0,1] |
 | `effect_demand[e]` | `marks / track size of e`; for ESTATE, `estate_demand / 66` ⚠ **R4** | [0,1] |
-| `effect_supply_rate[e]` | §9.3 hypergeometric; `D < 3` → `1 − (1 − k/max(D,EPS))³` | [0,1] |
+| `effect_supply_rate[e]` | §9.3: `1 − P(all three boundary draws miss e)` over the literal boundary draw, which reforms mid-draw at `D < 3` (R5; the old `(1 − k/D)³` fallback is withdrawn); branches on the viewer's own reshuffle vote | [0,1] |
 | `max_houses_this_turn` | `n / 3` | [0,1] |
 | `free_estate_size_counts[s]` | `count / 4`, ⚠ **R5 UNCLAMPED** — matching the shipped `estate_size_counts` exactly | [0, 8.25] |
 | `roundabout_repair[x]` | `capacity_if_roundabout()[x] / STREET_SIZES[x]` | [0,1] |
@@ -1601,6 +1607,8 @@ back-compatibility, no legacy head zero-fill (§0.4).
 | 6 | `encoder.rs`: port, then **§10.6 equivalence gate green before anything else runs** | `welcome_to_rust/src/encoder.rs`, `rust_encode_equiv.py` |
 | 7 | network shapes (auto-derived from `encoder` constants), regenerate WTS shards | `network.py`, `self_play.py`, `samples.rs` |
 | 8 | re-run S0 from scratch; gate per §11.2 | `train.py`, `datagen.py` |
+
+**Build status (2026-09-14):** steps 1–3 DONE. Step 3 shipped `number_prefix_sums`, `count_in_open_interval`, `boundary_pool_composition` (`discard + aside`), `ordered_draw_distribution` (the one boundary-draw helper §6.4/§7.5/§9.3 share) and `effect_supply_rate`, plus `EPS` in `constants.py`.
 
 Steps 1–4 are independently testable and land before the encoder touches them.
 Step 6 is the gate that must be green before any data is generated — a silent

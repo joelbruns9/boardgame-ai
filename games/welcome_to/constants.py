@@ -220,3 +220,7 @@ EXTREMITY_POSITIONS: Final = (
     (1, 0), (1, 10),
     (2, 0), (2, 11),
 )
+
+#: ``ENCODER_V3_SPEC.md`` §9.4 -- the one guard constant for every encoder
+#: quotient, ``num / max(den, EPS)``.  Declared once here, and once in Rust.
+EPS: Final = 1e-6

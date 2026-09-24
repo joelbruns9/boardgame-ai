@@ -249,85 +249,174 @@ def test_after_reshuffle_is_not_merely_deck_plus_discard():
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Encoder v3: prefix sums and exact supply rates (ENCODER_V3_SPEC.md §7.1, §9.3)
+# Encoder v3 step 3 -- ENCODER_V3_SPEC.md §7.1, §7.5, §9.3
 # ──────────────────────────────────────────────────────────────────────────
-import itertools
+import itertools  # noqa: E402
 
 
-def _fresh(seed: int = 3, **cfg):
-    return GameState.new(seed=seed, config=GameConfig(players=2, advanced=True, **cfg))
+def _played(players: int = 2, plies: int = 30, seed: int = 5, **kwargs) -> GameState:
+    state = _game(players=players, **kwargs)
+    rng = random.Random(seed)
+    for _ in range(plies):
+        if state.is_terminal:
+            break
+        state.apply(rng.choice(state.legal_actions()))
+    assert not state.is_terminal
+    return state
 
 
-def test_prefix_sums_are_cumulative_and_total_the_deck():
-    state = _fresh()
-    deck, reform, reshuffled = dk.number_prefix_sums(state, 0)
-    for p in (deck, reform, reshuffled):
-        assert p.shape == (16,)
-        assert p[0] == 0
-        assert all(p[i] <= p[i + 1] for i in range(15))
-    assert deck[-1] == dk.deck_composition(state, 0).sum()
-    assert reshuffled[-1] == deck[-1] + reform[-1]
+def _drain_to(state: GameState, construction_left: int) -> GameState:
+    """Move undrawn cards into the discard until ``construction_left`` remain.
+
+    A consistent state -- every card is still somewhere -- unlike advancing
+    ``deck_pos``, which would delete cards from the bookkeeping.
+    """
+    state = state.copy()
+    cards = state.deck[state.deck_pos:]
+    state.discard.extend(cards[construction_left:])
+    state.deck = state.deck[: state.deck_pos] + cards[:construction_left]
+    return state
 
 
-def test_prefix_range_subtraction_matches_a_direct_count():
-    """The subtraction the fit planes make, checked against counting by hand."""
-    state = _fresh(seed=11)
-    deck, _, _ = dk.number_prefix_sums(state, 0)
-    composition = dk.deck_composition(state, 0).sum(axis=1)
-    for low, high in ((7, 9), (-1, 18), (0, 4), (12, 16), (5, 6)):
-        expected = sum(
-            composition[NUMBER_INDEX[n]]
-            for n in range(1, 16)
-            if low < n < high
-        )
-        got = deck[min(high - 1, 15)] - deck[max(low, 0)]
-        assert got == expected, (low, high)
+def test_prefix_sums_interval_counts_match_brute_force():
+    state = _played()
+    deck, pool, reshuffled = dk.number_prefix_sums(state, 0)
+    per_number = [
+        dk.deck_composition(state, 0).sum(axis=1),
+        (dk.discard_composition(state, 0) + dk.aside_composition(state, 0)).sum(axis=1),
+        dk.after_reshuffle_composition(state, 0).sum(axis=1),
+    ]
+    for prefix, counts in zip((deck, pool, reshuffled), per_number):
+        assert prefix.shape == (16,) and prefix[0] == 0
+        for low in range(-3, 21):
+            for high in range(-3, 21):
+                expected = sum(
+                    int(counts[NUMBER_INDEX[n]]) for n in range(1, 16) if low < n < high
+                )
+                assert dk.count_in_open_interval(prefix, low, high) == expected
+    assert deck[-1] == state.deck_remaining
+    assert np.array_equal(reshuffled, deck + pool)
 
 
-def _brute_force_effect_rate(state, player, effect_index: int) -> float:
-    """P(effect appears among three drawn) by enumerating the literal deck."""
-    remaining = state.deck[state.deck_pos :]
-    cards = [c for c in remaining if CARD_TABLE[c][1] in EFFECT_INDEX]
-    hits = 0
-    total = 0
-    for combo in itertools.combinations(range(len(cards)), 3):
-        total += 1
-        if any(EFFECT_INDEX[CARD_TABLE[cards[i]][1]] == effect_index for i in combo):
-            hits += 1
-    return hits / total
+def _brute_ordered_draws(deck_labels, pool_labels, k, draws=3):
+    out = np.zeros((k,) * draws)
+    m = min(len(deck_labels), draws)
+    r = draws - m
+    first = list(itertools.permutations(range(len(deck_labels)), m))
+    rest = list(itertools.permutations(range(len(pool_labels)), r))
+    if not first or not rest:
+        return out
+    weight = 1.0 / (len(first) * len(rest))
+    for a in first:
+        for b in rest:
+            idx = tuple(deck_labels[i] for i in a) + tuple(pool_labels[j] for j in b)
+            out[idx] += weight
+    return out
 
 
-def test_effect_supply_rate_is_exact_not_the_independent_approximation():
-    """Three cards are drawn WITHOUT replacement; `1 - (1-p)**3` is not it."""
-    exact = 1.0 - dk._p_none_in_next_three(9, 40, 0, 0)
-    approximation = 1.0 - (1.0 - 9 / 40) ** 3
-    # The spec's worked example: 0.545 exact against 0.535 approximate.
-    assert abs(exact - 0.545) < 5e-4
-    assert abs(approximation - 0.5345) < 5e-4
-    assert exact > approximation
+@pytest.mark.parametrize("deck_size", [0, 1, 2, 3, 4, 7])
+def test_ordered_draws_match_enumeration_including_the_mid_draw_reform(deck_size):
+    """§7.5 R4: D < 3 reforms mid-draw and still yields three cards -- never 0."""
+    rng = random.Random(100 + deck_size)
+    k = 4
+    for _ in range(25):
+        deck_labels = [rng.randrange(k) for _ in range(deck_size)]
+        pool_labels = [rng.randrange(k) for _ in range(rng.randint(3, 6))]
+        deck = np.bincount(deck_labels, minlength=k)
+        pool = np.bincount(pool_labels, minlength=k)
+        got = dk.ordered_draw_distribution(deck, pool)
+        want = _brute_ordered_draws(deck_labels, pool_labels, k)
+        assert np.allclose(got, want, atol=1e-12)
+        assert got.sum() == pytest.approx(1.0, abs=1e-12)
 
 
-def test_effect_supply_rate_matches_brute_force_over_the_real_deck():
-    state = _fresh(seed=5)
-    rates = dk.effect_supply_rate(state, 0)
+def test_supply_rate_is_the_hypergeometric_form_when_the_deck_suffices():
+    state = _played()
+    counts = dk.deck_composition(state, 0).sum(axis=0).astype(np.float64)
+    total = counts.sum()
+    assert total >= 3
+    rate = dk.effect_supply_rate(state, 0)
     for e in range(dk.NUM_EFFECTS):
-        # `effect_supply_rate` returns float32; the arithmetic itself is f64.
-        assert abs(float(rates[e]) - _brute_force_effect_rate(state, 0, e)) < 1e-6
+        rest = total - counts[e]
+        want = 1 - rest * (rest - 1) * (rest - 2) / (total * (total - 1) * (total - 2))
+        assert rate[e] == pytest.approx(want, abs=1e-12)
 
 
-def test_a_near_empty_deck_still_reveals_three_cards():
-    """`_draw` reforms mid-draw, so `D < 3` is not a degenerate case."""
-    # Two cards left, one of them a hit: drawing both makes the hit certain.
-    assert dk._p_none_in_next_three(1, 2, 0, 30) == 0.0
-    # An empty deck draws all three from the reform pool.
-    assert dk._p_none_in_next_three(0, 0, 5, 30) == (25 * 24 * 23) / (30 * 29 * 28)
-    # And the hits sitting in the reform pool are what decide it, not the deck.
-    assert dk._p_none_in_next_three(0, 0, 0, 30) == 1.0
+def _engine_turn_plus_two_rate(state: GameState, samples: int, seed: int) -> np.ndarray:
+    """Oracle: run the engine's real boundary and read the cards it draws last.
+
+    The final three construction cards drawn are the ones promoted to aside on
+    the following boundary, i.e. turn+2's effects -- on an ordinary boundary, a
+    mid-draw reform and a queued reshuffle alike.
+    """
+    after = state.copy()
+    assert after.prepare_turn_boundary()
+    rng = random.Random(seed)
+    hits = np.zeros(dk.NUM_EFFECTS)
+    for _ in range(samples):
+        draws = after.sample_boundary_outcome(rng).draws
+        for e in {EFFECT_INDEX[CARD_TABLE[c][1]] for c in draws[-3:]}:
+            hits[e] += 1
+    return hits / samples
 
 
+def _assert_close_to_engine(state: GameState, seed: int) -> None:
+    rate = dk.effect_supply_rate(state, state.actor)
+    engine = _engine_turn_plus_two_rate(state, samples=6000, seed=seed)
+    # binomial sd <= 0.0065 at 6000 samples; 0.03 is > 4.5 sd
+    assert np.abs(rate - engine).max() < 0.03, (rate, engine)
+
+
+@pytest.mark.parametrize("left", [0, 1, 2, 5])
+def test_supply_rate_matches_the_engine_across_the_reform(left):
+    _assert_close_to_engine(_drain_to(_played(), left), seed=left)
+
+
+def test_the_viewers_own_reshuffle_vote_switches_to_the_reformed_pool():
+    state = _drain_to(_played(), 1)
+    before = dk.effect_supply_rate(state, state.actor)
+    state.reshuffle_votes[state.actor] = True
+    state.reshuffle_next_turn = True
+    after = dk.effect_supply_rate(state, state.actor)
+    assert not np.allclose(before, after)
+    _assert_close_to_engine(state, seed=99)
+
+
+def test_another_seats_vote_is_not_read():
+    state = _played()
+    before = dk.effect_supply_rate(state, 0)
+    state.reshuffle_votes[1] = True
+    state.reshuffle_next_turn = True
+    assert np.array_equal(dk.effect_supply_rate(state, 0), before)
+
+
+def test_boundary_pool_is_what_the_engine_reforms():
+    state = _drain_to(_played(plies=12), 0)
+    pool = dk.boundary_pool_composition(state, 0)
+    probe = state.copy()
+    probe._discard_step()
+    probe._reform_deck()
+    assert np.array_equal(dk._histogram(probe.deck), pool)
+
+
+def test_boundary_features_refuse_expert_one_seat_and_afterstates():
+    with pytest.raises(ValueError, match=r"2\+ player"):
+        dk.effect_supply_rate(_game(expert=True), 0)
+    for solo_rules in (True, False):
+        with pytest.raises(ValueError, match=r"2\+ player"):
+            dk.effect_supply_rate(_game(players=1, solo_rules=solo_rules), 0)
+    after = _played().copy()
+    assert after.prepare_turn_boundary()
+    with pytest.raises(ValueError, match="afterstate"):
+        dk.effect_supply_rate(after, 0)
+
+
+# `reveals_to_reform` is not part of step 3; this test is carried over from
+# `welcome-to-engine` 5a73fe6, whose step-3 block was otherwise superseded by
+# 9d4cf9b.  The function it covers is still live.
 def test_reveals_to_reform_counts_the_reveal_that_finds_the_deck_empty():
     """`floor(D/3) + 1`: `_draw` reforms only when it FINDS the deck empty."""
-    state = _fresh()
+    state = _game(advanced=True)
     for remaining, expected in ((0, 1), (3, 2), (4, 2), (6, 3), (7, 3)):
         state.deck_pos = len(state.deck) - remaining
         assert state.deck_remaining == remaining

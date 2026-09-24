@@ -67,6 +67,7 @@ from games.welcome_to.constants import (
     DECK_COUNTS,
     DECK_EFFECT_ORDER,
     EFFECT_INDEX,
+    EPS,
     NUMBER_INDEX,
 )
 from games.welcome_to.game import GameState
@@ -218,6 +219,176 @@ def effect_conditional_numbers(state: GameState, player: int) -> np.ndarray:
     return out
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Encoder v3 helpers -- ENCODER_V3_SPEC.md §7.1, §7.5, §9.3
+# ──────────────────────────────────────────────────────────────────────────
+def number_prefix_sums(
+    state: GameState, player: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Cumulative counts over card numbers 1..15 for (deck, discard+aside, reshuffled).
+
+    Each array is ``(16,)`` int64 with ``p[0] = 0`` and ``p[i]`` the number of
+    cards printed ``1..i``, so any interval is two lookups (see
+    :func:`count_in_open_interval`).  Built once per state and shared by every
+    sheet: one deck feeds all seats in standard mode.
+
+    ``reshuffled`` is the *immediate* reshuffle pool,
+    :func:`after_reshuffle_composition` -- plane 16 is named for exactly that and
+    is not the natural-reform pool (§7.4 R4).  ``p[-1]`` is the real denominator
+    of each (§7.1 R5).
+    """
+    deck = deck_composition(state, player).sum(axis=1)
+    pool = (
+        discard_composition(state, player) + aside_composition(state, player)
+    ).sum(axis=1)
+    return _prefix(deck), _prefix(pool), _prefix(deck + pool)
+
+
+def _prefix(counts: np.ndarray) -> np.ndarray:
+    out = np.zeros(NUM_NUMBERS + 1, dtype=np.int64)
+    np.cumsum(np.rint(counts).astype(np.int64), out=out[1:])
+    return out
+
+
+def count_in_open_interval(prefix: np.ndarray, low: int, high: int) -> int:
+    """Cards whose printed number ``n`` satisfies ``low < n < high``.
+
+    Exclusive bounds, matching ``gap_bounds`` and the §7.1 sentinels
+    (``low = -1``, ``high = 18``); anything outside ``1..15`` is clipped, since
+    no card prints it.  Card number ``n`` sits at ``prefix[n]`` because
+    :data:`CARD_NUMBERS` is exactly ``1..15``.
+    """
+    lo = min(max(low, 0), NUM_NUMBERS)          # numbers <= lo are excluded
+    hi = min(max(high - 1, 0), NUM_NUMBERS)     # numbers <= hi are included
+    return int(prefix[hi] - prefix[lo]) if hi > lo else 0
+
+
+def boundary_pool_composition(state: GameState, player: int) -> np.ndarray:
+    """``(15, 6)`` -- the pool ``_reform_deck`` sees if the next boundary exhausts the deck.
+
+    Not the discard pile as it stands: the boundary's ``_discard_step`` runs
+    *before* the draw and sweeps the three **aside** cards into it, so they are
+    already in the pool when ``_draw`` finds the deck empty (§7.5 R5 --
+    undercounting this by three was a shipped bug once).  The number cards beside
+    them are promoted, not discarded, and stay out.  So it is ``discard + aside``,
+    the same pool a queued reshuffle reforms.
+
+    Raises outside the 2+ player standard game (the only game this project trains
+    or serves) and on a prepared boundary afterstate, where the discard step has
+    already run and this would count the promoted number cards into a pool they
+    never join.
+    """
+    _require_pre_boundary(state)
+    return discard_composition(state, player) + aside_composition(state, player)
+
+
+def _require_pre_boundary(state: GameState) -> None:
+    if not state.config.standard or state.config.players < 2:
+        raise ValueError(
+            "boundary-draw features are defined for the 2+ player standard game "
+            "only, not expert or one-seat play"
+        )
+    if state.boundary_prepared:
+        raise ValueError(
+            "boundary-draw features read a mid-turn state; this is a prepared "
+            "boundary afterstate, whose discard step has already run"
+        )
+
+
+def ordered_draw_distribution(
+    deck: np.ndarray, pool: np.ndarray, draws: int = 3
+) -> np.ndarray:
+    """``(K,)*draws`` float64 -- P(draws 1, 2, 3 land in classes a, b, c), exactly.
+
+    The literal boundary draw of §7.5, over any partition of the cards into ``K``
+    classes (15 numbers, or 6 effects).  ``deck`` and ``pool`` are per-class
+    counts of the undrawn construction cards and of
+    :func:`boundary_pool_composition`.  With ``D = deck.sum()``:
+
+    * the first ``min(D, draws)`` draws come off the deck, without replacement;
+    * ``_draw`` reforms only when it *finds* the deck empty, so the rest come off
+      the pool, without replacement.  The reform shuffles the remaining deck in
+      too, but it is empty by then, so the two sources are disjoint and
+      independent.
+
+    Falling factorials, never products of marginals: §9.3 bans ``1 - (1-p)^3``.
+    Denominators follow §9.4 (``max(den, EPS)``);
+    a pool too small to finish the draw gives an all-zero joint, a state the
+    engine itself raises on.
+    """
+    deck = np.asarray(deck, dtype=np.float64)
+    pool = np.asarray(pool, dtype=np.float64)
+    from_deck = min(int(round(deck.sum())), draws)
+    return np.asarray(
+        np.multiply.outer(
+            _without_replacement(deck, from_deck),
+            _without_replacement(pool, draws - from_deck),
+        ),
+        dtype=np.float64,
+    )
+
+
+def _without_replacement(counts: np.ndarray, n: int) -> np.ndarray:
+    """Ordered joint of ``n`` draws without replacement, ``(K,)*n`` (a scalar at 0)."""
+    if n == 0:
+        return np.float64(1.0)
+    k = counts.shape[0]
+    eye = np.eye(k)
+    if n == 1:
+        num = counts
+    elif n == 2:
+        num = counts[:, None] * (counts[None, :] - eye)
+    elif n == 3:
+        num = (
+            counts[:, None, None]
+            * (counts[None, :, None] - eye[:, :, None])
+            * (counts[None, None, :] - eye[:, None, :] - eye[None, :, :])
+        )
+    else:
+        raise ValueError(f"a boundary draws at most three cards, not {n}")
+    total = float(counts.sum())
+    den = 1.0
+    for i in range(n):
+        den *= total - i
+    return np.clip(num, 0.0, None) / max(den, EPS)
+
+
+def effect_supply_rate(state: GameState, player: int) -> np.ndarray:
+    """``(6,)`` float64 -- P(effect *e* is among the three effects offered on turn+2).
+
+    Next turn's effects are printed and already in :func:`known_next_effects`;
+    the cards the *coming* boundary draws are the ones flipped aside a turn
+    later, so this is exact for turn+2 (§18 R5 #11), not a steady state.  Order
+    is :data:`DECK_EFFECT_ORDER`, so ``temp_availability_rate`` and
+    ``bis_availability_rate`` are two entries of this vector.
+
+    ``1 - P(all three draws miss e)`` over the literal boundary draw
+    (:func:`ordered_draw_distribution`), so ``D < 3`` reforms mid-draw rather
+    than taking an approximation (§9.3 R5).
+
+    ⚠ Branches on the viewer's **own** reshuffle vote, never on
+    ``reshuffle_next_turn``, which leaks an earlier actor's hidden vote (§6.4 R5).
+    If the viewer voted yes, the boundary reforms first and draws twice from the
+    reformed pool; turn+2's effects are the *second* triple, which by
+    exchangeability has the first triple's distribution over
+    :func:`after_reshuffle_composition`.  A yes vote from someone else is hidden
+    and left to search and the value head.
+    """
+    _require_pre_boundary(state)
+    if state.reshuffle_vote_for(player):
+        deck = after_reshuffle_composition(state, player).sum(axis=0)
+        pool = np.zeros(NUM_EFFECTS)
+    else:
+        deck = deck_composition(state, player).sum(axis=0)
+        pool = boundary_pool_composition(state, player).sum(axis=0)
+    joint = ordered_draw_distribution(deck, pool)
+    rate = np.empty(NUM_EFFECTS, dtype=np.float64)
+    for e in range(NUM_EFFECTS):
+        miss = np.arange(NUM_EFFECTS) != e
+        rate[e] = 1.0 - joint[np.ix_(miss, miss, miss)].sum()
+    return np.clip(rate, 0.0, 1.0)
+
+
 def _normalise(vector: np.ndarray) -> np.ndarray:
     total = float(vector.sum())
     if total <= 0.0:
@@ -244,117 +415,6 @@ def summarise(state: GameState, player: int) -> str:
             f"   next turn's effect: {nxt.name if nxt else 'n/a'}"
         )
     return "\n".join(lines)
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# Encoder v3: prefix sums and exact supply rates
-#
-# ENCODER_V3_SPEC.md §7.1, §7.4 and §9.3.  Two rules run through all of it:
-#
-#   * divide by the ACTUAL sum of the matrix being summed, never by
-#     `deck_remaining`.  In solo the undrawn deck also holds `SOLO_CARD_ID`,
-#     which is not a printed construction card and so is absent from
-#     `DECK_MATRIX`; `sum(c) == deck_remaining - 1` there.
-#   * there is no `D < 3` approximation.  The next reveal still produces three
-#     cards -- `_draw` reforms the discard mid-draw and carries on -- so the
-#     boundary is enumerated exactly rather than waved away.
-# ──────────────────────────────────────────────────────────────────────────
-def number_prefix_sums(
-    state: GameState, player: int
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Cumulative card counts over printed numbers 1..15.
-
-    Returns ``(deck, reform, reshuffled)``, each a ``(16,)`` array where
-    ``p[k]`` is the number of cards with printed number ``<= k``.  The count of
-    cards in an exclusive range ``(low, high)`` is then a single subtraction::
-
-        cards_in(low, high) = p[min(high - 1, 15)] - p[max(low, 0)]
-
-    which is what makes the fit-probability planes affordable: the sums are
-    built **once per state** and reused across all four sheets and every gap.
-
-    * ``deck``       -- the undrawn deck as it stands;
-    * ``reform``     -- what a mid-draw reform would put back (discard plus the
-      three aside cards, which ``_discard_step`` sweeps in before ``_draw``
-      finds the deck empty);
-    * ``reshuffled`` -- the pool after a queued reshuffle, i.e. both together.
-    """
-    deck = deck_composition(state, player).sum(axis=1)
-    reform = (
-        discard_composition(state, player) + aside_composition(state, player)
-    ).sum(axis=1)
-    reshuffled = deck + reform
-
-    def prefix(counts: np.ndarray) -> np.ndarray:
-        out = np.zeros(NUM_NUMBERS + 1, dtype=np.float64)
-        out[1:] = np.cumsum(counts)
-        return out
-
-    return prefix(deck), prefix(reform), prefix(reshuffled)
-
-
-def _falling(n: float, k: int) -> float:
-    """``n * (n-1) * ... * (n-k+1)``, and 1.0 for ``k == 0``."""
-    out = 1.0
-    for i in range(k):
-        out *= max(0.0, n - i)
-    return out
-
-
-def _p_none_in_next_three(deck_hits: float, deck_size: float,
-                          reform_hits: float, reform_size: float) -> float:
-    """P(none of the three cards revealed next turn is a "hit").
-
-    The reveal draws three cards **without replacement**, so this is a product of
-    falling factorials, never ``(1 - p)**3``.  And when the deck holds fewer than
-    three, ``_draw`` reforms the discard *mid-draw* and keeps going, so the three
-    cards come from two pools in sequence -- the draw does not simply stop.
-
-    Both phases are exact hypergeometrics; the deck phase takes as many cards as
-    it has, the reform phase supplies the remainder.
-    """
-    from_deck = min(3, int(deck_size))
-    from_reform = 3 - from_deck
-
-    p = 1.0
-    if from_deck:
-        denominator = _falling(deck_size, from_deck)
-        if denominator <= 0.0:
-            return 0.0
-        p *= _falling(deck_size - deck_hits, from_deck) / denominator
-    if from_reform:
-        denominator = _falling(reform_size, from_reform)
-        if denominator <= 0.0:
-            # Nothing left anywhere to draw: the question is vacuous, and
-            # reporting "a hit is impossible" is the honest reading.
-            return 1.0
-        p *= _falling(reform_size - reform_hits, from_reform) / denominator
-    return p
-
-
-def effect_supply_rate(state: GameState, player: int) -> np.ndarray:
-    """``(6,)`` -- P(effect ``e`` is among the three cards revealed next turn).
-
-    ⚠ **Not** ``1 - (1 - p)**3``.  Three cards are drawn without replacement, so
-    the independent-trials form is an approximation; at ``D = 40, k = 9`` it gives
-    0.535 against 0.545 exact, and the gap widens as the deck drains.
-
-    This is **exact for turn+2**, not a steady-state estimate: the three cards
-    drawn at the next boundary are precisely the ones whose effects are offered
-    two turns from now, because they become the asides.  Next turn's effects are
-    already certainties in :func:`known_next_effects`.
-    """
-    deck = deck_composition(state, player)
-    reform = discard_composition(state, player) + aside_composition(state, player)
-    deck_size = float(deck.sum())
-    reform_size = float(reform.sum())
-
-    rates = np.zeros(NUM_EFFECTS, dtype=np.float32)
-    for e in range(NUM_EFFECTS):
-        rates[e] = 1.0 - _p_none_in_next_three(
-            float(deck[:, e].sum()), deck_size, float(reform[:, e].sum()), reform_size
-        )
-    return rates
 
 
 def reveals_to_reform(state: GameState) -> int:
