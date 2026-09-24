@@ -43,8 +43,7 @@ def test_state_round_trips():
         a.next_u64()
     b = PortableRng(0)
     b.state = a.state
-    assert [b.next_u64() for _ in range(5)] == \
-challenge if False else [PortableRng(a.state).next_u64() for _ in range(5)]
+    assert [b.next_u64() for _ in range(5)] == [a.next_u64() for _ in range(5)]
 
 
 def test_clone_is_independent():
