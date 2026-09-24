@@ -9,7 +9,7 @@ Run: python -m pytest games/cantstop/tests/test_train.py -q
 
 import json
 import random
-from collections import Counter
+from collections import Counter, deque
 
 import numpy as np
 import pytest
@@ -217,3 +217,42 @@ def test_compare_reports_an_interval_not_just_a_rate():
     assert lo <= result["win_rate"] <= hi
     # Two games can never be significant.
     assert result["better"] is False
+
+
+# ---- replay window and passes (7WD-style schedule) ----
+
+def test_window_keeps_the_last_k_iterations():
+    buf = ReplayBuffer(window_iterations=3)
+    for i in range(5):
+        buf.add(np.full((i + 1, FEATURE_SIZE), i, np.float32),
+                np.zeros(i + 1, np.int64))
+    x, _ = buf.arrays()
+    assert buf.iterations == 3
+    assert sorted(set(x[:, 0].tolist())) == [2.0, 3.0, 4.0]
+    assert len(buf) == 3 + 4 + 5
+
+
+def test_a_buffer_needs_some_limit():
+    with pytest.raises(ValueError, match="max_rows, window_iterations"):
+        ReplayBuffer()
+
+
+def test_passes_are_per_lifetime_even_while_the_window_fills():
+    """Simulate the schedule: every row that lives a full window must be
+    sampled ``passes`` times on average, including the first iteration's
+    rows, which arrive in the thinnest buffer. Uneven iteration sizes on
+    purpose -- rows per iteration vary with game length."""
+    from games.cantstop.train import steps_for_passes
+    window, passes, batch = 30, 5.0, 1
+    sizes = [9000, 6500, 4000] + [4500 + 97 * (i % 7) for i in range(60)]
+    held, lifetime = deque(), {}
+    for it, n in enumerate(sizes):
+        held.append((it, n))
+        if len(held) > window:
+            held.popleft()
+        rows = sum(k for _, k in held)
+        samples = steps_for_passes(rows, passes, window, batch) * batch
+        for born, _ in held:
+            lifetime[born] = lifetime.get(born, 0.0) + samples / rows
+    full = [lifetime[b] for b in range(len(sizes) - window)]
+    assert all(abs(v - passes) < 0.01 for v in full), full[:5]

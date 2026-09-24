@@ -18,6 +18,7 @@ can replace the execution without touching the schedule.
 
 import argparse
 import json
+import math
 import random
 import time
 from collections import deque
@@ -43,16 +44,23 @@ MVP_RULES = RuleSet.make(2, extended=False, blocking=False)
 
 
 class ReplayBuffer:
-    """Most-recent-rows buffer, trimmed by row count rather than by game.
+    """Most-recent rows, one chunk per ``add`` (per iteration).
 
-    Rows, not games, is the right unit even here: a 4-player or 5-column game
-    contributes several times the rows of a 2-player base game, so trimming by
-    game would silently weight the buffer towards the longer variants once
-    more than one rule set is in play.
+    Two independent limits, either or both:
+
+    * ``window_iterations`` -- keep the last K iterations' rows, as 7WD's
+      ``--replay-window``. The run's default; it is what makes
+      ``--passes`` mean "passes over each position's lifetime".
+    * ``max_rows`` -- a hard row cap, trimmed by whole iterations. Rows, not
+      games, because a 4-player or 5-column game contributes several times
+      the rows of a 2-player base game.
     """
 
-    def __init__(self, max_rows):
+    def __init__(self, max_rows=None, window_iterations=None):
+        if max_rows is None and window_iterations is None:
+            raise ValueError("give max_rows, window_iterations, or both")
         self.max_rows = max_rows
+        self.window_iterations = window_iterations
         self._chunks = deque()
         self._rows = 0
 
@@ -63,9 +71,17 @@ class ReplayBuffer:
             return
         self._chunks.append((features, slots))
         self._rows += len(features)
-        while self._rows > self.max_rows and len(self._chunks) > 1:
+        while len(self._chunks) > 1 and (
+                (self.max_rows is not None and self._rows > self.max_rows)
+                or (self.window_iterations is not None
+                    and len(self._chunks) > self.window_iterations)):
             old_x, _ = self._chunks.popleft()
             self._rows -= len(old_x)
+
+    @property
+    def iterations(self):
+        """Iterations actually held (realised window)."""
+        return len(self._chunks)
 
     def __len__(self):
         return self._rows
@@ -131,10 +147,29 @@ def train_steps(net, buffer, opt, steps, batch_size, device, rng):
     return float(np.mean(losses))
 
 
+def steps_for_passes(buffer_rows, passes, replay_window, batch_size):
+    """Optimizer steps this iteration so that every position is sampled
+    ``passes`` times on average over its whole life in the buffer.
+
+    Each iteration draws ``passes / replay_window`` of the current buffer, so
+    a row that lives the full window collects exactly ``passes`` -- whether
+    it arrived in a thin early buffer or a full one. (A per-new-row rule,
+    ``passes * new_rows``, instead hammers the first iterations' rows: they
+    are resampled every iteration while the buffer is small, ~5 * H(30) = 20
+    passes for iteration 1's rows at a 30-iteration window.) The cost is
+    light training early, until the window fills.
+    """
+    samples = passes * buffer_rows / replay_window
+    return max(1, math.ceil(samples / batch_size))
+
+
 def run(out_dir, iterations, games, rule_sets=(MVP_RULES,), hidden=(256, 256),
-        lr=1e-3, batch_size=256, steps=200, buffer_rows=20000,
-        arena_games=60, seed=0, device=None, init_checkpoint=None,
-        backend="auto", threads=0, in_flight=None):
+        lr=1e-3, batch_size=256, steps=None, passes=5.0, replay_window=30,
+        buffer_rows=None, arena_games=60, seed=0, device=None,
+        init_checkpoint=None, backend="auto", threads=0, in_flight=None):
+    """``steps=None`` derives each iteration's steps from ``passes`` and
+    ``replay_window`` (``steps_for_passes``); an integer fixes them, as
+    the pre-window loop did."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     log_path = out / "run.jsonl"
@@ -158,7 +193,8 @@ def run(out_dir, iterations, games, rule_sets=(MVP_RULES,), hidden=(256, 256),
     baseline = NetEvaluator(baseline_net, device=str(device))
 
     opt = torch.optim.Adam(net.parameters(), lr=lr)
-    buffer = ReplayBuffer(buffer_rows)
+    buffer = ReplayBuffer(max_rows=buffer_rows,
+                          window_iterations=replay_window)
 
     for it in range(1, iterations + 1):
         started = time.time()
@@ -169,13 +205,25 @@ def run(out_dir, iterations, games, rule_sets=(MVP_RULES,), hidden=(256, 256),
 
         x, y = stack_rows(results)
         buffer.add(x, y)
-        loss = train_steps(net, buffer, opt, steps, batch_size, device,
+        it_steps = (steps if steps is not None else
+                    steps_for_passes(len(buffer), passes, replay_window,
+                                     batch_size))
+        loss = train_steps(net, buffer, opt, it_steps, batch_size, device,
                            torch_rng)
+        samples = it_steps * min(batch_size, len(buffer))
 
         record = {
             "iteration": it,
             "loss": loss,
             "buffer_rows": len(buffer),
+            # 7WD's training-schedule columns: the realised window and how
+            # hard this iteration leaned on the data it has.
+            "window_iterations": buffer.iterations,
+            "new_rows": len(x),
+            "train_steps": it_steps,
+            "samples": samples,
+            "samples_per_new_position": round(samples / len(x), 3),
+            "buffer_passes": round(samples / len(buffer), 4),
             "gen_seconds": round(gen_seconds, 1),
             "seconds_per_game": round(gen_seconds / max(1, len(results)), 2),
             **summarize(results),
@@ -211,8 +259,16 @@ def main(argv=None):
     p.add_argument("--hidden", type=int, nargs="+", default=[256, 256])
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--batch-size", type=int, default=256)
-    p.add_argument("--steps", type=int, default=200)
-    p.add_argument("--buffer-rows", type=int, default=20000)
+    p.add_argument("--steps", type=int, default=None,
+                   help="fixed optimizer steps per iteration; overrides "
+                        "--passes")
+    p.add_argument("--passes", type=float, default=5.0,
+                   help="average times each position is sampled over its "
+                        "life in the buffer; sets steps per iteration")
+    p.add_argument("--replay-window", type=int, default=30,
+                   help="iterations of self-play kept in the buffer")
+    p.add_argument("--buffer-rows", type=int, default=None,
+                   help="optional hard row cap on top of the window")
     p.add_argument("--arena-games", type=int, default=60,
                    help="0 to skip the head-to-head checks")
     p.add_argument("--seed", type=int, default=0)
@@ -237,6 +293,8 @@ def main(argv=None):
         lr=args.lr,
         batch_size=args.batch_size,
         steps=args.steps,
+        passes=args.passes,
+        replay_window=args.replay_window,
         buffer_rows=args.buffer_rows,
         arena_games=args.arena_games,
         seed=args.seed,
