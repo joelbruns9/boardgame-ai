@@ -1,0 +1,22 @@
+[package]
+name = "cantstop_rust"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "cantstop_rust"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# M0-M2 need pyo3 and nothing else. rayon arrives at M3, after single-threaded
+# equivalence is green -- that ordering is the one explicit "do it again" from
+# the Kingdomino port.
+#
+# Pinned at 0.28.x deliberately: 0.28 renamed `Python::with_gil` -> `attach`
+# and `allow_threads` -> `detach`, which M3 needs at the evaluator boundary.
+pyo3 = { version = "0.28.3", features = ["extension-module"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
