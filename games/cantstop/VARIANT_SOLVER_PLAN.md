@@ -227,11 +227,86 @@ batch crosses back.
   sets, lockstep. **A uniform-random driver is not a gate** (WT trap): cycle
   drivers and add constructed positions for blocking-blocked stops, the runner
   cap, and claim-clears-markers.
+  **GREEN (2026-09-24).** `src/engine.rs`, `snapshot.py` (the shared 8-tuple
+  both engines emit and load), `rust_equiv.py` (lockstep harness + CLI),
+  `tests/test_rust_engine_equiv.py`. Full gate
+  `python -m games.cantstop.rust_equiv --games-per-cell 100`: 4,000 games
+  (10 rule sets x 4 drivers: uniform / pusher / cautious / climber), 1.395M
+  steps, 0 divergences, 114 s. After every step it compares the snapshot, the
+  dice *and the RNG state*, legal moves, `can_stop`, `stop_blocked`; every
+  25th step all 126 dice multisets; every 5th step every transition on
+  clones, illegal ones included (same `ValueError`, state untouched).
+  Coverage: 169k blocked decisions, 68k busts, 90k cap-split rolls, 4k
+  one-space doubles, 21k claims that wiped an opponent's marker. 16
+  constructed positions, each fixture asserted to hit what it names. Gate
+  goes red on 6/6 Rust mutations (cap off-by-one, double room, claim keeps
+  markers, strict win, unsorted dice, blocking scans only two seats) and on 6
+  Python-side ones in the test file. One surviving mutant is *equivalent*,
+  not a gap: counting the mover's own marker as a blocker changes nothing,
+  because a runner always sits above its own saved marker.
 - **M2 — solver equivalence.** Same positions, compare the full decision table,
   not just the chosen move, against the Python solver under a deterministic
   **mock** evaluator — that isolates enumeration and backup from torch FP noise.
   Use **f64 throughout**, not f32: f32 diverges after tens of accumulations and
   breaks bit-identity because Python accumulates in float64.
+  **GREEN (2026-09-24), bit-exact:** full gate `--positions-per-ruleset 10`
+  = 400 solves (10 rule sets x 10 positions x 4 evaluators), 3.60M
+  configurations, 0 divergences, 18 min. `src/solver.rs`, `rust_solver.py`
+  (`RustTurnSolver`, a drop-in for `TurnSolver`, plus the gate and CLI
+  `python -m games.cantstop.rust_solver`), `tests/test_rust_solver_equiv.py`.
+  The Rust solver is **two-phase**: construct (enumerate) ->
+  `leaf_snapshots()` -> evaluate in Python -> `set_leaf_values` (backup) ->
+  query. That split is the M3 coalescing seam. The gate compares every
+  configuration's stoppable / winning / bust prob / menu (children and
+  probabilities) / stop, roll and decision values / stop flag with `==`,
+  then `value` / `choose_move` / `should_stop` on sampled configurations
+  under all 126 dice. Four mock evaluators; **`mover_wins`** (every leaf,
+  bust included, a win for the seat that just moved) puts every stop-or-roll
+  choice within 1.3e-15 of a tie with both answers common, so the summation
+  order and the prefer-stopping tie-break decide -- it is what makes
+  "bit-exact" a real claim. (`flat` never exercises the stop tie: winning
+  leaves make rolling strictly better.) Mutations: 6/7 caught (stop tie
+  strict, backup last-max, fused multiply-add, win off-by-one, query
+  last-max, empty root stoppable); the survivor (`w/1296` -> `w*(1/1296)`) is
+  equivalent -- class weights are only {1,4,6,8,12,18,24}, all exact.
+  **Measured, 2p base, AWAIT_MOVE roots (the self-play entry point), 15
+  positions, mean 3.7k configurations:** warm-cache Python 256 ms/solve vs
+  Rust enumerate + backup 12.4 ms -> **~21x**. ⚠ The M2 boundary now
+  dominates: `leaf_snapshots` 3.8 ms + rebuilding Python `GameState`s 29.7 ms
+  per solve, before any encoder runs. **M3 must encode leaves in Rust
+  straight into a float32 buffer** (port `encoder.py`, gate it bit-exact on
+  f32 against the Python encoder) rather than ship boards across.
+  **DONE (2026-09-24):** `src/encoder.rs`; `TurnSolver.leaf_features()`
+  returns LE float32 bytes, `NetEvaluator.evaluate_features(features,
+  reference)` takes them, and `RustTurnSolver` uses that path whenever the
+  evaluator has it (mocks still go through boards).
+  `tests/test_rust_encoder_equiv.py` compares raw bytes on every leaf of
+  sampled solves in all 10 rule sets and on ~1.2k whole-game boards.
+  Mutations: 2/3 caught (columns-needed scaled by the rule set's own
+  threshold -- the known trap -- and reversed seat rotation); the survivor
+  (divide in f32 instead of f64-then-cast) is provably equivalent for one
+  division. **Measured end to end with the (untrained) net on CPU, warm
+  caches, 15 AWAIT_MOVE roots:** 2p base Python 416 ms vs Rust 24.5 ms per
+  solve (**17x**; net forward 3.5 ms of it); 4p blocking 257 vs 12.1 ms
+  (**21x**).
+  **SUPERSEDED the same day -- that 17-21x was my implementation, not the
+  port's ceiling.** Profiling the Rust path showed enumeration at 64% and
+  ~4 us per configuration. Two causes, both fixed: (1) the menu cache was
+  rebuilt per solve while Python's is module-level and warm -- now one per
+  thread for the process (14.5 -> 5.8 ms); (2) per-node `Vec<Vec<usize>>`
+  menu groups sorted per group, ~150k small allocations per solve -- now
+  flat storage (one `kids` pool, `len x players` f64 slabs, FxHash maps,
+  the sorted-first-max tie-break done as "larger value, or equal value and
+  smaller key" with no sort) -> 1.4 ms. Values now cross as f64 bytes
+  (`set_leaf_values_bytes`). **Re-measured, same 15 positions, warm caches
+  both sides:** 2p base with net 410.7 -> 6.80 ms (**60x**), solver alone
+  357 -> 1.62 ms (**220x**); 4p blocking with net 257 -> 3.87 ms (**66x**),
+  solver alone 222 -> 1.12 ms (**198x**). All equivalence tests re-run green
+  and the backup mutations re-checked on the new code (4/4 caught).
+  ⚠ **With the solver this fast the net forward is now ~half of a Rust
+  solve (3.1 of 6.5 ms)** -- i.e. self-play becomes evaluator-bound, the
+  7WD shape. That is what M3's cross-game batching (and a GPU forward) is
+  for; further Rust tuning of enumeration has little left to buy.
 - **M3 — multicore (separate milestone, after M1/M2 are green).** Land
   single-threaded-correct first, then parallelize — this ordering is the one
   explicit "do it again" from the KD port. Parallelism goes over **games**

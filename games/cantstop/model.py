@@ -106,7 +106,14 @@ class NetEvaluator:
     def __call__(self, states):
         if not states:
             raise ValueError("evaluator called with no boards")
-        features = encode_batch(states)
+        return self.evaluate_features(encode_batch(states), states[0])
+
+    @torch.no_grad()
+    def evaluate_features(self, features, reference):
+        """The same, from already-encoded boards. ``reference`` is any board
+        sharing the batch's rule set and seat to move -- only those two are
+        read, to rotate the output back to absolute seats. This is the entry
+        the Rust solver uses: it encodes leaves itself (``RustTurnSolver``)."""
         chunks = []
         step = self.batch_size or len(features)
         for start in range(0, len(features), step):
@@ -119,7 +126,7 @@ class NetEvaluator:
         # to_absolute widens to float64, which is the contract the solver
         # needs: backward induction sums these thousands of times, and the
         # Rust port is specified to accumulate in f64 for the same reason.
-        return to_absolute(probs, states[0])
+        return to_absolute(probs, reference)
 
 
 def save_net(net, path):
