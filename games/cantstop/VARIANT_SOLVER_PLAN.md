@@ -147,6 +147,17 @@ Python self-play is roughly 1 s per turn on one core.
 
 ### Phase 2 — MVP learning test (Python, deliberately narrow)
 
+**Status: BUILT (2026-09-24), the run itself is the remaining work.**
+`encoder.py` (8c8641a), `model.py` (ef359dd), `self_play.py` + `arena.py` +
+`train.py` (4f43832). 182 tests, every module mutation-checked.
+
+Launch (from the worktree root, `boardgame-ai-cantstop`):
+
+    python -m games.cantstop.train --out runs/mvp --iterations 10 --games 20
+
+At the measured ~10 s/game for 2p base that is ~35 min of generation plus the
+arena checks; single-process.
+
 Purpose: prove the **loop learns at all** — encoder, labels, training step and
 the net-as-evaluator contract — at the smallest scale that can show it. This is
 *not* the full multi-variant gate; that moves to Phase 4, on Rust.
@@ -173,8 +184,9 @@ the net-as-evaluator contract — at the smallest scale that can show it. This i
   gate the MVP on integration rather than on learning. Self-play with the
   current net → one row per turn end, labelled with the eventual game winner
   (one-hot over seats) → cross-entropy → repeat.
-- **Multicore:** allowed here (`GameState` pickles cleanly; process pool over
-  *games*). Keep the fan-out logic — variant scheduling, per-variant row
+- **Multicore:** NOT YET BUILT -- `generate()` in `train.py` is the seam it
+  slots into, and is deliberately free of execution detail. Allowed here
+  (`GameState` pickles cleanly; process pool over *games*). Keep the fan-out logic — variant scheduling, per-variant row
   budgets, result collection, checkpoint cadence — in its own module, separate
   from the pool mechanism, because the fan-out survives the Rust port and the
   `multiprocessing` mechanism does not. **Smoke/correctness tests stay
