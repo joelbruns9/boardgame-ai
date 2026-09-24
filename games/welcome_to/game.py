@@ -1949,3 +1949,131 @@ def _p_any_stack_supplies(
     if total <= 0.0:
         return 0.0
     return 1.0 - miss / total
+
+
+def plan_threats(
+    state: "GameState", viewer: int, seat: int
+) -> tuple[list[bool], list[float]]:
+    """All three slots' :func:`can_complete_this_turn` and
+    :func:`p_complete_next_turn` in one pass.
+
+    Identical in value to calling the two singular predicates per slot -- which
+    ``tests/test_plan_threat.py`` asserts directly -- but it shares the work they
+    cannot share.  Both of them enumerate ``one_turn_sheets`` and then ask one
+    plan about the result; the enumeration does not depend on the plan, so three
+    slots repeat it three times, and ``_completing_numbers`` repeats it again for
+    every printed number of every stack.
+
+    Two shared passes replace that:
+
+    * one enumeration over the real offer, tested against every live plan;
+    * one enumeration per ``(effect, number)`` pair, memoised, tested against
+      every live plan -- so two stacks showing the same effect, and all three
+      plan slots, cost one walk between them.
+
+    The encoder calls this once per seat.  It matters because the cost is
+    concentrated where the sheet is still SPARSE: an empty sheet reaches ~32,000
+    one-turn sheets against ~300 late, and the early game is exactly where a
+    plan first comes within its one-turn ceiling.
+    """
+    slots = range(3)
+    if not state.config.standard:
+        return [False] * 3, [0.0] * 3
+
+    sheet = state.sheet_for(viewer, seat)
+    plans = [PLANS[state.plan_ids[s]] for s in slots]
+    banked = [seat in state.plan_turns_for(viewer, s) for s in slots]
+    done = [
+        (not banked[s]) and can_be_scored(plans[s], sheet) for s in slots
+    ]
+
+    # A plan is "live" when the answer is not already settled without walking.
+    live = [
+        s
+        for s in slots
+        if not banked[s] and not done[s] and not _one_turn_hopeless(plans[s], sheet)
+    ]
+
+    can_now = [False] * 3
+    for s in slots:
+        if done[s]:
+            can_now[s] = True
+
+    if live:
+        remaining = set(live)
+        offers = state.visible_cards(viewer)
+        for candidate in one_turn_sheets(
+            sheet, offers, advanced=state.config.advanced
+        ):
+            for s in tuple(remaining):
+                if can_be_scored(plans[s], candidate):
+                    can_now[s] = True
+                    remaining.discard(s)
+            if not remaining:
+                break
+
+    p_next = [0.0] * 3
+    for s in slots:
+        if done[s]:
+            p_next[s] = 1.0
+    if not live:
+        return can_now, p_next
+
+    known = state.next_effects(viewer)
+    reshuffling = state.reshuffle_vote_for(viewer)
+    if reshuffling:
+        known = [None, None, None]
+
+    # (effect, number) -> the live slots some one-turn sequence would complete.
+    memo: dict[tuple[Optional[Effect], int], frozenset[int]] = {}
+
+    def completing(effect: Optional[Effect], number: int) -> frozenset[int]:
+        key = (effect, number)
+        hit = memo.get(key)
+        if hit is not None:
+            return hit
+        effects = [effect] if effect is not None else list(Effect)
+        found: set[int] = set()
+        for candidate_effect in effects:
+            if candidate_effect not in _EFFECT_PHASE:
+                continue
+            for candidate in one_turn_sheets(
+                sheet, [(number, candidate_effect)], advanced=state.config.advanced
+            ):
+                for s in live:
+                    if s not in found and can_be_scored(plans[s], candidate):
+                        found.add(s)
+                if len(found) == len(live):
+                    break
+            if len(found) == len(live):
+                break
+        result = frozenset(found)
+        memo[key] = result
+        return result
+
+    per_slot_wanted: dict[int, list[set[int]]] = {s: [set(), set(), set()] for s in live}
+    for i, effect in enumerate(known):
+        for number in range(1, 16):
+            for s in completing(effect, number):
+                per_slot_wanted[s][i].add(number)
+
+    from games.welcome_to import deck_knowledge as _dk
+
+    if reshuffling:
+        pool = _dk.after_reshuffle_composition(state, viewer).sum(axis=1)
+        deck = pool
+        reform = np.zeros_like(pool)
+    else:
+        deck = _dk.deck_composition(state, viewer).sum(axis=1)
+        reform = (
+            _dk.discard_composition(state, viewer)
+            + _dk.aside_composition(state, viewer)
+        ).sum(axis=1)
+
+    for s in live:
+        wanted = per_slot_wanted[s]
+        if not any(wanted):
+            continue
+        p_next[s] = _p_any_stack_supplies(deck, reform, wanted)
+
+    return can_now, p_next

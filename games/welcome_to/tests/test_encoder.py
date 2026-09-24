@@ -76,9 +76,25 @@ def test_block_names_are_unique_across_the_two_vectors():
 
 def test_shape_does_not_depend_on_the_player_count():
     shapes = set()
-    for players in (1, 2, 3, 4):
+    for players in (2, 3, 4):
         shapes.add(tuple(a.shape for a in enc.encode_state(_game(players))))
     assert len(shapes) == 1
+
+
+def test_one_seat_and_expert_are_out_of_scope():
+    """§0.5: v3 is the 2+ player standard game; everything else RAISES.
+
+    Silently encoding them would emit all-zero `next_effects` and a discard
+    composition that is zero in expert -- i.e. a confident row built from
+    features that do not exist.
+    """
+    with pytest.raises(ValueError, match=r"2\+ player"):
+        enc.encode_state(_game(1))
+    with pytest.raises(ValueError, match=r"2\+ player"):
+        enc.encode_state(
+            GameState.new(seed=3, config=GameConfig(players=2, advanced=True,
+                                                    expert=True))
+        )
 
 
 def test_encoding_is_finite_and_bounded():
@@ -347,11 +363,12 @@ def test_the_plan_block_moves_when_that_seat_advances():
 def test_the_plan_block_reports_this_seats_own_progress():
     state = _game(2)
     state.sheets[0].temps = 7
-    block = enc.encode_state(state, 0)[1][0, enc.block_slice("plans")].reshape(3, 3)
+    sheets = enc.encode_state(state, 0)[1]
     for slot, plan_id in enumerate(state.plan_ids):
+        block = sheets[0, enc.plan_slot_slice(slot)]
         fraction, _ = progress(PLANS[plan_id], state.sheets[0])
-        assert block[slot, 0] == np.float32(fraction)
-        assert block[slot, 2] == 0.0, "nothing is banked yet"
+        assert block[0] == np.float32(fraction)
+        assert block[2] == 0.0, "nothing is banked yet"
 
 
 def test_capacity_block_falls_when_a_street_is_blocked():
@@ -405,9 +422,9 @@ def test_a_banked_plan_shows_on_the_seat_that_banked_it():
     state = _game(2)
     state.plan_turns[0][1] = state.turn - 1  # seat 1 completed plan slot 0
     _, sheets, _, glob = enc.encode_state(state, 0)
-    plans = enc.block_slice("plans")
-    assert sheets[0, plans].reshape(3, 3)[0, 2] == 0.0, "the viewer did not"
-    assert sheets[1, plans].reshape(3, 3)[0, 2] == 1.0, "seat 1 did"
+    slot0 = enc.plan_slot_slice(0)
+    assert sheets[0, slot0][2] == 0.0, "the viewer did not"
+    assert sheets[1, slot0][2] == 1.0, "seat 1 did"
 
     identity = glob[enc.block_slice("plan_identity")].reshape(3, -1)
     assert identity[0, -1] == 0.0, "the first-place value is claimed"
