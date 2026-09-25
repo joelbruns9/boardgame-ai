@@ -31,10 +31,11 @@ from .arena import compare
 from .encoder import FEATURE_SIZE
 from .engine import ALL_RULESETS, RuleSet
 from .model import (
-    CantStopNet, NetEvaluator, load_net, masked_cross_entropy, save_net,
+    CantStopNet, NetEvaluator, load_net, masked_cross_entropy,
+    masked_soft_cross_entropy, save_net,
     seat_mask_tensor,
 )
-from .self_play import play_game, stack_rows, summarize
+from .self_play import play_game, stack_training, summarize
 from .portable_rng import PortableRng
 from .solver import ProgressHeuristic
 
@@ -130,6 +131,10 @@ def train_steps(net, buffer, opt, steps, batch_size, device, rng):
     x_all = torch.from_numpy(x_all).to(device)
     y_all = torch.from_numpy(y_all).to(device)
     mask_all = seat_mask_tensor(x_all)
+    # 1-D integer rows are winner slots; 2-D float rows are TD targets
+    # (a distribution over slots, ``self_play.td_targets``).
+    soft = y_all.ndim == 2
+    loss_fn = masked_soft_cross_entropy if soft else masked_cross_entropy
 
     net.train()
     losses = []
@@ -139,7 +144,7 @@ def train_steps(net, buffer, opt, steps, batch_size, device, rng):
             np.array([rng.randrange(n) for _ in range(min(batch_size, n))])
         ).to(device)
         opt.zero_grad()
-        loss = masked_cross_entropy(net(x_all[idx]), y_all[idx], mask_all[idx])
+        loss = loss_fn(net(x_all[idx]), y_all[idx], mask_all[idx])
         loss.backward()
         opt.step()
         losses.append(loss.item())
@@ -166,7 +171,8 @@ def steps_for_passes(buffer_rows, passes, replay_window, batch_size):
 def run(out_dir, iterations, games, rule_sets=(MVP_RULES,), hidden=(256, 256),
         lr=1e-3, batch_size=256, steps=None, passes=5.0, replay_window=30,
         buffer_rows=None, arena_games=60, seed=0, device=None,
-        init_checkpoint=None, backend="auto", threads=0, in_flight=None):
+        init_checkpoint=None, backend="auto", threads=0, in_flight=None,
+        td_lambda=0.7):
     """``steps=None`` derives each iteration's steps from ``passes`` and
     ``replay_window`` (``steps_for_passes``); an integer fixes them, as
     the pre-window loop did."""
@@ -203,7 +209,9 @@ def run(out_dir, iterations, games, rule_sets=(MVP_RULES,), hidden=(256, 256),
                            threads=threads, in_flight=in_flight)
         gen_seconds = time.time() - started
 
-        x, y = stack_rows(results)
+        # Targets are fixed when rows enter the buffer, from the net that
+        # played the game -- as TD-Gammon's were, and as 7WD's search targets.
+        x, y = stack_training(results, td_lambda)
         buffer.add(x, y)
         it_steps = (steps if steps is not None else
                     steps_for_passes(len(buffer), passes, replay_window,
@@ -219,6 +227,7 @@ def run(out_dir, iterations, games, rule_sets=(MVP_RULES,), hidden=(256, 256),
             # 7WD's training-schedule columns: the realised window and how
             # hard this iteration leaned on the data it has.
             "window_iterations": buffer.iterations,
+            "td_lambda": td_lambda,
             "new_rows": len(x),
             "train_steps": it_steps,
             "samples": samples,
@@ -265,6 +274,10 @@ def main(argv=None):
     p.add_argument("--passes", type=float, default=5.0,
                    help="average times each position is sampled over its "
                         "life in the buffer; sets steps per iteration")
+    p.add_argument("--td-lambda", type=float, default=0.7,
+                   help="value-target lambda-return: 1 = game outcome only "
+                        "(the pre-TD labels), 0 = one-step TD against the "
+                        "next turn's solver value")
     p.add_argument("--replay-window", type=int, default=30,
                    help="iterations of self-play kept in the buffer")
     p.add_argument("--buffer-rows", type=int, default=None,
@@ -295,6 +308,7 @@ def main(argv=None):
         steps=args.steps,
         passes=args.passes,
         replay_window=args.replay_window,
+        td_lambda=args.td_lambda,
         buffer_rows=args.buffer_rows,
         arena_games=args.arena_games,
         seed=args.seed,

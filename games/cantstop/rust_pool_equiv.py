@@ -70,7 +70,8 @@ class MoverWinsMock(FeatureMock):
 
 MOCKS = {"hashed": HashedMock(), "mover_wins": MoverWinsMock()}
 
-FIELDS = ("winner", "turns", "solves", "evaluator_rows", "turn_lengths")
+FIELDS = ("winner", "turns", "solves", "evaluator_rows", "turn_lengths",
+          "turn_values")
 
 
 def compare_results(py, rs, where):

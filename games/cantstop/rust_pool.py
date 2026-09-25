@@ -224,8 +224,8 @@ def run_pool(rules_list, seeds, evaluators, seating=None,
     all_features = np.frombuffer(bytearray(pool.features()),
                                  dtype="<f4").reshape(-1, FEATURE_SIZE)
     results, at = [], 0
-    for (gid, winner, rows, slots, turns, solves, ev_rows, lengths), rules \
-            in zip(pool.results(), rules_list, strict=True):
+    for (gid, winner, rows, slots, turns, solves, ev_rows, lengths,
+         values), rules in zip(pool.results(), rules_list, strict=True):
         feats = all_features[at:at + rows]
         at += rows
         results.append(GameResult(
@@ -238,6 +238,7 @@ def run_pool(rules_list, seeds, evaluators, seating=None,
             solves=solves,
             evaluator_rows=ev_rows,
             turn_lengths=list(lengths),
+            turn_values=[None if v is None else list(v) for v in values],
         ))
     return results
 

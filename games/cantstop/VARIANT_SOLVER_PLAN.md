@@ -416,8 +416,18 @@ checkpointing, run log and gating.
 - **Sampling:** balance by **rows per variant**, not games (4-player and
   5-column games are longer, so equal games silently trains a 4-player
   specialist).
-- **Targets:** baseline is game outcome. Blending in the solver's own root
-  value is a later, measured change.
+- **Targets:** ~~baseline is game outcome; blending in the solver's own root
+  value is a later, measured change~~ **BUILT 2026-09-24 (moved up after the
+  mvp2 plateau, TD-Gammon lineage):** a lambda-return, `self_play.td_targets`.
+  Row i (the board after turn i) takes G_i = (1-lam) v_{i+1} + lam G_{i+1}.
+  v_{i+1} is the solver's value at the NEXT turn's opening roll: a one-turn-
+  deeper estimate of row i, sampled over that roll. G at the end is the
+  one-hot winner. An opening bust has no solve, and G passes through. lam is
+  applied when rows enter the buffer, from the net that played the game
+  (`--td-lambda`, default **0.7**, TD-Gammon's classic value; 1.0 = the old
+  outcome labels). The pool records `turn_values` and the M3 gate compares
+  them to Python. Loss: `masked_soft_cross_entropy`. **Not yet measured
+  against lam = 1.**
 - **Baselines:** heuristic-leaf solver (all variants); earlier checkpoints.
 - **Gate:** win rate vs the heuristic-leaf solver rises across iterations in
   **every** variant, not just the common ones.

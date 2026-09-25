@@ -523,7 +523,7 @@ fn f64_from_bytes(raw: &[u8]) -> PyResult<Vec<f64>> {
 }
 
 type BlockOut = (usize, usize, u8, u8, u8);
-type GameOut = (u64, i64, i64, Vec<i64>, u32, u32, u64, Vec<u32>);
+type GameOut = (u64, i64, i64, Vec<i64>, u32, u32, u64, Vec<u32>, Vec<Option<Vec<f64>>>);
 
 /// Many self-play or arena games advanced together (M3). Python's loop:
 ///
@@ -666,7 +666,8 @@ impl PySelfPlayPool {
     }
 
     /// One tuple per game, in game order: `(id, winner, rows, winner_slots,
-    /// turns, solves, evaluator_rows, turn_lengths)`, with the features of
+    /// turns, solves, evaluator_rows, turn_lengths, turn_values)`, with the
+    /// features of
     /// every game concatenated in `features()`. Winner is -1 for a failed
     /// game.
     fn results(&self) -> PyResult<Vec<GameOut>> {
@@ -683,7 +684,17 @@ impl PySelfPlayPool {
                     Some(w) => (w as i64, g.winner_slots().iter().map(|&s| s as i64).collect()),
                     None => (-1, Vec::new()),
                 };
-                (g.id, winner, rows, slots, g.turns, g.solves, g.evaluator_rows, g.turn_lengths.clone())
+                (
+                    g.id,
+                    winner,
+                    rows,
+                    slots,
+                    g.turns,
+                    g.solves,
+                    g.evaluator_rows,
+                    g.turn_lengths.clone(),
+                    g.turn_values.clone(),
+                )
             })
             .collect())
     }

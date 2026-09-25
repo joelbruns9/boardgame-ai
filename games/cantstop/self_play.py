@@ -46,23 +46,31 @@ class GameResult:
     solves: int
     evaluator_rows: int
     turn_lengths: list = field(default_factory=list)
+    # Per turn: the solver's absolute-seat value right after the opening
+    # roll, or None when that roll busted. The TD bootstrap (td_targets).
+    turn_values: list = field(default_factory=list)
     boards: list = None           # only when play_game(keep_boards=True)
 
     def __len__(self):
         return len(self.winner_slots)
 
 
-def play_turn(state, evaluate, rng):
+def play_turn(state, evaluate, rng, values=None):
     """Play the active player's whole turn. Returns (solves, decisions).
 
     ``state`` is mutated in place and left at the start of the next player's
-    turn (or game over).
+    turn (or game over). If ``values`` is a list, the solver's value at the
+    opening roll is appended to it (None for an opening bust).
     """
     moves = roll(state, random_dice(rng))
     if not moves:
+        if values is not None:
+            values.append(None)
         return 0, 0               # busted on the opening roll; no solve needed
 
     solver = TurnSolver(state, evaluate)
+    if values is not None:
+        values.append(solver.value(state).tolist())
     decisions = 0
     while True:
         apply_move(state, solver.choose_move(state))
@@ -79,7 +87,7 @@ def play_game(rules, evaluate, rng, max_turns=DEFAULT_MAX_TURNS,
               keep_boards=False):
     """Play one game to completion and collect its training rows."""
     state = GameState(rules)
-    boards, turns, solves, turn_lengths = [], 0, 0, []
+    boards, turns, solves, turn_lengths, turn_values = [], 0, 0, [], []
     evaluator_rows_before = getattr(evaluate, "rows", 0)
 
     while not state.game_over:
@@ -87,7 +95,7 @@ def play_game(rules, evaluate, rng, max_turns=DEFAULT_MAX_TURNS,
             raise TurnLimitExceeded(
                 f"{rules} reached {max_turns} turns with no winner; the "
                 "policy is likely never banking progress")
-        used, decisions = play_turn(state, evaluate, rng)
+        used, decisions = play_turn(state, evaluate, rng, turn_values)
         turns += 1
         solves += used
         turn_lengths.append(decisions)
@@ -108,6 +116,7 @@ def play_game(rules, evaluate, rng, max_turns=DEFAULT_MAX_TURNS,
         solves=solves,
         evaluator_rows=getattr(evaluate, "rows", 0) - evaluator_rows_before,
         turn_lengths=turn_lengths,
+        turn_values=turn_values,
         boards=boards if keep_boards else None,
     )
 
@@ -124,6 +133,54 @@ def stack_rows(results):
         raise ValueError("no rows to stack")
     return (np.concatenate([r.features for r in usable]),
             np.concatenate([r.winner_slots for r in usable]))
+
+
+def td_targets(result, lam):
+    """Soft value targets (rows, MAX_SEATS) float32, in each row's encoding
+    slots: the lambda-return over the game's turns.
+
+    Row i is the board after turn i; turn i+1 starts from it, and the
+    solver's value at that turn's opening roll (``turn_values[i + 1]``) is a
+    one-turn-deeper estimate of the row's value, sampled over the opening
+    roll. So, backwards from the final outcome z (one-hot winner):
+
+        G_R = z;   G_i = (1 - lam) * v_{i+1} + lam * G_{i+1}
+
+    ``lam = 1`` is the outcome-only label; ``lam = 0`` is one-step TD against
+    the search. An opening bust has no solve, and its board is the same board
+    with the turn passed on, so G passes through unchanged there.
+    Absolute-seat vectors are mixed, then rotated to each row's slots.
+    """
+    from .encoder import MAX_SEATS
+    rows = len(result)
+    n = result.rules.num_players
+    if rows == 0:
+        return np.zeros((0, MAX_SEATS), dtype=np.float32)
+    if len(result.turn_values) != rows + 1:
+        raise ValueError(f"{rows} rows need {rows + 1} turn values, got "
+                         f"{len(result.turn_values)}")
+    # Row i's encoding puts seat (active_i + k) % n in slot k, and the
+    # winner's slot is recorded; recover active_i from it.
+    g = np.zeros(n)
+    g[result.winner] = 1.0
+    out = np.zeros((rows, MAX_SEATS), dtype=np.float32)
+    for i in range(rows - 1, -1, -1):
+        v = result.turn_values[i + 1]
+        if v is not None:
+            g = (1.0 - lam) * np.asarray(v, dtype=np.float64) + lam * g
+        active = (result.winner - int(result.winner_slots[i])) % n
+        out[i, :n] = [g[(active + k) % n] for k in range(n)]
+    return out
+
+
+def stack_training(results, lam):
+    """(features, soft targets) for ``train_steps``; ``lam = 1`` reproduces
+    the one-hot winner labels of ``stack_rows``."""
+    usable = [r for r in results if len(r)]
+    if not usable:
+        raise ValueError("no rows to stack")
+    return (np.concatenate([r.features for r in usable]),
+            np.concatenate([td_targets(r, lam) for r in usable]))
 
 
 def summarize(results):

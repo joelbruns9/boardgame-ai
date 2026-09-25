@@ -79,6 +79,17 @@ def seat_mask_tensor(x):
     return x.index_select(1, idx) > 0.0
 
 
+def masked_soft_cross_entropy(logits, targets, mask):
+    """Cross-entropy against a target DISTRIBUTION over encoding slots
+    (N, MAX_SEATS), live seats only -- the TD targets. Absent seats carry
+    zero target mass and are zeroed out of the log-probabilities, so their
+    masked logits contribute nothing. With one-hot targets this equals
+    ``masked_cross_entropy``."""
+    neg_inf = torch.finfo(logits.dtype).min
+    logp = torch.log_softmax(logits.masked_fill(~mask, neg_inf), dim=-1)
+    return -(targets * logp.masked_fill(~mask, 0.0)).sum(dim=-1).mean()
+
+
 def masked_cross_entropy(logits, target_slots, mask):
     """Cross-entropy against a one-hot winner, over live seats only.
 

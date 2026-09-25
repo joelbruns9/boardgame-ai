@@ -56,6 +56,11 @@ pub struct Game {
     pub features: Vec<f32>,
     /// The seat to move on each recorded board, for the winner's slot.
     board_active: Vec<u8>,
+    /// Per turn: the solver's value (absolute seats) right after the
+    /// opening roll, or None when the opening roll busted (no solve). The
+    /// TD target's bootstrap; see `self_play.td_targets`.
+    pub turn_values: Vec<Option<Vec<f64>>>,
+    pending_value: Option<Vec<f64>>,
 }
 
 impl Game {
@@ -75,6 +80,8 @@ impl Game {
             turn_lengths: Vec::new(),
             features: Vec::new(),
             board_active: Vec::new(),
+            turn_values: Vec::new(),
+            pending_value: None,
         }
     }
 
@@ -105,6 +112,7 @@ impl Game {
     fn end_turn(&mut self) {
         self.turns += 1;
         self.turn_lengths.push(self.decisions);
+        self.turn_values.push(self.pending_value.take());
         self.decisions = 0;
         self.solver = None;
         if !self.state.game_over() {
@@ -121,6 +129,10 @@ impl Game {
         let solver = self.solver.as_mut().expect("a pending solve");
         solver.set_leaf_values(values)?;
         self.evaluator_rows += solver.num_leaves() as u64;
+        // The state is still at the opening roll (AWAIT_MOVE): this is
+        // `TurnSolver.value(state)` in play_turn.
+        let key = RKey::from_runners(&self.state.runners);
+        self.pending_value = Some(solver.value(key, self.state.phase, self.state.dice)?);
         self.status = Status::Ready;
         Ok(())
     }
