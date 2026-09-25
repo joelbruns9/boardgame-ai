@@ -1251,6 +1251,22 @@ to PhaseDConfig's defaults and measure a search this run does not run.
 Fix the knobs above; nothing was measured and nothing was launched."
   ok "Run configuration for the sweep: $RUN_CONFIG_JSON"
 
+  # The sweeps load their checkpoint strictly, as a resume would, so a
+  # warm-start source from before an encoder change fails them outright, and one
+  # without the run's new modules would be measured as a lighter network than
+  # the run serves. Measure the run's OWN starting network instead: the same
+  # `initialize_learner` migration `--init-checkpoint` takes.
+  SWEEP_SOURCE_CHECKPOINT="$SWEEP_CHECKPOINT"
+  SWEEP_CHECKPOINT="$SWEEP_DIR/sweep_checkpoint.pt"
+  common::quietly "$REPO_DIR/$RUN_DIR_REL/setup/sweep_checkpoint.log" "migrate sweep checkpoint" -- \
+    "$PY" -m games.seven_wonders_duel.sweep_checkpoint \
+    --checkpoint "$SWEEP_SOURCE_CHECKPOINT" \
+    --manifest "$RUN_CONFIG_JSON" \
+    --output "$SWEEP_CHECKPOINT" \
+    --precision "$PRECISION" \
+    || die "Could not migrate $SWEEP_SOURCE_CHECKPOINT to this run's architecture; nothing was measured."
+  ok "Sweep checkpoint: $SWEEP_CHECKPOINT (the run's starting network, from $SWEEP_SOURCE_CHECKPOINT)"
+
   # The generation/solver CORE SPLIT, as an axis rather than a constant.
   #
   # Generation and the endgame solver compete for the same physical cores, and
