@@ -252,10 +252,12 @@ common::python_deps() {
 common::build_crate() {
   local crate_dir="$1" module="$2"
   [ -d "$crate_dir" ] || die "Crate dir '$crate_dir' missing."
-  command -v maturin >/dev/null 2>&1 || "$PY" -m pip install "maturin>=1.5"
+  # Through $PY, not PATH: a venv used via $PYTHON without activation puts
+  # maturin where `command -v` cannot see it.
+  "$PY" -m maturin --version >/dev/null 2>&1 || "$PY" -m pip install "maturin>=1.5"
   (
     cd "$crate_dir"
-    maturin develop --release
+    "$PY" -m maturin develop --release
   ) || die "maturin develop failed for $crate_dir."
   "$PY" -c "import $module; print('$module import OK')" \
     || die "$module failed to import after build."

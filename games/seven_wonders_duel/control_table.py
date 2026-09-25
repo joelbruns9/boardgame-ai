@@ -196,12 +196,15 @@ def rule_identity() -> str:
     Not a git commit: a refactor that leaves every byte identical must not
     invalidate a checkpoint, and a solver change that alters one entry must.
     The digest covers the solver and the layout/wonder data it reads.
+
+    Line endings are normalised first: a Windows checkout with CRLF must agree
+    with a Linux one, or a table built on the laptop fails on every cloud box.
     """
 
     digest = hashlib.sha256()
     here = Path(__file__).resolve().parent
     for name in ("tableau_control.py", "data.py"):
-        digest.update((here / name).read_bytes())
+        digest.update((here / name).read_bytes().replace(b"\r\n", b"\n"))
     return digest.hexdigest()
 
 
