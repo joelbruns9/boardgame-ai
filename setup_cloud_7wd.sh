@@ -1330,7 +1330,7 @@ Fix the knobs above; nothing was measured and nothing was launched."
   if [ "$SWEEP_GENERATION_GAMES" -lt "$SWEEP_MAX_SLOTS" ]; then
     die "SWEEP_GENERATION_GAMES=$SWEEP_GENERATION_GAMES cannot fill $SWEEP_MAX_SLOTS slots; the slot axis would measure nothing above the game count."
   fi
-  say "Generation sweep: $SWEEP_GENERATION_GAMES games/point against max $SWEEP_MAX_SLOTS slots ($(( SWEEP_GENERATION_GAMES / SWEEP_MAX_SLOTS )) per slot)"
+  log "Generation sweep: $SWEEP_GENERATION_GAMES games/point against max $SWEEP_MAX_SLOTS slots ($(( SWEEP_GENERATION_GAMES / SWEEP_MAX_SLOTS )) per slot)"
 
   # ── THE COST OF MEASURING THE RUN, and what is done about it ──────────────
   #
@@ -1513,7 +1513,7 @@ PYWIN
       warn "size caps against. Leaving the solver caps at the launcher's values."
       _GEN_WALL=0
     else
-      say "Sizing against the WINNING geometry: $_WIN_WORKERS shards, $_WIN_SOLVER_TOTAL solver threads"
+      log "Sizing against the WINNING geometry: $_WIN_WORKERS shards, $_WIN_SOLVER_TOTAL solver threads"
       # Re-measure the rate at the thread count that won. Contention is what
       # this measures, and it is a function of the thread count -- stage 6b's
       # figure belongs to a different one.
@@ -1537,7 +1537,7 @@ PYRATE2
       # full-cost iteration and it is the only honest source of a production
       # generation wall. A failure degrades to the extrapolation below rather
       # than losing the whole setup, which is why this warns and does not die.
-      say "Confirmation point at FULL simulations (one point, the winner's geometry)"
+      log "Confirmation point at FULL simulations (one point, the winner's geometry)"
       "$PY" -m games.seven_wonders_duel.f4_phase_d_sweep \
         --checkpoint "$SWEEP_CHECKPOINT" \
         --output "$SWEEP_DIR/full_sims" \

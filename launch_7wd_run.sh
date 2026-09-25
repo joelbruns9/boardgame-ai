@@ -215,7 +215,8 @@ export SWEEP_SOLVER_THREADS_CSV="${SWEEP_SOLVER_THREADS_CSV:-0,4,8,16}"
 # no wall-clock total reports, so a value carried over from another box would
 # look harmless and change what the GPU sees on every forward.
 export SWEEP_INFERENCE_WAIT_CSV="${SWEEP_INFERENCE_WAIT_CSV:-0,1,2}"
-export SWEEP_GENERATION_GAMES="${SWEEP_GENERATION_GAMES:-200}"
+# SWEEP_GENERATION_GAMES is left to setup_cloud_7wd.sh, which derives it as 3x
+# the largest slot count. A pin here (200) went stale against 512 slots.
 
 # ── Hand over ───────────────────────────────────────────────────────────────
 #
