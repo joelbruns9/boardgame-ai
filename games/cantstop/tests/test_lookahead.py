@@ -32,7 +32,7 @@ EXACT = Search(exact_root=True)
 
 
 def _key(s):
-    return (s.exact_root, s.lookahead_k, s.lookahead_offset)
+    return (s.exact_root, s.lookahead_k, s.lookahead_offset, s.stop_bias)
 
 
 def turn_starts(rules, count, seed=4):

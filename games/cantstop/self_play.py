@@ -44,10 +44,19 @@ class Search:
                       (the bust board + the top k-1 stop leaves by reach) by
                       solving the next player's turn from them. 0 = off.
     lookahead_offset  shift unrefined leaves by the mean refinement.
+    stop_bias         risk attitude: stop when stop value + bias >= roll
+                      value. 0 = best play; +0.03 a conservative persona,
+                      -0.03 an aggressive one. Own turn only: a lookahead's
+                      refinement of the next turn stays unbiased.
     """
     exact_root: bool = False
     lookahead_k: int = 0
     lookahead_offset: bool = True
+    stop_bias: float = 0.0
+
+
+CONSERVATIVE = Search(stop_bias=0.03)
+AGGRESSIVE = Search(stop_bias=-0.03)
 
 
 PLAIN = Search()
@@ -77,8 +86,27 @@ class GameResult:
         return len(self.winner_slots)
 
 
+def _turn_value(solver, state):
+    """The turn's recorded value (the TD target): best play's value.
+
+    A persona plays its biased table, but its target must not be the biased
+    value -- the net cannot tell a persona is to move, and would learn that
+    the side to move plays worse than it does. So the same table is backed
+    up once without the bias for the value, then the bias is restored.
+    """
+    bias = solver.stop_bias
+    if bias == 0.0:
+        return solver.value(state).tolist()
+    solver.stop_bias = 0.0
+    solver._backup()
+    value = solver.value(state).tolist()
+    solver.stop_bias = bias
+    solver._backup()
+    return value
+
+
 def _solve(state, evaluate, search):
-    solver = TurnSolver(state, evaluate)
+    solver = TurnSolver(state, evaluate, stop_bias=search.stop_bias)
     if search.lookahead_k:
         from .lookahead import refine
         refine(solver, state, evaluate, search.lookahead_k,
@@ -97,7 +125,7 @@ def play_turn(state, evaluate, rng, values=None, search=PLAIN):
     if search.exact_root:
         solver = _solve(state, evaluate, search)
         if values is not None:
-            values.append(solver.value(state).tolist())
+            values.append(_turn_value(solver, state))
         if not roll(state, random_dice(rng)):
             return 1, 0           # busted on the opening roll
     else:
@@ -108,7 +136,7 @@ def play_turn(state, evaluate, rng, values=None, search=PLAIN):
             return 0, 0           # busted on the opening roll; no solve needed
         solver = _solve(state, evaluate, search)
         if values is not None:
-            values.append(solver.value(state).tolist())
+            values.append(_turn_value(solver, state))
     decisions = 0
     while True:
         apply_move(state, solver.choose_move(state))
@@ -122,8 +150,10 @@ def play_turn(state, evaluate, rng, values=None, search=PLAIN):
 
 
 def play_game(rules, evaluate, rng, max_turns=DEFAULT_MAX_TURNS,
-              keep_boards=False, search=PLAIN):
-    """Play one game to completion and collect its training rows."""
+              keep_boards=False, search=PLAIN, seat_searches=None):
+    """Play one game to completion and collect its training rows.
+    ``seat_searches`` (one per seat) overrides ``search`` per seat -- the
+    self-play personas."""
     state = GameState(rules)
     boards, turns, solves, turn_lengths, turn_values = [], 0, 0, [], []
     evaluator_rows_before = getattr(evaluate, "rows", 0)
@@ -133,8 +163,10 @@ def play_game(rules, evaluate, rng, max_turns=DEFAULT_MAX_TURNS,
             raise TurnLimitExceeded(
                 f"{rules} reached {max_turns} turns with no winner; the "
                 "policy is likely never banking progress")
+        seat_search = (seat_searches[state.active_player]
+                       if seat_searches else search)
         used, decisions = play_turn(state, evaluate, rng, turn_values,
-                                    search)
+                                    seat_search)
         turns += 1
         solves += used
         turn_lengths.append(decisions)

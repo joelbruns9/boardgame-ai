@@ -48,6 +48,10 @@ pub struct SearchConfig {
     pub lookahead_k: usize,
     /// Shift unrefined leaves by the mean refinement (`lookahead::combine`).
     pub lookahead_offset: bool,
+    /// Risk attitude (`TurnSolver::stop_bias`): the conservative and
+    /// aggressive self-play personas. Applies to the mover's own turn only;
+    /// lookahead refinements of the next player's turn stay unbiased.
+    pub stop_bias: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +76,9 @@ pub struct Game {
     refine_leaves: Vec<usize>,
     refine_weights: Vec<f64>,
     refiners: Vec<TurnSolver>,
+    /// The main solve's final leaf values (after any lookahead), kept so a
+    /// persona's turn can be re-backed-up without its bias for the target.
+    final_values: Vec<f64>,
     decisions: u32,
     max_turns: u32,
     pub status: Status,
@@ -112,6 +119,7 @@ impl Game {
             refine_leaves: Vec::new(),
             refine_weights: Vec::new(),
             refiners: Vec::new(),
+            final_values: Vec::new(),
             decisions: 0,
             max_turns,
             status: Status::Ready,
@@ -184,6 +192,7 @@ impl Game {
                 let main = self.solver.as_mut().expect("a pending solve");
                 main.set_leaf_values(v)?;
                 self.evaluator_rows += main.num_leaves() as u64;
+                self.final_values = v.to_vec();
                 if config.lookahead_k > 0 {
                     let (leaves, weights) = crate::lookahead::choose(main, config.lookahead_k)?;
                     self.refiners = leaves
@@ -216,14 +225,29 @@ impl Game {
                     self.config().lookahead_offset,
                 );
                 self.solver.as_mut().expect("main solve").rebackup(&new)?;
+                self.final_values = new;
                 self.refiners.clear();
                 self.stage = Stage::Main;
             }
         }
-        // `TurnSolver.value(state)` at the solve's root, as play_turn.
-        let solver = self.solver.as_ref().expect("main solve");
+        // The turn's recorded value (the TD target), as play_turn records
+        // it: always BEST play's value. A persona plays its biased table,
+        // but training on the biased value would teach the net that the
+        // side to move plays worse than it does -- so the target comes from
+        // an unbiased backup of the same table, then the bias is restored.
         let key = RKey::from_runners(&self.state.runners);
-        self.pending_value = Some(solver.value(key, self.state.phase, self.state.dice)?);
+        let (phase, dice) = (self.state.phase, self.state.dice);
+        let solver = self.solver.as_mut().expect("main solve");
+        let bias = solver.stop_bias;
+        if bias != 0.0 {
+            solver.stop_bias = 0.0;
+            solver.rebackup(&self.final_values)?;
+        }
+        self.pending_value = Some(solver.value(key, phase, dice)?);
+        if bias != 0.0 {
+            solver.stop_bias = bias;
+            solver.rebackup(&self.final_values)?;
+        }
         self.status = Status::Ready;
         Ok(())
     }
@@ -280,7 +304,9 @@ impl Game {
                     continue;
                 }
             }
-            self.solver = Some(TurnSolver::new_cached(&self.state).expect("game is live"));
+            let mut solver = TurnSolver::new_cached(&self.state).expect("game is live");
+            solver.stop_bias = self.config().stop_bias;
+            self.solver = Some(solver);
             self.solves += 1;
             self.status = Status::NeedsValues;
             return;

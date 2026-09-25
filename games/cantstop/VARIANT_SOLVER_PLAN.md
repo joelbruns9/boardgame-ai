@@ -464,6 +464,37 @@ checkpointing, run log and gating.
     the tables.
   - `NetEvaluator` now chunks forwards at 262k rows by default. One 16M-row
     forward asked for 16.8 GB.
+- **Value-net diagnosis (2026-09-25), 2p base.** overnight1 (0.51M net,
+  TD 0.7 sampled, window 30, passes 5): beats the heuristic ~55.5% but
+  plateaued by iteration ~60 (1 hour of 8).
+  - Learning rate: a 1e-4 step-down (runs/lr1e4) bought ~1 pt (51.2% vs
+    its start, 8,000 games). Not the main limit.
+  - Capacity (`capacity_probe.py`, 20k games, split by game): 92k, 0.51M,
+    3.3M and 5.4M nets all reach held-out 0.520 by epoch ~5; bigger ones
+    then overfit. Not capacity-bound at this data volume.
+  - Accuracy against 400-rollout truth (`value_accuracy.py`, 60 boards):
+    net RMSE 5.0 pts, one turn of exact search 2.9, k=4 2.4, k=16 2.3.
+    The direction is clear but not significant at 60 boards.
+  - Exact targets at lam 0.7 (runs/exact1): no gain (48.2% vs its start,
+    57.1% vs heuristic). At lam 0.7 the outcome's dice luck dominates the
+    target.
+  - Decision: lam = 0 (PureTD; Tesauro found lam 0 about as good as small
+    lam), exact targets, window 10.
+- **Self-play personas (BUILT 2026-09-25):** `Search.stop_bias`, per seat.
+  A persona stops when stop + bias >= roll: +0.03 conservative, -0.03
+  aggressive. Purpose: human opponents mostly stop too early, and pure
+  self-play never shows the net those positions.
+  - `train.py --conservative 0.2 --aggressive 0.1 --persona-bias 0.03`:
+    one persona seat per chosen game, rotating seat; draws no random
+    numbers when both fractions are 0.
+  - **Personas play biased, but record BEST-PLAY values as TD targets**
+    (the same table backed up without the bias). Otherwise ~15% of rows
+    would teach the net that the side to move plays worse than it does;
+    the net cannot see who is a persona.
+  - The net therefore values positions as if both sides play best.
+    Exploiting a cautious human is opponent modelling -- not built.
+- **LR schedule (BUILT):** `--lr-schedule 1:1e-3 60:3e-4 ...`, a step
+  schedule by iteration; `lr` is logged each iteration.
 - **Baselines:** heuristic-leaf solver (all variants); earlier checkpoints.
 - **Gate:** win rate vs the heuristic-leaf solver rises across iterations in
   **every** variant, not just the common ones.

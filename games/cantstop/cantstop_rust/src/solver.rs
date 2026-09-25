@@ -305,6 +305,11 @@ pub struct TurnSolver {
     has_roll: Vec<bool>,
     stops: Vec<bool>,
     solved: bool,
+    /// Risk attitude: stop when stop value + bias >= roll value (the
+    /// mover's win probability). 0 = best play; > 0 conservative (stops even
+    /// when rolling on is worth up to `bias` more); < 0 aggressive.
+    /// `self_play.Search.stop_bias`.
+    pub stop_bias: f64,
 }
 
 #[derive(Debug)]
@@ -361,6 +366,7 @@ impl TurnSolver {
             has_roll: Vec::new(),
             stops: Vec::new(),
             solved: false,
+            stop_bias: 0.0,
         };
         s.roots = if state.phase == Phase::AwaitMove {
             s.child_keys(root, state.dice.expect("AWAIT_MOVE holds dice"))
@@ -560,6 +566,11 @@ impl TurnSolver {
         (self.active + 1) % self.base.rules.num_players
     }
 
+    /// The runners the solve started from.
+    pub fn root_key(&self) -> RKey {
+        self.root_key
+    }
+
     /// Leaf `i` in `leaf_boards` order: None for the bust board (index 0),
     /// else the stop configuration.
     pub fn leaf_key(&self, i: usize) -> Option<RKey> {
@@ -726,7 +737,7 @@ impl TurnSolver {
             }
             self.roll_values[i * n..(i + 1) * n].copy_from_slice(&roll[..n]);
             self.has_roll[i] = true;
-            let stop_here = node.stoppable && self.stop_values[i * n + a] >= roll[a];
+            let stop_here = node.stoppable && self.stop_values[i * n + a] + self.stop_bias >= roll[a];
             let src = if stop_here { &self.stop_values } else { &self.roll_values };
             let row: [f64; 4] = {
                 let mut r = [0.0; 4];

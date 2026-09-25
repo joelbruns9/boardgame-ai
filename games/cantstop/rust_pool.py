@@ -171,7 +171,8 @@ DEFAULT_MAX_ROWS = 1_000_000
 def run_pool(rules_list, seeds, evaluators, seating=None,
              max_turns=DEFAULT_MAX_TURNS, threads=0, stats=None,
              in_flight=DEFAULT_IN_FLIGHT, search=PLAIN, searches=None,
-             search_seating=None, max_rows=DEFAULT_MAX_ROWS):
+             search_seating=None, max_rows=DEFAULT_MAX_ROWS, starts=None,
+             allow_unfinished=False):
     """Play one game per entry of ``rules_list`` on the Rust pool.
 
     ``seating[i][seat]`` is the evaluator index for that seat of game *i*
@@ -199,13 +200,22 @@ def run_pool(rules_list, seeds, evaluators, seating=None,
     if used and max(used) >= len(evaluators):
         raise ValueError(f"seating uses evaluator {max(used)} but only "
                          f"{len(evaluators)} were given")
-    specs = [(snapshot(GameState(r)), s, list(seats))
-             for r, s, seats in zip(rules_list, seeds, seating, strict=True)]
+    # ``starts``: turn-start positions to play from instead of empty boards
+    # (rollouts, one-turn solves); ``allow_unfinished`` returns games that
+    # hit ``max_turns`` (winner -1) instead of raising.
+    if starts is None:
+        starts = [GameState(r) for r in rules_list]
+    elif len(starts) != len(rules_list) or any(
+            st.rules != r for st, r in zip(starts, rules_list)):
+        raise ValueError("starts must match rules_list one to one")
+    specs = [(snapshot(st), s, list(seats))
+             for st, s, seats in zip(starts, seeds, seating, strict=True)]
     batched = all(hasattr(e, "relative_probs") for e in evaluators)
     started = time.perf_counter()
     pool = rust.SelfPlayPool(
         specs, max_turns, threads, in_flight,
-        [(s.exact_root, s.lookahead_k, s.lookahead_offset) for s in searches],
+        [(s.exact_root, s.lookahead_k, s.lookahead_offset, s.stop_bias)
+         for s in searches],
         search_seating, max_rows)
 
     t = time.perf_counter()
@@ -233,7 +243,7 @@ def run_pool(rules_list, seeds, evaluators, seating=None,
         stats.rust_seconds += time.perf_counter() - t
     stats.wall_seconds += time.perf_counter() - started
 
-    if pool.failure is not None:
+    if pool.failure is not None and not allow_unfinished:
         raise TurnLimitExceeded(pool.failure)
     all_features = np.frombuffer(bytearray(pool.features()),
                                  dtype="<f4").reshape(-1, FEATURE_SIZE)

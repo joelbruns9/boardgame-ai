@@ -95,8 +95,43 @@ class ReplayBuffer:
                 np.concatenate([y for _, y in self._chunks]))
 
 
+def persona_seating(schedule, rng, search, conservative=0.0,
+                    aggressive=0.0, bias=0.03):
+    """Per game, one ``Search`` per seat: the self-play personas.
+
+    ``conservative`` / ``aggressive`` are fractions of games (rounded) in
+    which ONE seat plays with ``stop_bias`` +``bias`` / -``bias`` on top of
+    ``search``; every other seat plays ``search``. Which games get a
+    persona is a deterministic shuffle drawn from ``rng`` (after the seeds),
+    and the persona sits at seat ``game_index % players`` so no seat is
+    favoured. Coverage, not exploration: human opponents mostly stop too
+    early, and pure self-play never shows the net those positions.
+    """
+    from dataclasses import replace
+    k = len(schedule)
+    n_c = round(conservative * k)
+    n_a = round(aggressive * k)
+    if n_c + n_a > k:
+        raise ValueError("persona fractions exceed 1")
+    if n_c + n_a == 0:
+        # No shuffle, so a persona-free run draws exactly the random
+        # numbers it did before personas existed.
+        return [[search] * rules.num_players for rules in schedule]
+    kinds = ["c"] * n_c + ["a"] * n_a + ["p"] * (k - n_c - n_a)
+    rng.shuffle(kinds)
+    out = []
+    for i, (rules, kind) in enumerate(zip(schedule, kinds)):
+        seats = [search] * rules.num_players
+        if kind != "p":
+            seats[i % rules.num_players] = replace(
+                search, stop_bias=bias if kind == "c" else -bias)
+        out.append(seats)
+    return out
+
+
 def generate(rule_sets, games_per_ruleset, evaluate, rng, backend="auto",
-             threads=0, stats=None, in_flight=None, search=PLAIN):
+             threads=0, stats=None, in_flight=None, search=PLAIN,
+             conservative=0.0, aggressive=0.0, persona_bias=0.03):
     """Play the scheduled games and return every result.
 
     Each game rolls from its own ``PortableRng``, seeded up front in
@@ -111,17 +146,24 @@ def generate(rule_sets, games_per_ruleset, evaluate, rng, backend="auto",
     from . import rust_pool
     if backend == "auto":
         backend = "rust" if rust_pool.rust_available() else "python"
-    if backend == "rust":
-        return rust_pool.generate(
-            rule_sets, games_per_ruleset, evaluate, rng, threads=threads,
-            stats=stats, in_flight=in_flight or rust_pool.DEFAULT_IN_FLIGHT,
-            search=search)
-    if backend != "python":
+    if backend not in ("rust", "python"):
         raise ValueError(f"unknown backend {backend!r}")
     schedule = [r for r in rule_sets for _ in range(games_per_ruleset)]
     seeds = rust_pool.game_seeds(rng, len(schedule))
-    return [play_game(rules, evaluate, PortableRng(seed), search=search)
-            for rules, seed in zip(schedule, seeds)]
+    seat_searches = persona_seating(schedule, rng, search, conservative,
+                                    aggressive, persona_bias)
+    if backend == "rust":
+        slots = list(dict.fromkeys(x for seats in seat_searches
+                                   for x in seats))
+        return rust_pool.run_pool(
+            schedule, seeds, [evaluate], threads=threads, stats=stats,
+            in_flight=in_flight or rust_pool.DEFAULT_IN_FLIGHT,
+            searches=slots,
+            search_seating=[[slots.index(x) for x in seats]
+                            for seats in seat_searches])
+    return [play_game(rules, evaluate, PortableRng(seed),
+                      seat_searches=seats)
+            for rules, seed, seats in zip(schedule, seeds, seat_searches)]
 
 
 def train_steps(net, buffer, opt, steps, batch_size, device, rng):
@@ -153,6 +195,25 @@ def train_steps(net, buffer, opt, steps, batch_size, device, rng):
     return float(np.mean(losses))
 
 
+def parse_lr_schedule(items):
+    """``["1:1e-3", "60:3e-4", "150:1e-4"]`` -> {1: 1e-3, 60: 3e-4, ...}:
+    from iteration 60 on the rate is 3e-4, and so on."""
+    out = {}
+    for item in items or ():
+        it, _, value = item.partition(":")
+        if not value:
+            raise ValueError(f"lr schedule entries are ITER:LR, got {item!r}")
+        out[int(it)] = float(value)
+    return out
+
+
+def lr_at(iteration, base_lr, schedule):
+    """The rate in force at ``iteration``: the latest schedule entry at or
+    before it, else ``base_lr``."""
+    starts = [k for k in (schedule or {}) if k <= iteration]
+    return schedule[max(starts)] if starts else base_lr
+
+
 def steps_for_passes(buffer_rows, passes, replay_window, batch_size):
     """Optimizer steps this iteration so that every position is sampled
     ``passes`` times on average over its whole life in the buffer.
@@ -173,11 +234,16 @@ def run(out_dir, iterations, games, rule_sets=(MVP_RULES,), hidden=(256, 256),
         lr=1e-3, batch_size=256, steps=None, passes=5.0, replay_window=30,
         buffer_rows=None, arena_games=60, seed=0, device=None,
         init_checkpoint=None, backend="auto", threads=0, in_flight=None,
-        td_lambda=0.7, search=PLAIN, arena_search=None):
+        td_lambda=0.7, search=PLAIN, arena_search=None, lr_schedule=None,
+        conservative=0.0, aggressive=0.0, persona_bias=0.03):
     """``search`` is how self-play searches (``self_play.Search``);
     ``arena_search`` how both sides of the per-iteration matches search
     (default: the same)."""
-    arena_search = search if arena_search is None else arena_search
+    if arena_search is None:
+        # exact_root changes only the RECORDED value, never a move, so the
+        # matches drop it: same games at a fifth of the cost.
+        from dataclasses import replace
+        arena_search = replace(search, exact_root=False)
     """``steps=None`` derives each iteration's steps from ``passes`` and
     ``replay_window`` (``steps_for_passes``); an integer fixes them, as
     the pre-window loop did."""
@@ -208,11 +274,15 @@ def run(out_dir, iterations, games, rule_sets=(MVP_RULES,), hidden=(256, 256),
                           window_iterations=replay_window)
 
     for it in range(1, iterations + 1):
+        it_lr = lr_at(it, lr, lr_schedule)
+        for group in opt.param_groups:
+            group["lr"] = it_lr
         started = time.time()
         evaluate = NetEvaluator(net, device=str(device))
         results = generate(rule_sets, games, evaluate, rng, backend=backend,
                            threads=threads, in_flight=in_flight,
-                           search=search)
+                           search=search, conservative=conservative,
+                           aggressive=aggressive, persona_bias=persona_bias)
         gen_seconds = time.time() - started
 
         # Targets are fixed when rows enter the buffer, from the net that
@@ -234,6 +304,9 @@ def run(out_dir, iterations, games, rule_sets=(MVP_RULES,), hidden=(256, 256),
             # hard this iteration leaned on the data it has.
             "window_iterations": buffer.iterations,
             "td_lambda": td_lambda,
+            "lr": it_lr,
+            "personas": {"conservative": conservative,
+                         "aggressive": aggressive, "bias": persona_bias},
             "search": vars(search) if hasattr(search, "__dict__") else
             {f: getattr(search, f) for f in search.__dataclass_fields__},
             "new_rows": len(x),
@@ -277,6 +350,19 @@ def main(argv=None):
                    help="train on all 10 rule sets instead of the MVP one")
     p.add_argument("--hidden", type=int, nargs="+", default=[256, 256])
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--lr-schedule", nargs="+", default=None,
+                   metavar="ITER:LR",
+                   help="step schedule by iteration, e.g. 1:1e-3 60:3e-4 "
+                        "150:1e-4 250:5e-5 (overrides --lr from the first "
+                        "entry on)")
+    p.add_argument("--conservative", type=float, default=0.0,
+                   help="fraction of self-play games with one conservative "
+                        "seat (stops even when rolling on is worth up to "
+                        "--persona-bias more)")
+    p.add_argument("--aggressive", type=float, default=0.0,
+                   help="fraction of self-play games with one aggressive seat")
+    p.add_argument("--persona-bias", type=float, default=0.03,
+                   help="the personas' stop bias, in win probability")
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--steps", type=int, default=None,
                    help="fixed optimizer steps per iteration; overrides "
@@ -325,6 +411,10 @@ def main(argv=None):
         rule_sets=tuple(ALL_RULESETS) if args.all_rulesets else (MVP_RULES,),
         hidden=tuple(args.hidden),
         lr=args.lr,
+        lr_schedule=parse_lr_schedule(args.lr_schedule),
+        conservative=args.conservative,
+        aggressive=args.aggressive,
+        persona_bias=args.persona_bias,
         batch_size=args.batch_size,
         steps=args.steps,
         passes=args.passes,

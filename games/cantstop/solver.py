@@ -130,9 +130,13 @@ class TurnSolver:
     available, but every decision from ``state`` onwards is.
     """
 
-    def __init__(self, state, evaluate):
+    def __init__(self, state, evaluate, stop_bias=0.0):
+        """``stop_bias``: risk attitude -- stop when stop value + bias >=
+        roll value (the mover's win probability). 0 is best play; > 0 is a
+        conservative player, < 0 an aggressive one."""
         if state.game_over:
             raise ValueError("game is over")
+        self.stop_bias = stop_bias
         self.base = state.clone()
         self.base.dice = None
         self.active = state.active_player
@@ -240,7 +244,8 @@ class TurnSolver:
                 roll_v = roll_v + p * self.decision_values[best]
             self.roll_values[key] = roll_v
             if (self.stoppable[key]
-                    and self.stop_values[key][a] >= roll_v[a]):
+                    and self.stop_values[key][a] + self.stop_bias
+                    >= roll_v[a]):
                 self.decision_values[key] = self.stop_values[key]
             else:
                 self.decision_values[key] = roll_v

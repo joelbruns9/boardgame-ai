@@ -392,6 +392,22 @@ impl PyTurnSolver {
         self.inner.leaf_boards().iter().map(snapshot_of).collect()
     }
 
+    /// `TurnSolver::leaf_reach`, per leaf in `leaf_snapshots` order (after
+    /// `set_leaf_values`): the lookahead's ranking signal, for diagnostics.
+    fn leaf_reach(&self) -> PyResult<Vec<f64>> {
+        Ok(self.inner.leaf_reach()?)
+    }
+
+    /// The value at the solve's root: the roll value for a turn start, or
+    /// the decision value otherwise.
+    fn root_value(&self, phase: u8, dice: Option<Vec<i64>>) -> PyResult<Vec<f64>> {
+        let phase = Phase::from_u8(phase).ok_or_else(|| PyValueError::new_err("bad phase"))?;
+        let dice = dice.map(to_dice).transpose()?;
+        let key = self.inner.roots.first().copied().unwrap_or_default();
+        let key = if phase == Phase::AwaitMove { self.inner.root_key() } else { key };
+        Ok(self.inner.value(key, phase, dice)?)
+    }
+
     /// The leaf boards encoded for the value net: little-endian float32
     /// bytes, `num_leaves x FEATURE_SIZE`, for `np.frombuffer`.
     fn leaf_features<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
@@ -549,7 +565,7 @@ impl PySelfPlayPool {
     /// one per logical core.
     #[new]
     ///
-    /// `searches`: `(exact_root, lookahead_k, lookahead_offset)` search
+    /// `searches`: `(exact_root, lookahead_k, lookahead_offset, stop_bias)` search
     /// settings, and `search_seating`: per game, one index into `searches`
     /// per seat (default: every seat uses `searches[0]`; default searches:
     /// one plain search).
@@ -561,17 +577,18 @@ impl PySelfPlayPool {
         max_turns: u32,
         threads: usize,
         in_flight: usize,
-        searches: Option<Vec<(bool, usize, bool)>>,
+        searches: Option<Vec<(bool, usize, bool, f64)>>,
         search_seating: Option<Vec<Vec<u8>>>,
         max_rows: usize,
     ) -> PyResult<Self> {
         let searches: Vec<selfplay::SearchConfig> = searches
-            .unwrap_or_else(|| vec![(false, 0, true)])
+            .unwrap_or_else(|| vec![(false, 0, true, 0.0)])
             .into_iter()
-            .map(|(exact_root, lookahead_k, lookahead_offset)| selfplay::SearchConfig {
+            .map(|(exact_root, lookahead_k, lookahead_offset, stop_bias)| selfplay::SearchConfig {
                 exact_root,
                 lookahead_k,
                 lookahead_offset,
+                stop_bias,
             })
             .collect();
         if searches.is_empty() {
