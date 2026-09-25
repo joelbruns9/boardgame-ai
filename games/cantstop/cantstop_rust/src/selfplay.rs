@@ -19,7 +19,7 @@
 use rayon::prelude::*;
 
 use crate::encoder::{encode_board, FEATURE_SIZE};
-use crate::engine::GameState;
+use crate::engine::{GameState, Phase};
 use crate::rng::{roll_dice, Rng};
 use crate::solver::{RKey, SolveError, TurnSolver};
 
@@ -29,11 +29,31 @@ pub enum Status {
     Queued,
     /// Not yet advanced, or values just supplied.
     Ready,
-    /// A turn solve is waiting for leaf values.
+    /// A turn solve (or its lookahead refinements) is waiting for values.
     NeedsValues,
     Done,
     /// Ran past `max_turns` with no winner -- a defect, as in Python.
     Failed(String),
+}
+
+/// How a seat searches its turns (`self_play.Search`). Per seat, like the
+/// evaluator, so an arena game can pit depth 2 against depth 1.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SearchConfig {
+    /// Solve before the opening roll, so the recorded turn value is the
+    /// exact expectation over every roll (the exact TD backup). Decisions
+    /// are unchanged: the same table answers every one of them.
+    pub exact_root: bool,
+    /// Selective 2-turn lookahead: leaves refined per turn (0 = off).
+    pub lookahead_k: usize,
+    /// Shift unrefined leaves by the mean refinement (`lookahead::combine`).
+    pub lookahead_offset: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stage {
+    Main,
+    Refine,
 }
 
 pub struct Game {
@@ -41,9 +61,17 @@ pub struct Game {
     pub state: GameState,
     rng: Rng,
     /// Which evaluator scores the leaves of each seat's turns. All zero in
-    /// self-play; the seating in an arena game.
+    /// self-play; the seating in an arena game. A lookahead's refinement
+    /// solves use the MOVER's evaluator: it is the mover's search.
     pub evaluator_of_seat: [u8; 4],
+    search_of_seat: [SearchConfig; 4],
     solver: Option<TurnSolver>,
+    stage: Stage,
+    /// Lookahead state between the main solve and its refinements.
+    v1: Vec<f64>,
+    refine_leaves: Vec<usize>,
+    refine_weights: Vec<f64>,
+    refiners: Vec<TurnSolver>,
     decisions: u32,
     max_turns: u32,
     pub status: Status,
@@ -56,21 +84,34 @@ pub struct Game {
     pub features: Vec<f32>,
     /// The seat to move on each recorded board, for the winner's slot.
     board_active: Vec<u8>,
-    /// Per turn: the solver's value (absolute seats) right after the
-    /// opening roll, or None when the opening roll busted (no solve). The
-    /// TD target's bootstrap; see `self_play.td_targets`.
+    /// Per turn: the solver's value (absolute seats) at its root -- right
+    /// after the opening roll, or before it with `exact_root` -- or None when
+    /// the opening roll busted with no solve. See `self_play.td_targets`.
     pub turn_values: Vec<Option<Vec<f64>>>,
     pending_value: Option<Vec<f64>>,
 }
 
 impl Game {
-    pub fn new(state: GameState, seed: u64, evaluator_of_seat: [u8; 4], id: u64, max_turns: u32) -> Game {
+    pub fn new(
+        state: GameState,
+        seed: u64,
+        evaluator_of_seat: [u8; 4],
+        id: u64,
+        max_turns: u32,
+        search_of_seat: [SearchConfig; 4],
+    ) -> Game {
         Game {
             id,
             state,
             rng: Rng::new(seed),
             evaluator_of_seat,
+            search_of_seat,
             solver: None,
+            stage: Stage::Main,
+            v1: Vec::new(),
+            refine_leaves: Vec::new(),
+            refine_weights: Vec::new(),
+            refiners: Vec::new(),
             decisions: 0,
             max_turns,
             status: Status::Ready,
@@ -97,16 +138,26 @@ impl Game {
         self.board_active.iter().map(|&a| (w + n - a) % n).collect()
     }
 
-    pub fn pending(&self) -> Option<&TurnSolver> {
-        match self.status {
-            Status::NeedsValues => self.solver.as_ref(),
-            _ => None,
+    /// Solves waiting for leaf values: the turn's main solve, or its
+    /// lookahead refinements (one block each).
+    pub fn pending_solvers(&self) -> Vec<&TurnSolver> {
+        if self.status != Status::NeedsValues {
+            return Vec::new();
+        }
+        match self.stage {
+            Stage::Main => self.solver.iter().collect(),
+            Stage::Refine => self.refiners.iter().collect(),
         }
     }
 
-    /// Which evaluator the pending solve needs.
+    /// Which evaluator the pending solves need (the mover's).
     pub fn pending_evaluator(&self) -> u8 {
         self.evaluator_of_seat[self.state.active_player as usize]
+    }
+
+    /// The mover's search settings.
+    fn config(&self) -> SearchConfig {
+        self.search_of_seat[self.state.active_player as usize]
     }
 
     fn end_turn(&mut self) {
@@ -123,14 +174,54 @@ impl Game {
         }
     }
 
-    /// Supply the pending solve's leaf values (`num_leaves * num_players`,
-    /// row-major, absolute seats).
-    pub fn supply(&mut self, values: &[f64]) -> Result<(), SolveError> {
-        let solver = self.solver.as_mut().expect("a pending solve");
-        solver.set_leaf_values(values)?;
-        self.evaluator_rows += solver.num_leaves() as u64;
-        // The state is still at the opening roll (AWAIT_MOVE): this is
-        // `TurnSolver.value(state)` in play_turn.
+    /// Supply values for `pending_solvers`, one slice per solver in order
+    /// (`num_leaves * num_players`, row-major, absolute seats).
+    pub fn supply(&mut self, values: &[&[f64]]) -> Result<(), SolveError> {
+        match self.stage {
+            Stage::Main => {
+                let config = self.config();
+                let v = values[0];
+                let main = self.solver.as_mut().expect("a pending solve");
+                main.set_leaf_values(v)?;
+                self.evaluator_rows += main.num_leaves() as u64;
+                if config.lookahead_k > 0 {
+                    let (leaves, weights) = crate::lookahead::choose(main, config.lookahead_k)?;
+                    self.refiners = leaves
+                        .iter()
+                        .map(|&i| TurnSolver::new_cached(&main.leaf_board(i)))
+                        .collect::<Result<_, _>>()?;
+                    self.refine_leaves = leaves;
+                    self.refine_weights = weights;
+                    self.v1 = v.to_vec();
+                    self.stage = Stage::Refine;
+                    self.status = Status::NeedsValues;
+                    return Ok(());
+                }
+            }
+            Stage::Refine => {
+                let mut refined = Vec::with_capacity(self.refiners.len());
+                for (r, v) in self.refiners.iter_mut().zip(values) {
+                    r.set_leaf_values(v)?;
+                    self.evaluator_rows += r.num_leaves() as u64;
+                    // The refined board is a turn start: its root roll value.
+                    refined.push(r.value(RKey::default(), Phase::AwaitRoll, None)?);
+                }
+                let n = self.state.rules.num_players as usize;
+                let new = crate::lookahead::combine(
+                    &self.v1,
+                    n,
+                    &self.refine_leaves,
+                    &self.refine_weights,
+                    &refined,
+                    self.config().lookahead_offset,
+                );
+                self.solver.as_mut().expect("main solve").rebackup(&new)?;
+                self.refiners.clear();
+                self.stage = Stage::Main;
+            }
+        }
+        // `TurnSolver.value(state)` at the solve's root, as play_turn.
+        let solver = self.solver.as_ref().expect("main solve");
         let key = RKey::from_runners(&self.state.runners);
         self.pending_value = Some(solver.value(key, self.state.phase, self.state.dice)?);
         self.status = Status::Ready;
@@ -144,6 +235,14 @@ impl Game {
         }
         loop {
             if let Some(solver) = self.solver.as_ref() {
+                if self.state.phase == Phase::AwaitRoll {
+                    // exact_root: solved before the opening roll; roll now.
+                    let moves = self.state.roll(roll_dice(&mut self.rng)).expect("rollable");
+                    if moves.is_empty() {
+                        self.end_turn();
+                    }
+                    continue;
+                }
                 // Finish the turn from the solved table: play_turn's loop.
                 let dice = self.state.dice.expect("AWAIT_MOVE holds dice");
                 let key = RKey::from_runners(&self.state.runners);
@@ -173,11 +272,13 @@ impl Game {
                 ));
                 return;
             }
-            // Start a turn: an opening bust needs no solve.
-            let moves = self.state.roll(roll_dice(&mut self.rng)).expect("rollable");
-            if moves.is_empty() {
-                self.end_turn();
-                continue;
+            if !self.config().exact_root {
+                // Start a turn: an opening bust needs no solve.
+                let moves = self.state.roll(roll_dice(&mut self.rng)).expect("rollable");
+                if moves.is_empty() {
+                    self.end_turn();
+                    continue;
+                }
             }
             self.solver = Some(TurnSolver::new_cached(&self.state).expect("game is live"));
             self.solves += 1;
@@ -191,6 +292,9 @@ impl Game {
 #[derive(Clone, Debug)]
 pub struct Block {
     pub game: usize,
+    /// Which of the game's `pending_solvers` (0 unless a lookahead is
+    /// refining several boards).
+    pub sub: usize,
     pub rows: usize,
     pub evaluator: u8,
     pub num_players: u8,
@@ -206,6 +310,12 @@ pub struct Pool {
     /// first version ran every game from the start: long games then trailed
     /// on alone, and the median round had 6 of 64 games waiting.
     in_flight: usize,
+    /// At most this many leaf rows per round; waiting games beyond it wait
+    /// for the next round (a game's blocks always go together). Needed once
+    /// lookahead turned each waiting game into K+1 turn-start solves: 64
+    /// games in flight at K=4 asked one forward for ~16M rows (16.8 GB).
+    /// 0 = unlimited.
+    max_rows: usize,
     /// Blocks of the last `pending` call, in buffer order.
     blocks: Vec<Block>,
 }
@@ -213,7 +323,7 @@ pub struct Pool {
 impl Pool {
     /// `threads == 0` uses rayon's default (one per logical core);
     /// `in_flight == 0` puts every game in flight from the start.
-    pub fn new(mut games: Vec<Game>, threads: usize, in_flight: usize) -> Pool {
+    pub fn new(mut games: Vec<Game>, threads: usize, in_flight: usize, max_rows: usize) -> Pool {
         let threads = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()
@@ -222,7 +332,7 @@ impl Pool {
         for g in games.iter_mut().skip(in_flight) {
             g.status = Status::Queued;
         }
-        Pool { games, threads, in_flight, blocks: Vec::new() }
+        Pool { games, threads, in_flight, max_rows, blocks: Vec::new() }
     }
 
     fn live(g: &Game) -> bool {
@@ -273,21 +383,31 @@ impl Pool {
     /// Where each waiting game's leaf rows will sit in the pending buffer,
     /// in ascending game order. `write_pending` fills the buffer.
     pub fn pending_blocks(&mut self) -> &[Block] {
-        self.blocks = self
-            .games
-            .iter()
-            .enumerate()
-            .filter_map(|(i, g)| {
-                let s = g.pending()?;
-                Some(Block {
+        let mut blocks = Vec::new();
+        let mut rows = 0usize;
+        for (i, g) in self.games.iter().enumerate() {
+            let solvers = g.pending_solvers();
+            if solvers.is_empty() {
+                continue;
+            }
+            let game_rows: usize = solvers.iter().map(|s| s.num_leaves()).sum();
+            // Always admit at least one game, however large.
+            if self.max_rows != 0 && rows != 0 && rows + game_rows > self.max_rows {
+                continue;
+            }
+            rows += game_rows;
+            for (sub, s) in solvers.into_iter().enumerate() {
+                blocks.push(Block {
                     game: i,
+                    sub,
                     rows: s.num_leaves(),
                     evaluator: g.pending_evaluator(),
                     num_players: g.state.rules.num_players,
                     leaf_active: s.leaf_active_player(),
-                })
-            })
-            .collect();
+                });
+            }
+        }
+        self.blocks = blocks;
         &self.blocks
     }
 
@@ -299,17 +419,17 @@ impl Pool {
     /// (`pending_rows * FEATURE_SIZE`), one disjoint slice per game, in
     /// parallel.
     pub fn write_pending(&self, out: &mut [f32]) {
-        let mut slices: Vec<(usize, &mut [f32])> = Vec::with_capacity(self.blocks.len());
+        let mut slices: Vec<(usize, usize, &mut [f32])> = Vec::with_capacity(self.blocks.len());
         let mut rest = out;
         for b in &self.blocks {
             let (head, tail) = rest.split_at_mut(b.rows * FEATURE_SIZE);
-            slices.push((b.game, head));
+            slices.push((b.game, b.sub, head));
             rest = tail;
         }
         let games = &self.games;
         self.threads.install(|| {
-            slices.into_par_iter().for_each(|(i, slice)| {
-                games[i].pending().expect("waiting").encode_leaves_into(slice);
+            slices.into_par_iter().for_each(|(i, sub, slice)| {
+                games[i].pending_solvers()[sub].encode_leaves_into(slice);
             })
         });
     }
@@ -357,18 +477,14 @@ impl Pool {
         if values.len() != expected {
             return Err(format!("expected {expected} values for the pending blocks, got {}", values.len()));
         }
-        let mut slices: Vec<(usize, &[f64])> = Vec::with_capacity(self.blocks.len());
+        // Each game's slices, in its `pending_solvers` order.
+        let mut by_game: Vec<Vec<&[f64]>> = vec![Vec::new(); self.games.len()];
         let mut at = 0;
         for b in &self.blocks {
             let len = b.rows * b.num_players as usize;
-            slices.push((b.game, &values[at..at + len]));
+            debug_assert_eq!(by_game[b.game].len(), b.sub);
+            by_game[b.game].push(&values[at..at + len]);
             at += len;
-        }
-        // Pair each waiting game with its slice without aliasing: walk the
-        // games in order, since blocks are in ascending game order.
-        let mut by_game: Vec<Option<&[f64]>> = vec![None; self.games.len()];
-        for (g, s) in slices {
-            by_game[g] = Some(s);
         }
         let games = &mut self.games;
         let errors: Vec<String> = self.threads.install(|| {
@@ -376,7 +492,9 @@ impl Pool {
                 .par_iter_mut()
                 .zip(by_game.par_iter())
                 .filter_map(|(g, v)| {
-                    let v = (*v)?;
+                    if v.is_empty() {
+                        return None;
+                    }
                     if let Err(e) = g.supply(v) {
                         return Some(format!("game {}: {:?}", g.id, e));
                     }

@@ -136,7 +136,9 @@ class NetEvaluator:
         batches every waiting game's leaves through here, then rotates each
         game's block back to absolute seats itself."""
         chunks = []
-        step = self.batch_size or len(features)
+        # Chunked even by default: a lookahead round can hand over a million
+        # rows, and one forward over all of them does not fit an 8 GB GPU.
+        step = self.batch_size or 262_144
         for start in range(0, len(features), step):
             x = torch.from_numpy(features[start:start + step]).to(self.device)
             chunks.append(self.net.win_probs(x).cpu().numpy())

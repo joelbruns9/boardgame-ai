@@ -31,6 +31,28 @@ from .solver import TurnSolver
 DEFAULT_MAX_TURNS = 400
 
 
+@dataclass(frozen=True)
+class Search:
+    """How each turn is searched. The defaults are the plain one-turn
+    solve, rooted after the opening roll.
+
+    exact_root        solve BEFORE the opening roll: the recorded turn value
+                      becomes the exact expectation over every roll (the
+                      exact TD backup, as PureTD's 1-ply target). Decisions
+                      are identical -- one table answers them all.
+    lookahead_k       selective 2-turn lookahead: refine this many leaves
+                      (the bust board + the top k-1 stop leaves by reach) by
+                      solving the next player's turn from them. 0 = off.
+    lookahead_offset  shift unrefined leaves by the mean refinement.
+    """
+    exact_root: bool = False
+    lookahead_k: int = 0
+    lookahead_offset: bool = True
+
+
+PLAIN = Search()
+
+
 class TurnLimitExceeded(RuntimeError):
     """A game ran past ``max_turns`` without anyone winning."""
 
@@ -55,22 +77,38 @@ class GameResult:
         return len(self.winner_slots)
 
 
-def play_turn(state, evaluate, rng, values=None):
+def _solve(state, evaluate, search):
+    solver = TurnSolver(state, evaluate)
+    if search.lookahead_k:
+        from .lookahead import refine
+        refine(solver, state, evaluate, search.lookahead_k,
+               search.lookahead_offset)
+    return solver
+
+
+def play_turn(state, evaluate, rng, values=None, search=PLAIN):
     """Play the active player's whole turn. Returns (solves, decisions).
 
     ``state`` is mutated in place and left at the start of the next player's
-    turn (or game over). If ``values`` is a list, the solver's value at the
-    opening roll is appended to it (None for an opening bust).
+    turn (or game over). If ``values`` is a list, the solver's value at its
+    root is appended: after the opening roll, or before it with
+    ``search.exact_root`` (None for an opening bust with no solve).
     """
-    moves = roll(state, random_dice(rng))
-    if not moves:
+    if search.exact_root:
+        solver = _solve(state, evaluate, search)
         if values is not None:
-            values.append(None)
-        return 0, 0               # busted on the opening roll; no solve needed
-
-    solver = TurnSolver(state, evaluate)
-    if values is not None:
-        values.append(solver.value(state).tolist())
+            values.append(solver.value(state).tolist())
+        if not roll(state, random_dice(rng)):
+            return 1, 0           # busted on the opening roll
+    else:
+        moves = roll(state, random_dice(rng))
+        if not moves:
+            if values is not None:
+                values.append(None)
+            return 0, 0           # busted on the opening roll; no solve needed
+        solver = _solve(state, evaluate, search)
+        if values is not None:
+            values.append(solver.value(state).tolist())
     decisions = 0
     while True:
         apply_move(state, solver.choose_move(state))
@@ -84,7 +122,7 @@ def play_turn(state, evaluate, rng, values=None):
 
 
 def play_game(rules, evaluate, rng, max_turns=DEFAULT_MAX_TURNS,
-              keep_boards=False):
+              keep_boards=False, search=PLAIN):
     """Play one game to completion and collect its training rows."""
     state = GameState(rules)
     boards, turns, solves, turn_lengths, turn_values = [], 0, 0, [], []
@@ -95,7 +133,8 @@ def play_game(rules, evaluate, rng, max_turns=DEFAULT_MAX_TURNS,
             raise TurnLimitExceeded(
                 f"{rules} reached {max_turns} turns with no winner; the "
                 "policy is likely never banking progress")
-        used, decisions = play_turn(state, evaluate, rng, turn_values)
+        used, decisions = play_turn(state, evaluate, rng, turn_values,
+                                    search)
         turns += 1
         solves += used
         turn_lengths.append(decisions)

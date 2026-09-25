@@ -6,6 +6,7 @@
 
 pub mod encoder;
 pub mod engine;
+pub mod lookahead;
 pub mod rng;
 pub mod selfplay;
 pub mod solver;
@@ -522,7 +523,7 @@ fn f64_from_bytes(raw: &[u8]) -> PyResult<Vec<f64>> {
         .collect())
 }
 
-type BlockOut = (usize, usize, u8, u8, u8);
+type BlockOut = (usize, usize, u8, u8, u8, usize);
 type GameOut = (u64, i64, i64, Vec<i64>, u32, u32, u64, Vec<u32>, Vec<Option<Vec<f64>>>);
 
 /// Many self-play or arena games advanced together (M3). Python's loop:
@@ -547,13 +548,44 @@ impl PySelfPlayPool {
     /// `evaluator_of_seat` has one small int per seat. `threads == 0` means
     /// one per logical core.
     #[new]
-    #[pyo3(signature = (games, max_turns, threads=0, in_flight=0))]
+    ///
+    /// `searches`: `(exact_root, lookahead_k, lookahead_offset)` search
+    /// settings, and `search_seating`: per game, one index into `searches`
+    /// per seat (default: every seat uses `searches[0]`; default searches:
+    /// one plain search).
+    #[pyo3(signature = (games, max_turns, threads=0, in_flight=0, searches=None,
+                        search_seating=None, max_rows=0))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         games: Vec<(Snapshot, u64, Vec<u8>)>,
         max_turns: u32,
         threads: usize,
         in_flight: usize,
+        searches: Option<Vec<(bool, usize, bool)>>,
+        search_seating: Option<Vec<Vec<u8>>>,
+        max_rows: usize,
     ) -> PyResult<Self> {
+        let searches: Vec<selfplay::SearchConfig> = searches
+            .unwrap_or_else(|| vec![(false, 0, true)])
+            .into_iter()
+            .map(|(exact_root, lookahead_k, lookahead_offset)| selfplay::SearchConfig {
+                exact_root,
+                lookahead_k,
+                lookahead_offset,
+            })
+            .collect();
+        if searches.is_empty() {
+            return Err(PyValueError::new_err("searches must not be empty"));
+        }
+        if let Some(ss) = &search_seating {
+            if ss.len() != games.len() {
+                return Err(PyValueError::new_err(format!(
+                    "{} search seatings for {} games",
+                    ss.len(),
+                    games.len()
+                )));
+            }
+        }
         let mut out = Vec::with_capacity(games.len());
         for (i, (snap, seed, seats)) in games.into_iter().enumerate() {
             let state = state_from_snapshot(snap)?;
@@ -566,9 +598,25 @@ impl PySelfPlayPool {
             }
             let mut e = [0u8; 4];
             e[..seats.len()].copy_from_slice(&seats);
-            out.push(selfplay::Game::new(state, seed, e, i as u64, max_turns));
+            let mut cfg = [searches[0]; 4];
+            if let Some(ss) = &search_seating {
+                let row = &ss[i];
+                if row.len() != seats.len() {
+                    return Err(PyValueError::new_err(format!(
+                        "game {i}: {} search seats for {} players",
+                        row.len(),
+                        seats.len()
+                    )));
+                }
+                for (seat, &slot) in row.iter().enumerate() {
+                    cfg[seat] = *searches.get(slot as usize).ok_or_else(|| {
+                        PyValueError::new_err(format!("game {i}: no search {slot}"))
+                    })?;
+                }
+            }
+            out.push(selfplay::Game::new(state, seed, e, i as u64, max_turns, cfg));
         }
-        Ok(PySelfPlayPool { inner: selfplay::Pool::new(out, threads, in_flight), features_taken: false })
+        Ok(PySelfPlayPool { inner: selfplay::Pool::new(out, threads, in_flight, max_rows), features_taken: false })
     }
 
     fn advance(&mut self, py: Python<'_>) {
@@ -601,7 +649,7 @@ impl PySelfPlayPool {
             .inner
             .pending_blocks()
             .iter()
-            .map(|b| (b.game, b.rows, b.evaluator, b.num_players, b.leaf_active))
+            .map(|b| (b.game, b.rows, b.evaluator, b.num_players, b.leaf_active, b.sub))
             .collect();
         let floats = self.inner.pending_rows() * encoder::FEATURE_SIZE;
         let inner = &self.inner;

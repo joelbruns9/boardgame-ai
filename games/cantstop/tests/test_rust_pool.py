@@ -259,7 +259,7 @@ def test_rust_rotation_is_to_absolute_bit_for_bit():
     got = np.frombuffer(pool.absolute_from_relative(rel.tobytes()), "<f8")
     starts = np.cumsum([0] + [b[1] for b in blocks])
     want = []
-    for i, (game, rows, _ev, n, active) in enumerate(blocks):
+    for i, (game, rows, _ev, n, active, _sub) in enumerate(blocks):
         ref = GameState(rules_list[game])
         ref.active_player = active
         want.append(to_absolute(rel[starts[i]:starts[i + 1]], ref).ravel())

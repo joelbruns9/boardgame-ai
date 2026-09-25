@@ -15,11 +15,14 @@ import random
 
 from .engine import GameState
 from .portable_rng import PortableRng
-from .self_play import DEFAULT_MAX_TURNS, TurnLimitExceeded, play_turn
+from .self_play import DEFAULT_MAX_TURNS, PLAIN, TurnLimitExceeded, play_turn
 
 
-def play_match_game(rules, seating, rng, max_turns=DEFAULT_MAX_TURNS):
-    """Play one game where ``seating[seat]`` evaluates for that seat.
+def play_match_game(rules, seating, rng, max_turns=DEFAULT_MAX_TURNS,
+                    search_seating=None):
+    """Play one game where ``seating[seat]`` evaluates for that seat, and
+    ``search_seating[seat]`` (a ``self_play.Search``; plain when omitted) is
+    how that seat searches.
 
     Returns the winning *seat*, which the caller maps back to a player.
     """
@@ -29,7 +32,9 @@ def play_match_game(rules, seating, rng, max_turns=DEFAULT_MAX_TURNS):
         if turns >= max_turns:
             raise TurnLimitExceeded(
                 f"{rules} reached {max_turns} turns with no winner")
-        play_turn(state, seating[state.active_player], rng)
+        a = state.active_player
+        play_turn(state, seating[a], rng,
+                  search=search_seating[a] if search_seating else PLAIN)
         turns += 1
     return state.winner
 
@@ -56,12 +61,15 @@ def player_of_seat(seat_of, seat):
 
 
 def play_match(rules, players, games, rng=None, max_turns=DEFAULT_MAX_TURNS,
-               backend="auto", threads=0, in_flight=None):
+               backend="auto", threads=0, in_flight=None, searches=None):
     """Play ``games`` games between ``players`` and count wins per player.
 
     ``players`` must have exactly ``rules.num_players`` entries. Game *i*
     seats player *p* at seat ``(p + i) % num_players``, so over a multiple of
     ``num_players`` games every player sits in every seat equally often.
+    ``searches`` gives each player its own ``self_play.Search`` (plain for
+    all when omitted) -- how the lookahead is measured: the same net at
+    depth 2 against itself at depth 1.
 
     Each game rolls from its own ``PortableRng`` seeded from ``rng`` up
     front, so the ``"rust"`` pool and the ``"python"`` loop play the same
@@ -79,7 +87,8 @@ def play_match(rules, players, games, rng=None, max_turns=DEFAULT_MAX_TURNS,
     if backend == "rust":
         return rust_pool.play_match(
             rules, players, games, rng, max_turns=max_turns, threads=threads,
-            in_flight=in_flight or rust_pool.DEFAULT_IN_FLIGHT)
+            in_flight=in_flight or rust_pool.DEFAULT_IN_FLIGHT,
+            searches=searches)
     if backend != "python":
         raise ValueError(f"unknown backend {backend!r}")
     seeds = rust_pool.game_seeds(rng, games)
@@ -88,10 +97,14 @@ def play_match(rules, players, games, rng=None, max_turns=DEFAULT_MAX_TURNS,
     for i in range(games):
         seat_of = seating_for_game(n, i)
         seating = [None] * n
+        search_seating = [PLAIN] * n
         for player, seat in enumerate(seat_of):
             seating[seat] = players[player]
+            if searches is not None:
+                search_seating[seat] = searches[player]
         winning_seat = play_match_game(rules, seating,
-                                       PortableRng(seeds[i]), max_turns)
+                                       PortableRng(seeds[i]), max_turns,
+                                       search_seating)
         wins[player_of_seat(seat_of, winning_seat)] += 1
     return wins
 
@@ -142,7 +155,7 @@ def verdict(wins, num_players, player=0):
 
 def compare(rules, challenger, incumbent, games, rng=None,
             max_turns=DEFAULT_MAX_TURNS, backend="auto", threads=0,
-            in_flight=None):
+            in_flight=None, search=PLAIN):
     """Match one challenger against copies of one incumbent.
 
     Returns the challenger's win rate, its Wilson interval, and the raw wins.
@@ -152,5 +165,5 @@ def compare(rules, challenger, incumbent, games, rng=None,
     n = rules.num_players
     players = [challenger] + [incumbent] * (n - 1)
     wins = play_match(rules, players, games, rng, max_turns, backend,
-                      threads, in_flight)
+                      threads, in_flight, [search] * n)
     return verdict(wins, n)

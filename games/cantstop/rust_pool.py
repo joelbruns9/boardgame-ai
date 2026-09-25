@@ -28,7 +28,8 @@ import numpy as np
 from .encoder import FEATURE_SIZE, to_absolute
 from .engine import GameState
 from .portable_rng import PortableRng
-from .self_play import DEFAULT_MAX_TURNS, GameResult, TurnLimitExceeded
+from .self_play import (DEFAULT_MAX_TURNS, PLAIN, GameResult,
+                        TurnLimitExceeded)
 from .snapshot import snapshot
 
 
@@ -52,7 +53,7 @@ def game_seeds(rng, count):
 
 
 def _reference(rules_by_game, block):
-    game, _rows, _ev, _n, leaf_active = block
+    game, _rows, _ev, _n, leaf_active = block[:5]
     ref = GameState(rules_by_game[game])
     ref.active_player = leaf_active
     return ref
@@ -162,17 +163,27 @@ class PoolStats:
 # full until the schedule runs out.
 DEFAULT_IN_FLIGHT = 64
 
+# Leaf rows per round (one forward per evaluator). ~400 MB of features;
+# bounds host and GPU memory once lookahead multiplies each game's rows.
+DEFAULT_MAX_ROWS = 1_000_000
+
 
 def run_pool(rules_list, seeds, evaluators, seating=None,
              max_turns=DEFAULT_MAX_TURNS, threads=0, stats=None,
-             in_flight=DEFAULT_IN_FLIGHT):
+             in_flight=DEFAULT_IN_FLIGHT, search=PLAIN, searches=None,
+             search_seating=None, max_rows=DEFAULT_MAX_ROWS):
     """Play one game per entry of ``rules_list`` on the Rust pool.
 
     ``seating[i][seat]`` is the evaluator index for that seat of game *i*
     (all zeros when omitted: self-play with ``evaluators[0]``). Returns one
     ``GameResult`` per game, in order. Raises ``TurnLimitExceeded`` like
     ``play_game`` if any game runs out of turns.
+
+    ``search`` (a ``self_play.Search``) applies to every seat; or give
+    ``searches`` plus ``search_seating[i][seat]`` indices, as evaluators.
     """
+    if searches is None:
+        searches = [search]
     rust = _rust()
     stats = stats if stats is not None else PoolStats()
     if seating is None:
@@ -192,7 +203,10 @@ def run_pool(rules_list, seeds, evaluators, seating=None,
              for r, s, seats in zip(rules_list, seeds, seating, strict=True)]
     batched = all(hasattr(e, "relative_probs") for e in evaluators)
     started = time.perf_counter()
-    pool = rust.SelfPlayPool(specs, max_turns, threads, in_flight)
+    pool = rust.SelfPlayPool(
+        specs, max_turns, threads, in_flight,
+        [(s.exact_root, s.lookahead_k, s.lookahead_offset) for s in searches],
+        search_seating, max_rows)
 
     t = time.perf_counter()
     pool.advance()
@@ -245,16 +259,18 @@ def run_pool(rules_list, seeds, evaluators, seating=None,
 
 def generate(rule_sets, games_per_ruleset, evaluate, rng,
              max_turns=DEFAULT_MAX_TURNS, threads=0, stats=None,
-             in_flight=DEFAULT_IN_FLIGHT):
+             in_flight=DEFAULT_IN_FLIGHT, search=PLAIN):
     """``train.generate`` on the pool: same schedule, same seeds."""
     rules_list = [r for r in rule_sets for _ in range(games_per_ruleset)]
     seeds = game_seeds(rng, len(rules_list))
     return run_pool(rules_list, seeds, [evaluate], max_turns=max_turns,
-                    threads=threads, stats=stats, in_flight=in_flight)
+                    threads=threads, stats=stats, in_flight=in_flight,
+                    search=search)
 
 
 def play_match(rules, players, games, rng, max_turns=DEFAULT_MAX_TURNS,
-               threads=0, stats=None, in_flight=DEFAULT_IN_FLIGHT):
+               threads=0, stats=None, in_flight=DEFAULT_IN_FLIGHT,
+               searches=None):
     """``arena.play_match`` on the pool: game *i* seats player *p* at
     ``(p + i) % n`` and wins are credited to the player, not the seat."""
     from .arena import player_of_seat, seating_for_game
@@ -273,17 +289,22 @@ def play_match(rules, players, games, rng, max_turns=DEFAULT_MAX_TURNS,
         else:
             evaluators.append(p)
             slot_of_player.append(len(evaluators) - 1)
+    searches = list(searches) if searches is not None else [PLAIN] * n
+    search_slots = list(dict.fromkeys(searches))      # distinct, in order
     seat_maps = [seating_for_game(n, i) for i in range(games)]
-    seating = []
+    seating, search_seating = [], []
     for seat_of in seat_maps:
-        ev_of_seat = [0] * n
+        ev_of_seat, search_of_seat = [0] * n, [0] * n
         for player, seat in enumerate(seat_of):
             ev_of_seat[seat] = slot_of_player[player]
+            search_of_seat[seat] = search_slots.index(searches[player])
         seating.append(ev_of_seat)
+        search_seating.append(search_of_seat)
     seeds = game_seeds(rng, games)
     results = run_pool([rules] * games, seeds, evaluators, seating,
                        max_turns=max_turns, threads=threads, stats=stats,
-                       in_flight=in_flight)
+                       in_flight=in_flight, searches=search_slots,
+                       search_seating=search_seating)
     wins = [0] * n
     for seat_of, r in zip(seat_maps, results):
         wins[player_of_seat(seat_of, r.winner)] += 1

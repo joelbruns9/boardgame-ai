@@ -428,6 +428,42 @@ checkpointing, run log and gating.
   outcome labels). The pool records `turn_values` and the M3 gate compares
   them to Python. Loss: `masked_soft_cross_entropy`. **Not yet measured
   against lam = 1.**
+- **Search options (`self_play.Search`, BUILT 2026-09-24; user's call:
+  cross-turn search in self-play is worth throughput).**
+  - `exact_root` (`--td-target exact`): solve BEFORE the opening roll, so
+    the turn value is the exact expectation over every roll (PureTD's exact
+    1-ply backup). Games are unchanged; only the recorded value differs.
+  - `lookahead_k` (`--lookahead-k`): selective 2-turn lookahead,
+    `lookahead.py` / `src/lookahead.rs`.
+    1. Refine the bust board plus the top k-1 stop leaves by reach under
+       the current policy.
+    2. Solve the next player's whole turn from each, from its turn start.
+    3. Swap those values in; with `lookahead_offset`, shift the other
+       leaves by the reach-weighted mean refinement; back up again.
+  - Search is set **per seat** (`search_seating`), so an arena can pit
+    depth 2 against depth 1 with the same net.
+  - Gate: per turn from mid-game positions, bit-exact vs Python, 3 rule
+    sets x 2 mocks x {exact, k2, k3 raw, k3 exact}, plus mixed-seat turns.
+    3/3 planted bugs caught. The first version of that gate checked
+    NOTHING (a size filter no rule set met); it now fails loudly.
+  - **Measured cost (2p base, untrained net, GPU, 64 in flight):**
+
+    | search | games/h | net rows per turn |
+    |---|---|---|
+    | plain | 30.2k | 14.7k |
+    | exact | 6.0k | 67k |
+    | k=4 | 1,260 | 287k |
+    | k=16 | 189 | 1.1M |
+
+    The pre-build estimate ("exact at most ~2x, k=16 5-10x") was wrong:
+    it used the LARGEST table sizes. A typical turn-start solve has ~4.6x
+    the leaves of a post-roll one, and every refinement is a turn-start
+    solve.
+  - A k=16 + exact run exhausted host memory: 64 games x 17 live solver
+    tables. `max_rows` (default 1M rows per round) bounds the forward, not
+    the tables.
+  - `NetEvaluator` now chunks forwards at 262k rows by default. One 16M-row
+    forward asked for 16.8 GB.
 - **Baselines:** heuristic-leaf solver (all variants); earlier checkpoints.
 - **Gate:** win rate vs the heuristic-leaf solver rises across iterations in
   **every** variant, not just the common ones.

@@ -293,6 +293,10 @@ pub struct TurnSolver {
     /// Nodes whose stop needs a value, in leaf order after the bust board.
     leaf_nodes: Vec<u32>,
     pub roots: Vec<RKey>,
+    /// The position the solve started from: its runners, and the dice when
+    /// it was rooted at a roll (AWAIT_MOVE). `leaf_reach` starts there.
+    root_key: RKey,
+    root_dice: Option<[u8; 4]>,
     // Filled by `set_leaf_values`, `len * num_players` each.
     stop_values: Vec<f64>,
     has_stop: Vec<bool>,
@@ -348,6 +352,8 @@ impl TurnSolver {
             order: Vec::new(),
             leaf_nodes: Vec::new(),
             roots: Vec::new(),
+            root_key: root,
+            root_dice: if state.phase == Phase::AwaitMove { state.dice } else { None },
             stop_values: Vec::new(),
             has_stop: Vec::new(),
             decision_values: Vec::new(),
@@ -552,6 +558,101 @@ impl TurnSolver {
     /// turn), which is what rotates the net's seat-relative output back.
     pub fn leaf_active_player(&self) -> u8 {
         (self.active + 1) % self.base.rules.num_players
+    }
+
+    /// Leaf `i` in `leaf_boards` order: None for the bust board (index 0),
+    /// else the stop configuration.
+    pub fn leaf_key(&self, i: usize) -> Option<RKey> {
+        if i == 0 {
+            None
+        } else {
+            Some(self.nodes[self.leaf_nodes[i - 1] as usize].key)
+        }
+    }
+
+    /// The end-of-turn board for leaf `i` (0 = bust), as `leaf_boards`.
+    pub fn leaf_board(&self, i: usize) -> GameState {
+        let mut s = self.base.clone();
+        s.runners = [0; 13];
+        s.phase = Phase::AwaitDecision;
+        if i == 0 {
+            s.bust().expect("AWAIT_DECISION can bust");
+        } else {
+            s.runners = self.nodes[self.leaf_nodes[i - 1] as usize].key.to_runners();
+            s.stop().expect("leaf configurations are stoppable");
+        }
+        s
+    }
+
+    /// How much each leaf matters to this turn under the current policy,
+    /// per leaf in `leaf_boards` order: for the bust board, the probability
+    /// the turn ends in a bust; for a stop leaf, the probability the turn
+    /// reaches that configuration's stop-or-roll decision at all (so a
+    /// rejected stop that best play still passes through scores too).
+    ///
+    /// The selective lookahead refines the top leaves by this. Computed in a
+    /// canonical order -- nodes by (total height, key) ascending, children by
+    /// menu group -- because the sums feed a selection that must match the
+    /// Python reference bit for bit.
+    pub fn leaf_reach(&self) -> Result<Vec<f64>, SolveError> {
+        if !self.solved {
+            return Err(SolveError::NotSolved);
+        }
+        let len = self.nodes.len();
+        let (a, n) = (self.active as usize, self.num_players);
+        let mut reach = vec![0.0f64; len];
+        let start = match self.root_dice {
+            Some(d) => self.best_child(self.root_key, d)?.0,
+            None => self.root_key,
+        };
+        reach[self.node(start)?] = 1.0;
+        let mut order: Vec<usize> = (0..len).collect();
+        order.sort_by(|&x, &y| {
+            let (kx, ky) = (&self.nodes[x].key, &self.nodes[y].key);
+            kx.height_sum().cmp(&ky.height_sum()).then(kx.cmp(ky))
+        });
+        let mut leaf_of = vec![usize::MAX; len];
+        for (j, &i) in self.leaf_nodes.iter().enumerate() {
+            leaf_of[i as usize] = j + 1;
+        }
+        let mut out = vec![0.0f64; self.num_leaves()];
+        for &i in &order {
+            let r = reach[i];
+            let node = &self.nodes[i];
+            if r == 0.0 || node.winning {
+                continue;
+            }
+            if leaf_of[i] != usize::MAX {
+                out[leaf_of[i]] = r;
+            }
+            if self.stops[i] {
+                continue;
+            }
+            let menu = node.menu.as_ref().expect("expanded node");
+            let kids = &self.kids[node.kids_start as usize..];
+            out[0] += r * menu.bust_p;
+            for (idx, p) in &menu.groups {
+                let mut best = kids[idx[0]] as usize;
+                let mut best_v = self.decision_values[best * n + a];
+                for &j in &idx[1..] {
+                    let k = kids[j] as usize;
+                    let v = self.decision_values[k * n + a];
+                    if v > best_v || (v == best_v && self.nodes[k].key < self.nodes[best].key) {
+                        best = k;
+                        best_v = v;
+                    }
+                }
+                reach[best] += r * p;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Redo the backward induction with new leaf values (same layout as
+    /// `set_leaf_values`). The selective lookahead's second pass.
+    pub fn rebackup(&mut self, values: &[f64]) -> Result<(), SolveError> {
+        self.solved = false;
+        self.set_leaf_values(values)
     }
 
     /// Backward induction, given `num_leaves * num_players` values, row-major

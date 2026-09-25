@@ -35,7 +35,7 @@ from .model import (
     masked_soft_cross_entropy, save_net,
     seat_mask_tensor,
 )
-from .self_play import play_game, stack_training, summarize
+from .self_play import PLAIN, Search, play_game, stack_training, summarize
 from .portable_rng import PortableRng
 from .solver import ProgressHeuristic
 
@@ -96,7 +96,7 @@ class ReplayBuffer:
 
 
 def generate(rule_sets, games_per_ruleset, evaluate, rng, backend="auto",
-             threads=0, stats=None, in_flight=None):
+             threads=0, stats=None, in_flight=None, search=PLAIN):
     """Play the scheduled games and return every result.
 
     Each game rolls from its own ``PortableRng``, seeded up front in
@@ -114,12 +114,13 @@ def generate(rule_sets, games_per_ruleset, evaluate, rng, backend="auto",
     if backend == "rust":
         return rust_pool.generate(
             rule_sets, games_per_ruleset, evaluate, rng, threads=threads,
-            stats=stats, in_flight=in_flight or rust_pool.DEFAULT_IN_FLIGHT)
+            stats=stats, in_flight=in_flight or rust_pool.DEFAULT_IN_FLIGHT,
+            search=search)
     if backend != "python":
         raise ValueError(f"unknown backend {backend!r}")
     schedule = [r for r in rule_sets for _ in range(games_per_ruleset)]
     seeds = rust_pool.game_seeds(rng, len(schedule))
-    return [play_game(rules, evaluate, PortableRng(seed))
+    return [play_game(rules, evaluate, PortableRng(seed), search=search)
             for rules, seed in zip(schedule, seeds)]
 
 
@@ -172,7 +173,11 @@ def run(out_dir, iterations, games, rule_sets=(MVP_RULES,), hidden=(256, 256),
         lr=1e-3, batch_size=256, steps=None, passes=5.0, replay_window=30,
         buffer_rows=None, arena_games=60, seed=0, device=None,
         init_checkpoint=None, backend="auto", threads=0, in_flight=None,
-        td_lambda=0.7):
+        td_lambda=0.7, search=PLAIN, arena_search=None):
+    """``search`` is how self-play searches (``self_play.Search``);
+    ``arena_search`` how both sides of the per-iteration matches search
+    (default: the same)."""
+    arena_search = search if arena_search is None else arena_search
     """``steps=None`` derives each iteration's steps from ``passes`` and
     ``replay_window`` (``steps_for_passes``); an integer fixes them, as
     the pre-window loop did."""
@@ -206,7 +211,8 @@ def run(out_dir, iterations, games, rule_sets=(MVP_RULES,), hidden=(256, 256),
         started = time.time()
         evaluate = NetEvaluator(net, device=str(device))
         results = generate(rule_sets, games, evaluate, rng, backend=backend,
-                           threads=threads, in_flight=in_flight)
+                           threads=threads, in_flight=in_flight,
+                           search=search)
         gen_seconds = time.time() - started
 
         # Targets are fixed when rows enter the buffer, from the net that
@@ -228,6 +234,8 @@ def run(out_dir, iterations, games, rule_sets=(MVP_RULES,), hidden=(256, 256),
             # hard this iteration leaned on the data it has.
             "window_iterations": buffer.iterations,
             "td_lambda": td_lambda,
+            "search": vars(search) if hasattr(search, "__dict__") else
+            {f: getattr(search, f) for f in search.__dataclass_fields__},
             "new_rows": len(x),
             "train_steps": it_steps,
             "samples": samples,
@@ -245,10 +253,12 @@ def run(out_dir, iterations, games, rule_sets=(MVP_RULES,), hidden=(256, 256),
             current = NetEvaluator(net, device=str(device))
             record["vs_random_init"] = compare(
                 rule_sets[0], current, baseline, arena_games, rng,
-                backend=backend, threads=threads, in_flight=in_flight)
+                backend=backend, threads=threads, in_flight=in_flight,
+                search=arena_search)
             record["vs_heuristic"] = compare(
                 rule_sets[0], current, ProgressHeuristic(), arena_games, rng,
-                backend=backend, threads=threads, in_flight=in_flight)
+                backend=backend, threads=threads, in_flight=in_flight,
+                search=arena_search)
 
         with log_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, default=str) + "\n")
@@ -278,6 +288,17 @@ def main(argv=None):
                    help="value-target lambda-return: 1 = game outcome only "
                         "(the pre-TD labels), 0 = one-step TD against the "
                         "next turn's solver value")
+    p.add_argument("--td-target", choices=("sampled", "exact"),
+                   default="sampled",
+                   help="turn value for the TD target: after the opening "
+                        "roll that happened (sampled) or averaged over every "
+                        "opening roll (exact; solves before the roll)")
+    p.add_argument("--lookahead-k", type=int, default=0,
+                   help="selective 2-turn lookahead in self-play and arena: "
+                        "leaves refined per turn (0 = off)")
+    p.add_argument("--no-lookahead-offset", action="store_true",
+                   help="do not shift unrefined leaves by the mean "
+                        "refinement")
     p.add_argument("--replay-window", type=int, default=30,
                    help="iterations of self-play kept in the buffer")
     p.add_argument("--buffer-rows", type=int, default=None,
@@ -309,6 +330,9 @@ def main(argv=None):
         passes=args.passes,
         replay_window=args.replay_window,
         td_lambda=args.td_lambda,
+        search=Search(exact_root=args.td_target == "exact",
+                      lookahead_k=args.lookahead_k,
+                      lookahead_offset=not args.no_lookahead_offset),
         buffer_rows=args.buffer_rows,
         arena_games=args.arena_games,
         seed=args.seed,
