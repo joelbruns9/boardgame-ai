@@ -144,3 +144,32 @@ def test_failed_capture_disables_graphs_and_stays_correct():
         # And CUDA still works afterwards: no allocator left recording.
         torch.zeros(4, device="cuda").sum().item()
     assert graphed.captures == 0 and graphed.eager_calls == 3
+
+
+@cuda
+def test_embedder_over_projection_budget_captures_and_matches():
+    """Above the fused embedder's budget eager falls back to a per-type loop
+    that syncs the host -- illegal in capture, and every box capture over 512
+    rows failed on it. Under capture the fused path now runs in row chunks."""
+
+    from .inference import Evaluator
+    from .train import model_from_config
+
+    torch.manual_seed(0)
+    model = model_from_config({"slot_embedding": True}, d_model=64, layers=1).cuda().eval()
+    evaluator = Evaluator(model, "cuda", 4096)
+    embedder = evaluator.model.embedder
+    embedder.MAX_PROJECTION_BYTES = 1  # force every batch over budget
+    graphed = GraphedForward(evaluator.model)
+    from . import f4_cost_model as cm
+    from .rust_bridge import rust_flat_batch_adapter
+
+    corpus = cm.collect_corpus(2, 1)
+    random.seed(0)
+    payload = cm.build_payload(random.choices(corpus, k=24))
+    batch = rust_flat_batch_adapter(evaluator).build_device_batch(payload)[0]
+    with torch.no_grad():
+        want = evaluator.model(batch)
+        got = graphed(batch)
+    assert graphed.captures == 1 and graphed.eager_calls == 0
+    torch.testing.assert_close(got["policy"], want["policy"], atol=1e-4, rtol=1e-4)

@@ -326,6 +326,31 @@ class TokenEmbedder(nn.Module):
         )
         return needed <= self.MAX_PROJECTION_BYTES
 
+    def _forward_fused_chunked(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """The fused path over row chunks that each fit the projection budget.
+
+        Over budget this used to fall back to the per-type loop -- two host
+        syncs per token type, and illegal inside CUDA-graph capture (it is what
+        failed every capture above 512 rows). The coalescer now merges batches
+        past that, so the valve is reached in production. Rows are independent
+        here, so chunking is the fused arithmetic exactly, just in pieces
+        (measured: max |d| 0.0 against one fused pass, 4.8e-7 against the loop).
+        """
+
+        rows, tokens = batch["type_ids"].shape
+        per_row = (
+            tokens * len(TOKEN_TYPES) * self.d_model * batch["features"].element_size()
+        )
+        chunk = max(1, self.MAX_PROJECTION_BYTES // max(1, per_row))
+        return torch.cat(
+            [
+                self._forward_fused(
+                    {key: value[start : start + chunk] for key, value in batch.items()}
+                )
+                for start in range(0, rows, chunk)
+            ]
+        )
+
     def slot_ids(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         """W1: the Age/slot identity of every token, 0 where there is none.
 
@@ -398,6 +423,11 @@ class TokenEmbedder(nn.Module):
                 self.unfuse()
             elif self._fits_projection_budget(batch):
                 return self._forward_fused(batch)
+            elif torch.cuda.is_current_stream_capturing():
+                # Only under CUDA-graph capture, where the loop below is
+                # illegal. Eager keeps the loop: on a device-bound GPU it
+                # measured faster at 1,024 rows (13.4 vs 17.2 ms on a 3070).
+                return self._forward_fused_chunked(batch)
         type_ids = batch["type_ids"]
         out = self.type_embedding(type_ids) + self.aux(batch["aux_ids"])
         per_type = torch.zeros_like(out)
