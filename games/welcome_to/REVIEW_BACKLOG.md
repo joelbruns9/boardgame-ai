@@ -25,7 +25,13 @@ of a later implementation.
 
 ## Review requests now outstanding
 
-None for the current Welcome To working-tree scope.
+**2026-09-25:** `ENCODER_V3_AND_ADVISOR_REVIEW_REQUEST.md` covers every commit
+after `26696f6` (`4e65beb` … `13ea612`): encoder v3 steps 1–7 and the BGA
+advisor. It supersedes the unanswered `ENCODER_V3_BUILD_REVIEW_REQUEST.md`. It
+discloses one spec deviation found while writing it (§3.1: plane 18 and §8 ignore
+the viewer's reshuffle vote), which is proposed to be fixed before step 8.
+
+*The 2026-08-28 state, kept for history:* none for the then working-tree scope.
 
 All Welcome To changes after `d8509b3` are covered by the completed reviews.
 Files such as `self_play.py`, `s2_train.py`, `network.py`, and `samples.rs`

@@ -1,5 +1,9 @@
 # Review request — encoder v3 build, steps 1–4
 
+> ⚠ **SUPERSEDED 2026-09-25 by `ENCODER_V3_AND_ADVISOR_REVIEW_REQUEST.md`**, which
+> covers steps 1–7 and the BGA advisor. This request was never answered; its §2
+> detail is still cited from there, but its priorities are out of date.
+
 `ENCODER_V3_SPEC.md` §12 steps 1–4: the `sheet.py`, `plans.py`,
 `deck_knowledge.py` and `game.py` support code the encoder will consume, plus
 the tests that gate it. **Step 5 (`encoder.py`, the ABI break to 2) is NOT in
