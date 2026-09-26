@@ -63,6 +63,14 @@ from .slot_identity import (
 # reasons.
 _TABLEAU_TYPE_INDEX = TOKEN_TYPES.index(TokenType.TABLEAU)
 _AGE_COLUMNS = tuple(GLOBAL_FEATURES.index(f"age_{age}") for age in (1, 2, 3))
+#: The same columns as a SLICE when they are adjacent, which they are today.
+#: Indexing with a Python list copies the index to the device on every forward,
+#: and that host-to-device copy is illegal inside CUDA graph capture.
+_AGE_SLICE = (
+    slice(_AGE_COLUMNS[0], _AGE_COLUMNS[-1] + 1)
+    if list(_AGE_COLUMNS) == list(range(_AGE_COLUMNS[0], _AGE_COLUMNS[-1] + 1))
+    else None
+)
 _ROW_COLUMN = TABLEAU_FEATURES.index("row")
 _X_COLUMN = TABLEAU_FEATURES.index("x")
 #: How many present slots overlap and cover this one. A slot becomes reachable
@@ -349,7 +357,8 @@ class TokenEmbedder(nn.Module):
         Read from the GLOBAL token's one-hot, which is always position 0.
         """
 
-        age_onehot = batch["features"][:, 0, list(_AGE_COLUMNS)]
+        columns = _AGE_SLICE if _AGE_SLICE is not None else list(_AGE_COLUMNS)
+        age_onehot = batch["features"][:, 0, columns]
         # `argmax` alone would call an all-zero row Age I. Ages are exclusive,
         # so the sum is 1 exactly when one is set.
         return torch.where(

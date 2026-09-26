@@ -392,8 +392,12 @@ def legal_action_tensors_packed(
     lengths: torch.Tensor,
     legal_flat: torch.Tensor,
     legal_lengths: torch.Tensor,
+    width: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """`legal_action_tensors` for a caller that already has padded tensors.
+
+    ``width`` pads the legal axis to at least that many columns, with the same
+    padding a short row already gets (CUDA-graph replay needs static shapes).
 
     The Rust flat boundary hands over `[rows, tokens]` id tensors plus lengths,
     and a single concatenated legal-action vector plus its own lengths. Slicing
@@ -412,7 +416,7 @@ def legal_action_tensors_packed(
         torch.full_like(token_columns, _KEY_PAD),
     )
 
-    width = max(1, int(legal_lengths.max()) if legal_lengths.numel() else 1)
+    width = max(1, int(legal_lengths.max()) if legal_lengths.numel() else 1, width or 0)
     action_columns = torch.arange(width, device=device).expand(rows, width)
     valid = action_columns < legal_lengths.reshape(-1, 1)
     starts = torch.cumsum(legal_lengths, 0) - legal_lengths

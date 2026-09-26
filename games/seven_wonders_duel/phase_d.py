@@ -855,6 +855,10 @@ class PhaseDConfig:
     It is one branch inside the drain loop, not a second code path.
     """
     rust_inference_wait_ms: float = 0.0
+    #: Replay the evaluator forward as CUDA graphs (`cuda_graphs.py`). Measured
+    #: 3.5x per call at small batches on a 3070 -- the ~520 kernel launches are
+    #: the cost there -- and within bf16's own noise of the eager forward.
+    cuda_graphs: bool = False
     """How long the Rust evaluator worker may BLOCK to widen a batch.
 
     Deliberately separate from ``inference_wait_ms`` (2.0), which belongs to the
@@ -4367,7 +4371,9 @@ class PhaseDLoop:
         )
         league = self.league_assignment(iteration, len(jobs))
         if league is None:
-            adapter = rust_flat_batch_adapter(evaluator)
+            adapter = rust_flat_batch_adapter(
+                evaluator, cuda_graphs=self.config.cuda_graphs
+            )
         else:
             # Network 0 is the learner, network 1 the archive. Routed on the
             # searcher inside Rust, so the archive's network drives the whole of
@@ -4387,7 +4393,8 @@ class PhaseDLoop:
                         # net's own W/D/L, so the two need not match.
                         value_source=_checkpoint_value_source(league.checkpoint),
                     ),
-                )
+                ),
+                cuda_graphs=self.config.cuda_graphs,
             )
             print(
                 f"iteration {iteration}: league play -- {league.games} of "
@@ -5818,8 +5825,8 @@ class PhaseDLoop:
         # search always runs under the mover's own network; games sharing a
         # mover still batch together.
         adapters = (
-            rust_flat_batch_adapter(candidate_eval),
-            rust_flat_batch_adapter(opponent_eval),
+            rust_flat_batch_adapter(candidate_eval, cuda_graphs=self.config.cuda_graphs),
+            rust_flat_batch_adapter(opponent_eval, cuda_graphs=self.config.cuda_graphs),
         )
         outcomes: list[MatchOutcome] = []
         maximum_pairs = self.config.gate_max_games // 2
@@ -5914,7 +5921,7 @@ class PhaseDLoop:
         candidate_eval = evaluator(candidate_spec, candidate_precision)
         opponent_eval = evaluator(opponent_spec, opponent_precision)
         adapter = rust_searcher_routed_flat_batch_adapter(
-            (candidate_eval, opponent_eval)
+            (candidate_eval, opponent_eval), cuda_graphs=self.config.cuda_graphs
         )
         pairs = games // 2
         seeds: list[int] = []
@@ -6083,7 +6090,7 @@ class PhaseDLoop:
             precision=self.config.precision,
             value_source=_spec_value_source(candidate_spec),
         )
-        adapter = rust_flat_batch_adapter(evaluator)
+        adapter = rust_flat_batch_adapter(evaluator, cuda_graphs=self.config.cuda_graphs)
         outcomes: list[MatchOutcome] = []
         maximum_pairs = (max_games or self.config.gate_max_games) // 2
         bot_name = opponent_spec.bot.name
@@ -7036,6 +7043,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="restore one evaluator request per forward. For a same-box A/B of "
         "the coalescer against itself; not a production setting.",
+    )
+    parser.add_argument(
+        "--cuda-graphs",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="replay the evaluator forward as CUDA graphs: pads each batch to a "
+        "bucket and replaces ~520 kernel launches with one replay. Numerically "
+        "within bf16 noise of the eager forward, not bit-identical to it.",
     )
     parser.add_argument(
         "--rust-inference-wait-ms",
@@ -7993,6 +8008,7 @@ def main(argv=None) -> int:
         rust_slots=args.rust_slots,
         rust_global_batch_cap=args.rust_global_batch_cap,
         rust_inference_wait_ms=args.rust_inference_wait_ms,
+        cuda_graphs=args.cuda_graphs,
         rust_coalesce=args.rust_coalesce,
         gate_global_batch_cap=args.gate_global_batch_cap,
         rust_max_inflight_batches=args.rust_max_inflight_batches,

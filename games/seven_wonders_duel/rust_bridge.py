@@ -194,6 +194,18 @@ def rust_global_batch_adapter(evaluator):
     return adapter
 
 
+def torch_module_list():
+    import torch
+
+    return torch.nn.ModuleList
+
+
+def _legal_width_bucket(legal_lengths) -> int:
+    from .cuda_graphs import width_bucket
+
+    return width_bucket(int(legal_lengths.max()) if legal_lengths.numel() else 1)
+
+
 class _RustFlatBatchAdapter:
     """F4.5 packed-buffer transformer boundary with compact result transfer.
 
@@ -218,9 +230,30 @@ class _RustFlatBatchAdapter:
         pinned_memory: bool = False,
         cuda_events: bool = False,
         vectorized_gather: bool = True,
+        cuda_graphs: bool = False,
     ):
         self.evaluator = evaluator
         self.diagnostic_sync = diagnostic_sync
+        #: Replay the forward as CUDA graphs (`cuda_graphs.py`): batches are
+        #: padded to buckets and ~520 kernel launches become one replay. The
+        #: evaluator's own model is never replaced; a routed model's per-net
+        #: children are, because the routed proxy belongs to this adapter.
+        self.cuda_graphs = (
+            bool(cuda_graphs)
+            and str(evaluator.device).startswith("cuda")
+            and getattr(evaluator, "model", None) is not None
+        )
+        self._model = None
+        if self.cuda_graphs:
+            self._model = evaluator.model
+            from .cuda_graphs import GraphedForward
+
+            children = getattr(evaluator.model, "models", None)
+            if isinstance(children, torch_module_list()):
+                for index, child in enumerate(children):
+                    children[index] = GraphedForward(child, max_rows=evaluator.max_batch)
+            else:
+                self._model = GraphedForward(evaluator.model, max_rows=evaluator.max_batch)
         self.pinned_memory = pinned_memory
         #: Phase 3: replace the per-row softmax loop with a segmented softmax, a
         #: single D2H transfer, and one bulk `tolist()`. All three of those costs
@@ -339,6 +372,10 @@ class _RustFlatBatchAdapter:
         if len(lengths) != rows or int(lengths.sum()) != tokens:
             raise ValueError("flat token offsets do not align")
         max_tokens = int(payload["max_tokens"])
+        if self.cuda_graphs:
+            from .cuda_graphs import width_bucket
+
+            max_tokens = width_bucket(max_tokens)
         pin_memory = self.pinned_memory and self.evaluator.device != "cpu"
         row_ids = torch.repeat_interleave(torch.arange(rows), lengths)
         starts = torch.repeat_interleave(token_offsets[:-1], lengths)
@@ -430,6 +467,9 @@ class _RustFlatBatchAdapter:
                     torch.as_tensor(lengths, dtype=torch.long),
                     torch.as_tensor(legal_actions, dtype=torch.long),
                     torch.as_tensor(legal_lengths, dtype=torch.long),
+                    width=(
+                        _legal_width_bucket(legal_lengths) if self.cuda_graphs else None
+                    ),
                 )
             )
         tensor_seconds = time.perf_counter() - tensor_start
@@ -467,7 +507,8 @@ class _RustFlatBatchAdapter:
         forwards_before = getattr(self.evaluator.model, "model_forwards", None)
         with torch.no_grad():
             with self.evaluator.autocast():
-                outputs = self.evaluator.model(batch)
+                model = self._model if self.cuda_graphs else self.evaluator.model
+                outputs = model(batch)
         if forwards_before is None:
             self.total_metrics["model_forwards"] += 1
         else:
@@ -625,6 +666,7 @@ def rust_flat_batch_adapter(
     pinned_memory: bool = False,
     cuda_events: bool = False,
     vectorized_gather: bool = True,
+    cuda_graphs: bool = False,
 ):
     """Return the F4.5 flat-buffer adapter for the current Torch evaluator."""
 
@@ -638,6 +680,7 @@ def rust_flat_batch_adapter(
         pinned_memory=pinned_memory,
         cuda_events=cuda_events,
         vectorized_gather=vectorized_gather,
+        cuda_graphs=cuda_graphs,
     )
 
 
@@ -648,6 +691,7 @@ def rust_searcher_routed_flat_batch_adapter(
     pinned_memory: bool = False,
     cuda_events: bool = False,
     vectorized_gather: bool = True,
+    cuda_graphs: bool = False,
 ):
     """Route packed Rust rows by the packed ``net_ids`` byte (W1.3).
 
@@ -858,6 +902,7 @@ def rust_searcher_routed_flat_batch_adapter(
         pinned_memory=pinned_memory,
         cuda_events=cuda_events,
         vectorized_gather=vectorized_gather,
+        cuda_graphs=cuda_graphs,
     )
 
 
@@ -868,6 +913,7 @@ def rust_seat_routed_flat_batch_adapter(
     pinned_memory: bool = False,
     cuda_events: bool = False,
     vectorized_gather: bool = True,
+    cuda_graphs: bool = False,
 ):
     """Route packed Rust rows to a different evaluator model for each **leaf actor**.
 
@@ -1005,6 +1051,7 @@ def rust_seat_routed_flat_batch_adapter(
         pinned_memory=pinned_memory,
         cuda_events=cuda_events,
         vectorized_gather=vectorized_gather,
+        cuda_graphs=cuda_graphs,
     )
 
 

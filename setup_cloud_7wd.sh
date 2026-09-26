@@ -631,6 +631,11 @@ GRAPH_LAYERS="${GRAPH_LAYERS:-}"
 GRAPH_BASES="${GRAPH_BASES:-}"
 GRAPH_ALPHA="${GRAPH_ALPHA:-}"
 SWD_CONTROL_FEATURES="${SWD_CONTROL_FEATURES:-1}"   # W3
+# CUDA-graph replay of the evaluator forward (`cuda_graphs.py`). Off unless
+# asked: it moves the forward by bf16 noise, so it is a decision, not a default.
+CUDA_GRAPHS="${CUDA_GRAPHS:-0}"
+GRAPH_REPLAY_FLAGS=()
+[ "$CUDA_GRAPHS" = "1" ] && GRAPH_REPLAY_FLAGS+=(--cuda-graphs)
 export SWD_CONTROL_FEATURES
 HIERARCHICAL_VALUE="${HIERARCHICAL_VALUE:-0}"  # W4
 HIER_VALUE_WEIGHT="${HIER_VALUE_WEIGHT:-0}"
@@ -1153,6 +1158,7 @@ TRAIN_CMD=(
   "${ARCH_FLAGS[@]}"
   "${SPECIALIST_FLAGS[@]}"
   "${SOLVER_FLAGS[@]}"
+  "${GRAPH_REPLAY_FLAGS[@]}"
   --hof-opponent-fraction "$HOF_FRACTION" --hof-start-games "$HOF_START_GAMES"
   --selfplay-generator-mode soft_gate
   --bootstrap-policy "$BOOTSTRAP_POLICY"
@@ -1632,6 +1638,7 @@ else
   common::quietly "$REPO_DIR/$RUN_DIR_REL/setup/plumbing_smoke.log" "plumbing smoke" -- \
     "$PY" -m games.seven_wonders_duel.phase_d \
     --run-dir "$SMOKE_DIR" --device cuda --plumbing-smoke --process-workers 2 \
+    ${GRAPH_REPLAY_FLAGS[@]+"${GRAPH_REPLAY_FLAGS[@]}"} \
     || die "CUDA plumbing smoke failed — do not launch training."
   ok "Smoke completed: $SMOKE_DIR"
 fi

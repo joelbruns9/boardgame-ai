@@ -114,6 +114,9 @@ fi
 export SLOT_EMBEDDING="${SLOT_EMBEDDING:-1}"            # W1
 export GRAPH_MODULE="${GRAPH_MODULE:-1}"                # W2
 export SWD_CONTROL_FEATURES="${SWD_CONTROL_FEATURES:-1}"  # W3
+# CUDA-graph replay: on a 5090 one thread dispatching ~520 kernels per forward
+# capped generation while the shards idled 60%. See cuda_graphs.py.
+export CUDA_GRAPHS="${CUDA_GRAPHS:-1}"
 export ACTION_RESIDUAL="${ACTION_RESIDUAL:-1}"          # W5
 export ACTION_EXPOSES="${ACTION_EXPOSES:-1}"
 export ACTION_POLICY_WEIGHT="${ACTION_POLICY_WEIGHT:-0.5}"
