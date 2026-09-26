@@ -1759,6 +1759,8 @@ def max_houses_this_turn(state: "GameState", viewer: int, seat: int) -> int:
                     if effect is Effect.BIS and written.bis_candidates():
                         total += 1
                     best = max(best, total)
+                    if best >= 3:
+                        return 3  # the ceiling; nothing later can beat it
     return min(best, 3)
 
 

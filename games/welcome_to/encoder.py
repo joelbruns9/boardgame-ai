@@ -29,7 +29,7 @@ DESIGN CONTRACT
    returns four arrays::
 
        sheet_planes    (4, 22, 3, 12)   one block per seat, identical function
-       sheet_scalars   (4, 202)         one block per seat, identical function
+       sheet_scalars   (4, 196)         one block per seat, identical function
        viewer_plane    (1, 3, 12)       phase scratch, viewer only
        global_scalars  (367,)           game-wide and viewer-relative
 
@@ -52,11 +52,18 @@ DESIGN CONTRACT
 6. **Training-isolated.**  Nothing here imports a heuristic evaluator.
 
 ``ENCODER_V3_SPEC.md`` is the spec of record and this module implements its §12
-step 5: every plane and block at **22 planes / 202 per-sheet / 367 global**,
+step 5: every plane and block at **22 planes / 196 per-sheet / 367 global**,
 ABI 1 -> 2.  Section references below are to that document.
 
+⚠ **§6.4 DEMOTED (2026-09-25, user's call).**  ``can_complete_this_turn`` and
+``p_complete_next_turn`` were 96.5% of encode time (25 ms median / 2.8 s max vs
+4.3 ms without them) and are no longer encoded: the plan slot is 34 floats, not
+36.  The net is expected to learn plan-completion threat from the requirement,
+feasibility and rate fields that remain.  The predicates stay in :mod:`game`
+(tested by ``test_plan_threat.py``) as an ablation to re-add, not as inputs.
+
 ⚠ **SCOPE (§0.5, decided 2026-09-14): the 2+ player STANDARD game only.**
-Expert and one-seat play **raise**.  The threat predicates (§6.4), the fit
+Expert and one-seat play **raise**.  The fit
 planes (§7.1, §7.5) and the boundary-draw rates (§9.3) all rest on "every seat
 sees the same three stacks and opponents' sheets are public", which is
 ``config.standard``; and ``known_next_effects`` is all-zero outside it, so their
@@ -110,7 +117,6 @@ from games.welcome_to.game import (
     Phase,
     bis_usable,
     max_houses_this_turn,
-    plan_threats,
 )
 from games.welcome_to.plans import (
     NUM_DEALT_PLANS,
@@ -220,7 +226,7 @@ SHEET_SCALAR_BLOCKS: tuple[tuple[str, int], ...] = (
     ("capacity", 4),
     ("roundabout_repair", 3),       # §4
     ("total_span", 1),
-    ("plans", 3 * 36),              # §3.4
+    ("plans", 3 * 34),              # §3.4, minus the §6.4 threat pair
     ("demand", 24),                 # §7.2
     ("reshuffle_contraction", 8),   # §7.3
     ("refusal", 5),                 # §8
@@ -256,7 +262,7 @@ GLOBAL_SCALAR_BLOCKS: tuple[tuple[str, int], ...] = (
 NUM_GLOBAL_SCALAR: int = sum(size for _, size in GLOBAL_SCALAR_BLOCKS)
 
 #: Width of one plan slot's sub-block inside ``plans`` (§3.4).
-PLAN_SLOT_WIDTH: int = 36
+PLAN_SLOT_WIDTH: int = 34
 
 
 def _normalise(vector: np.ndarray) -> np.ndarray:
@@ -316,7 +322,7 @@ def _require_scope(state: GameState) -> None:
 # §7.1: "Build the prefix sums once per state and reuse them across all four
 # sheets -- this is what keeps symmetric encoding cheap."  Everything in this
 # class is seat-independent by construction: one deck feeds every seat in
-# standard mode, which is the same premise the threat predicates rest on.
+# standard mode, the premise §7.5 and §9.3 rest on.
 # ──────────────────────────────────────────────────────────────────────────
 class _DeckView:
     """Prefix sums, supplies and rates the whole state shares."""
@@ -352,17 +358,23 @@ class _DeckView:
         self.next_effects = list(state.next_effects(viewer))
         self.next_is_temp = tuple(e is Effect.TEMP for e in self.next_effects)
 
-        # The ordered joint over next turn's three NUMBERS, reforming mid-draw.
-        # §6.4/§7.5 both need it and it is the same object; built lazily-ish
-        # here because §8's refusal block needs it on every sheet anyway.
-        self.joint: Optional[np.ndarray] = None
+        # The ordered joint over next turn's three NUMBERS, reforming mid-draw,
+        # as exact integer numerators over one denominator (see
+        # `dk.ordered_draw_counts` for why never the float joint).  Built
+        # lazily; §8's refusal block needs it on every sheet anyway.
+        self.joint: Optional[tuple[np.ndarray, float]] = None
 
-    def ordered_joint(self) -> np.ndarray:
+    def ordered_joint(self) -> tuple[np.ndarray, float]:
         if self.joint is None:
-            self.joint = dk.ordered_draw_distribution(
+            self.joint = dk.ordered_draw_counts(
                 self.deck_numbers, self.reform_numbers
             )
         return self.joint
+
+    def draw_probability(self, masks) -> float:
+        """P(stack ``i``'s next number is in ``masks[i]``, for all three)."""
+        num, den = self.ordered_joint()
+        return dk.draw_probability(num, den, masks)
 
     # -- interval lookups ---------------------------------------------------
     def fit_deck(self, low: int, high: int) -> float:
@@ -433,7 +445,6 @@ def _p_fit_next_turn(view: _DeckView, low: int, high: int) -> float:
         return min(1.0, max(0.0, 1.0 - none / max(denom, EPS)))
 
     # D < 3: the draw reforms mid-way, so enumerate it literally.
-    joint = view.ordered_joint()
     masks = []
     for temp in view.next_is_temp:
         lo, hi = (low - 2, high + 2) if temp else (low, high)
@@ -442,8 +453,7 @@ def _p_fit_next_turn(view: _DeckView, low: int, high: int) -> float:
             if lo < n < hi:
                 miss[i] = 0.0
         masks.append(miss)
-    mask = np.multiply.outer(np.multiply.outer(masks[0], masks[1]), masks[2])
-    return float(np.clip(1.0 - (joint * mask).sum(), 0.0, 1.0))
+    return min(1.0, max(0.0, 1.0 - view.draw_probability(masks)))
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -744,10 +754,9 @@ def _plan_block(
     sheet: Sheet,
     slot: int,
     view: _DeckView,
-    threats: tuple[list[bool], list[float]],
     w: _Writer,
 ) -> None:
-    """One plan slot's 36 floats (§3.4)."""
+    """One plan slot's 34 floats (§3.4, without the demoted §6.4 pair)."""
     plan = PLANS[state.plan_ids[slot]]
     fraction, steps = progress(plan, sheet)
     banked = seat in state.plan_turns_for(viewer, slot)
@@ -822,12 +831,6 @@ def _plan_block(
     )
     w.put(_turns(max(effect_turns_raw, number_turns_raw)))
 
-    # §6.4 threat (2).  Computed for all three slots in one shared pass --
-    # `plan_threats` exists because the singular predicates re-walk the same
-    # one-turn enumeration once per plan and once per (stack, number).
-    can_now, p_next = threats
-    w.put(0.0 if banked else float(can_now[slot]),
-          0.0 if banked else float(p_next[slot]))
 
 
 def _number_demand(sheet: Sheet) -> np.ndarray:
@@ -967,8 +970,18 @@ def _reshuffle_contraction(
         # (demand)`.  Dividing by the full deck size makes the same sheet
         # against the same PROPORTIONS score lower simply because the deck has
         # drained -- a deck-size signal leaking into a rate.
-        norm = float(supply.sum()) * float(effect_demand.sum())
-        return _ratio(float((effect_demand * supply).sum()), norm)
+        #
+        # ⚠ §10.6: `effect_demand` is NOT integer-valued, so these two sums are
+        # order-sensitive.  Plain left-to-right loops, never `ndarray.sum()`
+        # (pairwise) or builtin `sum()` (compensated since Python 3.12) -- Rust
+        # mirrors this exact order.
+        demand_total = 0.0
+        weighted = 0.0
+        for e in range(_NUM_EFFECTS):
+            demand_total += float(effect_demand[e])
+            weighted += float(effect_demand[e]) * float(supply[e])
+        norm = float(supply.sum()) * demand_total
+        return _ratio(weighted, norm)
 
     for with_temp in (False, True):
         demand = _card_demand(sheet, with_temp)
@@ -1008,9 +1021,7 @@ def _playable_sets(
 
 def _joint_miss(view: _DeckView, masks: list[np.ndarray]) -> float:
     """P(every stack's number falls in its own miss set), over the ordered draw."""
-    joint = view.ordered_joint()
-    mask = np.multiply.outer(np.multiply.outer(masks[0], masks[1]), masks[2])
-    return float(np.clip((joint * mask).sum(), 0.0, 1.0))
+    return view.draw_probability(masks)
 
 
 def _best_roundabout_sheet(state: GameState, sheet: Sheet) -> Optional[Sheet]:
@@ -1191,7 +1202,7 @@ def _plan_conflict_seat(
 def _sheet_scalars(
     state: GameState, viewer: int, seat: int, view: _DeckView
 ) -> np.ndarray:
-    """One seat's 202 flat features, by the same function for every seat.
+    """One seat's 196 flat features, by the same function for every seat.
 
     Every read goes through a viewer-safe accessor -- ``sheet_for``,
     ``score_breakdown(..., viewer=)``, ``plan_turns_for`` -- so this is symmetric
@@ -1250,10 +1261,9 @@ def _sheet_scalars(
         w.put(_ratio(float(repair[x]), float(STREET_SIZES[x])))
     w.put(_ratio(float(sheet.total_span()), _TOTAL_SPAN_SCALE))
 
-    # THE RACE (108) -- §3.4
-    threats = plan_threats(state, viewer, seat)
+    # THE RACE (102) -- §3.4
     for slot in range(3):
-        _plan_block(state, viewer, seat, sheet, slot, view, threats, w)
+        _plan_block(state, viewer, seat, sheet, slot, view, w)
 
     # demand (24) -- §7.2
     w.put_array(_number_demand(sheet) / float(NUM_BOXES))
@@ -1487,7 +1497,7 @@ def block_axis(name: str) -> str:
 
 
 def plan_slot_slice(slot: int) -> slice:
-    """Where plan ``slot``'s 36 floats sit inside the ``plans`` block."""
+    """Where plan ``slot``'s 34 floats sit inside the ``plans`` block."""
     if not 0 <= slot < 3:
         raise ValueError(f"plan slot {slot} out of range")
     block = block_slice("plans")

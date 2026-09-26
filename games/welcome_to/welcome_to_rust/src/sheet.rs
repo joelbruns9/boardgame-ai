@@ -41,6 +41,35 @@ impl SheetScore {
     }
 }
 
+/// The most houses that could still be written in one street's `row`.
+/// Shared by `placement_capacity` and `capacity_if_roundabout` so the
+/// hypothetical is evaluated by the identical rule (`sheet.py::_row_capacity`).
+pub fn row_capacity(row: &[i32; MAX_STREET_LEN], size: usize) -> i32 {
+    let mut total = 0i32;
+    let mut y = 0usize;
+    while y < size {
+        if row[y] != EMPTY {
+            y += 1;
+            continue;
+        }
+        let start = y;
+        while y < size && row[y] == EMPTY {
+            y += 1;
+        }
+        let run = (y - start) as i32;
+        let mut low = MIN_NUMBER - 1;
+        if start > 0 && row[start - 1] != EMPTY && row[start - 1] != ROUNDABOUT {
+            low = row[start - 1];
+        }
+        let mut high = MAX_NUMBER + 1;
+        if y < size && row[y] != EMPTY && row[y] != ROUNDABOUT {
+            high = row[y];
+        }
+        total += run.min((high - low - 1).max(0));
+    }
+    total
+}
+
 #[derive(Clone, Debug)]
 pub struct Sheet {
     /// `EMPTY` for an empty box, otherwise the written number (0..17) or
@@ -179,35 +208,94 @@ impl Sheet {
     pub fn placement_capacity(&self) -> [i32; NUM_STREETS] {
         let mut out = [0i32; NUM_STREETS];
         for x in 0..NUM_STREETS {
-            let size = STREET_SIZES[x];
-            let row = &self.numbers[x];
-            let mut y = 0usize;
-            while y < size {
-                if row[y] != EMPTY {
-                    y += 1;
+            out[x] = row_capacity(&self.numbers[x], STREET_SIZES[x]);
+        }
+        out
+    }
+
+    /// Sum of `box_spans` — remaining freedom, which does not saturate.
+    pub fn total_span(&self) -> i32 {
+        let spans = self.box_spans();
+        (0..NUM_STREETS)
+            .map(|x| spans[x][..STREET_SIZES[x]].iter().sum::<i32>())
+            .sum()
+    }
+
+    /// `box_spans`, but allowing one roundabout elsewhere in the street.
+    /// Mirrors `Sheet.span_if_roundabout` (ENCODER_V3_SPEC §4).
+    pub fn span_if_roundabout(&self, available: bool) -> [[i32; MAX_STREET_LEN]; NUM_STREETS] {
+        let mut spans = self.box_spans();
+        if !available || !self.can_build_roundabout() {
+            return spans;
+        }
+        for x in 0..NUM_STREETS {
+            for y in 0..STREET_SIZES[x] {
+                if self.numbers[x][y] != EMPTY {
                     continue;
                 }
-                let start = y;
-                while y < size && row[y] == EMPTY {
-                    y += 1;
+                let (first, last, low, high) = self.gap_bounds(x, y).expect("empty box");
+                let mut best = spans[x][y];
+                if y > first {
+                    best = best.max((high - (MIN_NUMBER - 1) - 1).max(0));
                 }
-                let run = (y - start) as i32;
-                let mut low = MIN_NUMBER - 1;
-                if start > 0 && row[start - 1] != EMPTY && row[start - 1] != ROUNDABOUT {
-                    low = row[start - 1];
+                if y < last {
+                    best = best.max(((MAX_NUMBER + 1) - low - 1).max(0));
                 }
-                let mut high = MAX_NUMBER + 1;
-                if y < size && row[y] != EMPTY && row[y] != ROUNDABOUT {
-                    high = row[y];
-                }
-                out[x] += run.min((high - low - 1).max(0));
+                spans[x][y] = best;
             }
+        }
+        spans
+    }
+
+    /// Per street, the best `placement_capacity` one roundabout can buy.
+    pub fn capacity_if_roundabout(&self, available: bool) -> [i32; NUM_STREETS] {
+        let mut capacity = self.placement_capacity();
+        if !available || !self.can_build_roundabout() {
+            return capacity;
+        }
+        for x in 0..NUM_STREETS {
+            let size = STREET_SIZES[x];
+            let mut best = capacity[x];
+            for r in 0..size {
+                if self.numbers[x][r] != EMPTY {
+                    continue;
+                }
+                let mut hypothetical = self.numbers[x];
+                hypothetical[r] = ROUNDABOUT;
+                best = best.max(row_capacity(&hypothetical, size));
+            }
+            capacity[x] = best;
+        }
+        capacity
+    }
+
+    /// Could `(x, y)` ever be filled by a bis? A sound over-estimate; there is
+    /// deliberately no `bis_marks` test (the track saturates, it does not gate).
+    pub fn bis_reachable(&self, x: usize, y: usize) -> bool {
+        if self.numbers[x][y] != EMPTY {
+            return false;
+        }
+        let size = STREET_SIZES[x];
+        if y > 0 && !self.fences[x][y - 1] && self.numbers[x][y - 1] != ROUNDABOUT {
+            return true;
+        }
+        if y + 1 < size && !self.fences[x][y] && self.numbers[x][y + 1] != ROUNDABOUT {
+            return true;
+        }
+        false
+    }
+
+    /// Per street, an upper bound on boxes a bis could still fill.
+    pub fn bis_reach(&self) -> [i32; NUM_STREETS] {
+        let mut out = [0i32; NUM_STREETS];
+        for x in 0..NUM_STREETS {
+            out[x] = (0..STREET_SIZES[x]).filter(|&y| self.bis_reachable(x, y)).count() as i32;
         }
         out
     }
 
     /// `(first, last, low, high)` for the empty run containing `(x, y)`.
-    fn gap_bounds(&self, x: usize, y: usize) -> Option<(usize, usize, i32, i32)> {
+    pub fn gap_bounds(&self, x: usize, y: usize) -> Option<(usize, usize, i32, i32)> {
         let row = &self.numbers[x];
         let size = STREET_SIZES[x];
         if row[y] != EMPTY {
@@ -430,6 +518,18 @@ impl Sheet {
     pub fn estate_size_counts(&self) -> [i32; MAX_ESTATE_SIZE] {
         let mut mult = [0i32; MAX_ESTATE_SIZE];
         for (_, _, size) in self.estates() {
+            if size <= MAX_ESTATE_SIZE {
+                mult[size - 1] += 1;
+            }
+        }
+        mult
+    }
+
+    /// `estate_size_counts` over `free_estates` only: the plan-eligibility
+    /// multiset, where `estate_size_counts` is the scoring one.
+    pub fn free_estate_size_counts(&self) -> [i32; MAX_ESTATE_SIZE] {
+        let mut mult = [0i32; MAX_ESTATE_SIZE];
+        for (_, _, size) in self.free_estates() {
             if size <= MAX_ESTATE_SIZE {
                 mult[size - 1] += 1;
             }

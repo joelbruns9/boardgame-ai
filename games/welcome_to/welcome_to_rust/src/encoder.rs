@@ -1,28 +1,44 @@
-//! Bit-exact mirror of `games/welcome_to/encoder.py` (RUST_PORT_PLAN M3).
+//! Bit-exact mirror of `games/welcome_to/encoder.py` — encoder v3, ABI 2
+//! (ENCODER_V3_SPEC.md §12 step 6).
 //!
-//! Python remains the oracle. Integer divisions deliberately happen in `f64`
-//! and are cast to `f32` at the write, matching Python-float -> NumPy-f32. The
-//! deck histogram is already `f32`, so its normalization stays in `f32`, as
-//! NumPy does for those arrays.
+//! Python remains the oracle and §10.6 demands exact float equality. The rules
+//! that make that reachable:
+//!
+//! * integer divisions happen in `f64` and are cast to `f32` once, at the write,
+//!   matching Python-float -> NumPy-f32;
+//! * the deck histogram is `f32`, as in NumPy, and its normalisations stay `f32`;
+//! * every boundary-draw probability is an **integer** numerator sum over one
+//!   denominator (`deck_knowledge.ordered_draw_counts`), so summation order is
+//!   irrelevant — never a sum over a float joint, which NumPy sums pairwise;
+//! * the one non-integer reduction (`eff_rate`) is a plain left-to-right loop
+//!   on both sides.
+//!
+//! ⚠ §6.4's threat pair is DEMOTED (2026-09-25): a plan slot is 34 floats.
+//! ⚠ The four `SPEC GAP` rules in `encoder.py` are mirrored here by name.
 
+use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
 use crate::constants::{
     box_index, card_effect, card_number, num_base_cards, Effect, BIS_BOXES, EMPTY,
-    ESTATE_ROW_BOXES, MAX_ESTATE_SIZE, MAX_STREET_LEN, NUM_BOXES, NUM_STREETS, PARK_BOXES,
-    PERMIT_BOXES, POOL_BOXES, POOL_POSITIONS, ROUNDABOUT, ROUNDABOUT_BOXES, STREET_SIZES,
-    TEMP_BOXES,
+    ESTATE_ROW_BOXES, ESTATE_ROW_SCORES, EXTREMITY_POSITIONS, MAX_ESTATE_SIZE, MAX_NUMBER,
+    MAX_STREET_LEN, MIN_NUMBER, NUM_BOXES, NUM_STREETS, PARK_BOXES, PERMIT_BOXES, POOL_BOXES,
+    POOL_POSITIONS, ROUNDABOUT, ROUNDABOUT_BOXES, STREET_SIZES, TEMP_BOXES, TEMP_DELTAS,
 };
 use crate::game::{EngineError, EngineResult, Game, Phase, NO_CARD};
-use crate::plans::{dense_index, progress, NUM_DEALT_PLANS, PLANS};
-use crate::sheet::Sheet;
+use crate::plans::{
+    dense_index, feasible, progress, requirements, turns_lower_bound, Plan, PlanKind,
+    Requirements, NUM_DEALT_PLANS, PLANS,
+};
+use crate::sheet::{Pos, Sheet};
 
-pub const ENCODER_ABI_VERSION: usize = 1;
+pub const ENCODER_ABI_VERSION: usize = 2;
 pub const MAX_SEATS: usize = 4;
 pub const MAX_PLAYERS: usize = 6;
-pub const SHEET_PLANES: usize = 12;
-pub const NUM_SHEET_SCALAR: usize = 45;
-pub const NUM_GLOBAL_SCALAR: usize = 358;
+pub const SHEET_PLANES: usize = 22;
+pub const NUM_SHEET_SCALAR: usize = 196;
+pub const NUM_GLOBAL_SCALAR: usize = 367;
+pub const PLAN_SLOT_WIDTH: usize = 34;
 pub const SHEET_PLANES_LEN: usize = MAX_SEATS * SHEET_PLANES * NUM_STREETS * MAX_STREET_LEN;
 pub const SHEET_SCALARS_LEN: usize = MAX_SEATS * NUM_SHEET_SCALAR;
 pub const VIEWER_PLANE_LEN: usize = NUM_STREETS * MAX_STREET_LEN;
@@ -33,6 +49,17 @@ const NUM_NUMBER_VALUES: usize = 18;
 const TURN_SCALE: f64 = 30.0;
 const SCORE_SCALE: f64 = 50.0;
 const STEPS_SCALE: f64 = 12.0;
+const TURNS_CAP: f64 = 12.0;
+/// `constants.EPS` — the only guard constant, declared once in each language.
+const EPS: f64 = 1e-6;
+
+const LOW_SENTINEL: i32 = MIN_NUMBER - 1;
+const HIGH_SENTINEL: i32 = MAX_NUMBER + 1;
+const TOTAL_SPAN_SCALE: f64 = (NUM_BOXES * 18) as f64;
+const ESTATE_DEMAND_SCALE: f64 = 66.0;
+const FIT_RATE_BOX_SCALE: f64 = NUM_BOXES as f64;
+/// ⚠ SPEC GAP 1: SURVEYOR has no track; 3 slots x MAX_ESTATE_SIZE steps.
+const SURVEYOR_DEMAND_SCALE: f64 = 18.0;
 
 const P_VALID: usize = 0;
 const P_WRITTEN: usize = 1;
@@ -46,6 +73,30 @@ const P_WRITABLE: usize = 8;
 const P_ESTATE_SIZE: usize = 9;
 const P_SPAN: usize = 10;
 const P_FIT: usize = 11;
+const P_WRITABLE_TEMP: usize = 12;
+const P_SPAN_ROUNDABOUT: usize = 13;
+const P_FIT_DECK: usize = 14;
+const P_FIT_TEMP: usize = 15;
+const P_FIT_RESHUFFLE: usize = 16;
+const P_FIT_ROUNDABOUT: usize = 17;
+const P_FIT_NEXT_TURN: usize = 18;
+const P_PLAN_TARGET: [usize; 3] = [19, 20, 21];
+
+/// `DECK_EFFECT_ORDER`, i.e. the effect of each `effect_index`.
+const EFFECT_ORDER: [Effect; NUM_EFFECTS] = [
+    Effect::Surveyor,
+    Effect::Pool,
+    Effect::Temp,
+    Effect::Bis,
+    Effect::Park,
+    Effect::Estate,
+];
+const E_SURVEYOR: usize = 0;
+const E_POOL: usize = 1;
+const E_TEMP: usize = 2;
+const E_BIS: usize = 3;
+const E_PARK: usize = 4;
+const E_ESTATE: usize = 5;
 
 pub(crate) type Matrix = [[f32; NUM_EFFECTS]; NUM_NUMBERS];
 
@@ -60,14 +111,27 @@ fn ratio_i32(value: i32, scale: i32) -> f32 {
     (value as f64 / scale as f64) as f32
 }
 
+/// §9.4: every quotient is `num / max(den, EPS)`, clamped to [0, 1].
+fn ratio(num: f64, den: f64) -> f64 {
+    (num / den.max(EPS)).max(0.0).min(1.0)
+}
+
+/// §9.4: `min(t, TURNS_CAP) / TURNS_CAP`; a non-finite supply lands on 1.0.
+fn turns(value: f64) -> f64 {
+    if !value.is_finite() {
+        return 1.0;
+    }
+    value.max(0.0).min(TURNS_CAP) / TURNS_CAP
+}
+
 fn effect_index(effect: Effect) -> Option<usize> {
     Some(match effect {
-        Effect::Surveyor => 0,
-        Effect::Pool => 1,
-        Effect::Temp => 2,
-        Effect::Bis => 3,
-        Effect::Park => 4,
-        Effect::Estate => 5,
+        Effect::Surveyor => E_SURVEYOR,
+        Effect::Pool => E_POOL,
+        Effect::Temp => E_TEMP,
+        Effect::Bis => E_BIS,
+        Effect::Park => E_PARK,
+        Effect::Estate => E_ESTATE,
         Effect::Solo => return None,
     })
 }
@@ -92,204 +156,41 @@ fn seat_order(game: &Game, viewer: usize) -> Vec<usize> {
     out
 }
 
-fn offered_numbers(game: &Game, viewer: usize) -> Vec<i32> {
-    let mut out = Vec::new();
-    for slot in 0..3 {
-        let (number, effect) = game.combination_faces(slot, viewer);
-        if let (Some(number), Some(effect)) = (number, effect) {
-            out.extend(game.numbers_for(number, effect));
+/// `game.py::_numbers_for` — the temp widening, in codec order.
+fn numbers_for(number: i32, effect: Effect) -> Vec<i32> {
+    if effect != Effect::Temp {
+        return vec![number];
+    }
+    let mut out = vec![number];
+    for &delta in TEMP_DELTAS[1..].iter() {
+        let n = number + delta;
+        if (MIN_NUMBER..=MAX_NUMBER).contains(&n) {
+            out.push(n);
         }
     }
     out
 }
 
-fn write_sheet_planes(sheet: &Sheet, offered: &[i32], seat: usize, out: &mut [f32]) {
-    let mut writable = [[false; MAX_STREET_LEN]; NUM_STREETS];
-    for &number in offered {
-        for (x, y) in sheet.available_locations(Some(number)) {
-            writable[x][y] = true;
-        }
-    }
-    let spans = sheet.box_spans();
-    for x in 0..NUM_STREETS {
-        let size = STREET_SIZES[x];
-        for y in 0..size {
-            let number = sheet.numbers[x][y];
-            out[sheet_plane_index(seat, P_VALID, x, y)] = 1.0;
-            if number != EMPTY {
-                out[sheet_plane_index(seat, P_WRITTEN, x, y)] = 1.0;
-                if number == ROUNDABOUT {
-                    out[sheet_plane_index(seat, P_ROUNDABOUT, x, y)] = 1.0;
-                } else {
-                    out[sheet_plane_index(seat, P_NUMBER, x, y)] = ratio_i32(number, 17);
-                }
-            }
-            out[sheet_plane_index(seat, P_BIS, x, y)] = sheet.is_bis[x][y] as u8 as f32;
-            out[sheet_plane_index(seat, P_TOP_FENCE, x, y)] = sheet.top_fences[x][y] as u8 as f32;
-            if y + 1 < size {
-                out[sheet_plane_index(seat, P_FENCE_RIGHT, x, y)] = sheet.fences[x][y] as u8 as f32;
-            }
-            out[sheet_plane_index(seat, P_POOL, x, y)] =
-                POOL_POSITIONS.contains(&(x, y)) as u8 as f32;
-            out[sheet_plane_index(seat, P_WRITABLE, x, y)] = writable[x][y] as u8 as f32;
-            out[sheet_plane_index(seat, P_SPAN, x, y)] = ratio_i32(spans[x][y], 18);
-            if number == EMPTY {
-                let mut best: Option<f64> = None;
-                for &candidate in offered {
-                    if let Some(fit) = sheet.positional_fit(candidate, x, y) {
-                        best = Some(best.map_or(fit, |old| old.max(fit)));
-                    }
-                }
-                if let Some(fit) = best {
-                    out[sheet_plane_index(seat, P_FIT, x, y)] = (1.0f64 / (1.0f64 - fit)) as f32;
-                }
-            }
-        }
-    }
-    for (x, start, estate_size) in sheet.estates() {
-        for y in start..start + estate_size {
-            out[sheet_plane_index(seat, P_ESTATE_SIZE, x, y)] = estate_size as f32 / 6.0f32;
-        }
-    }
+fn banked(game: &Game, viewer: usize, seat: usize, slot: usize) -> bool {
+    game.plan_turns_for(viewer, slot)
+        .iter()
+        .any(|&(player, _)| player == seat as i32)
 }
 
-struct Writer {
-    buf: Vec<f32>,
-    pos: usize,
-}
-
-impl Writer {
-    fn new(size: usize) -> Writer {
-        Writer {
-            buf: vec![0.0; size],
-            pos: 0,
-        }
-    }
-
-    fn put(&mut self, value: f32) {
-        self.buf[self.pos] = value;
-        self.pos += 1;
-    }
-
-    fn put_f64(&mut self, value: f64) {
-        self.put(value as f32);
-    }
-
-    fn put_array(&mut self, values: &[f32]) {
-        self.buf[self.pos..self.pos + values.len()].copy_from_slice(values);
-        self.pos += values.len();
-    }
-
-    fn one_hot(&mut self, index: Option<usize>, size: usize) {
-        if let Some(index) = index {
-            if index < size {
-                self.buf[self.pos + index] = 1.0;
-            }
-        }
-        self.pos += size;
-    }
-
-    fn skip(&mut self, count: usize) {
-        self.pos += count;
-    }
-}
-
-fn sheet_scalars(game: &Game, viewer: usize, seat: usize) -> Vec<f32> {
-    let sheet = game.sheet_for(viewer, seat);
-    let mut w = Writer::new(NUM_SHEET_SCALAR);
-
-    for x in 0..NUM_STREETS {
-        w.put(ratio_i32(sheet.parks[x], PARK_BOXES[x]));
-    }
-    w.put(ratio_i32(sheet.pool_count(), POOL_BOXES));
-    w.put(ratio_i32(sheet.temps, TEMP_BOXES));
-    w.put(ratio_i32(sheet.bis_marks, BIS_BOXES));
-    w.put(ratio_i32(sheet.permits, PERMIT_BOXES));
-    w.put(ratio_i32(sheet.roundabouts, ROUNDABOUT_BOXES));
-    for i in 0..MAX_ESTATE_SIZE {
-        w.put(ratio_i32(sheet.estate_marks[i], ESTATE_ROW_BOXES[i]));
-    }
-    for count in sheet.estate_size_counts() {
-        w.put_f64(count as f64 / 4.0);
-    }
-
-    let breakdown = game.score_breakdown(seat, Some(viewer));
-    for value in [
-        breakdown.parks,
-        breakdown.pools,
-        breakdown.estates,
-        breakdown.plans,
-        breakdown.temp,
-        breakdown.bis,
-        breakdown.permits,
-        breakdown.roundabouts,
-    ] {
-        w.put_f64(value as f64 / SCORE_SCALE);
-    }
-    w.put_f64(breakdown.total() as f64 / 100.0);
-
-    let capacity = sheet.placement_capacity();
-    for x in 0..NUM_STREETS {
-        w.put(ratio_i32(capacity[x], STREET_SIZES[x] as i32));
-    }
-    w.put_f64(capacity.iter().sum::<i32>() as f64 / NUM_BOXES as f64);
-
+/// `(number, effect)` per stack with both faces visible (`visible_cards`).
+fn offers(game: &Game, viewer: usize) -> Vec<(i32, Effect)> {
+    let mut out = Vec::new();
     for slot in 0..3 {
-        let (fraction, steps) = progress(&PLANS[game.plan_ids[slot]], sheet);
-        let banked = game
-            .plan_turns_for(viewer, slot)
-            .iter()
-            .any(|&(player, _)| player == seat as i32);
-        w.put_f64(fraction);
-        w.put_f64((steps as f64).min(STEPS_SCALE) / STEPS_SCALE);
-        w.put(banked as u8 as f32);
+        if let (Some(number), Some(effect)) = game.combination_faces(slot, viewer) {
+            out.push((number, effect));
+        }
     }
-
-    let written = (0..NUM_STREETS)
-        .map(|x| {
-            (0..STREET_SIZES[x])
-                .filter(|&y| sheet.numbers[x][y] != EMPTY)
-                .count()
-        })
-        .sum::<usize>();
-    w.put_f64((NUM_BOXES - written) as f64 / NUM_BOXES as f64);
-    w.put((seat == viewer) as u8 as f32);
-    w.put(1.0);
-    debug_assert_eq!(w.pos, NUM_SHEET_SCALAR);
-    w.buf
+    out
 }
 
-/// ⚠ `game.ctx` belongs to `game.actor`, so this reads it only when the viewer
-/// *is* the actor. Ungated it would answer "where could the viewer write the
-/// number the opponent just picked" — meaningless, a read of hidden mid-turn
-/// state, and invisible to `information_key`, which carries `ctx` only on the
-/// viewer's own turn. See `encoder.py::_viewer_plane` for the full argument.
-fn write_viewer_plane(game: &Game, viewer: usize, out: &mut [f32]) {
-    if viewer != game.actor {
-        return;
-    }
-    let sheet = &game.sheets[viewer];
-    let mut boxes = [[false; MAX_STREET_LEN]; NUM_STREETS];
-    if game.phase == Phase::WriteNumber {
-        if let (Some(number), Some(effect)) = (game.ctx.number, game.ctx.effect) {
-            for candidate in game.numbers_for(number, effect) {
-                for (x, y) in sheet.available_locations(Some(candidate)) {
-                    boxes[x][y] = true;
-                }
-            }
-        }
-    } else if game.phase == Phase::RoundaboutPlace {
-        for (x, y) in sheet.available_locations(None) {
-            boxes[x][y] = true;
-        }
-    }
-    for x in 0..NUM_STREETS {
-        for y in 0..STREET_SIZES[x] {
-            out[viewer_plane_index(x, y)] = boxes[x][y] as u8 as f32;
-        }
-    }
-}
-
+// ──────────────────────────────────────────────────────────────────────────
+// Deck histograms
+// ──────────────────────────────────────────────────────────────────────────
 fn card_cell(card: i32) -> Option<(usize, usize)> {
     if card == NO_CARD || card < 0 {
         return None;
@@ -319,8 +220,7 @@ fn histogram<'a>(cards: impl IntoIterator<Item = &'a i32>) -> Matrix {
 /// The full 81-card deck as a `(number, effect)` histogram.
 ///
 /// Memoized because `deck_composition` runs once per `information_key` — that
-/// is once per search transition, not once per evaluated leaf — and rebuilding
-/// this allocated an 81-element `Vec` and walked the card table every time.
+/// is once per search transition, not once per evaluated leaf.
 fn base_deck_matrix() -> &'static Matrix {
     static BASE: OnceLock<Matrix> = OnceLock::new();
     BASE.get_or_init(|| {
@@ -340,10 +240,7 @@ fn add_matrix(left: &Matrix, right: &Matrix) -> Matrix {
 }
 
 pub(crate) fn deck_composition(game: &Game, viewer: usize) -> Matrix {
-    // Accumulated in place rather than into a joined `Vec`: the previous
-    // spelling cloned `discard` (up to 81 cards) and appended the table on
-    // every call. Counts are whole numbers held in `f32`, so summation order
-    // is exact and this stays bit-identical to the Python oracle.
+    // Counts are whole numbers held in `f32`, so summation order is exact.
     let mut seen = histogram(game.table_cards(viewer).iter());
     if !game.config.expert {
         add_cards(&mut seen, game.discard.iter());
@@ -404,17 +301,1046 @@ fn normalize(values: &[f32], uniform_if_empty: bool) -> Vec<f32> {
     values.iter().map(|&value| value / total).collect()
 }
 
-fn global_scalars(game: &Game, viewer: usize) -> EngineResult<Vec<f32>> {
+// ──────────────────────────────────────────────────────────────────────────
+// The literal boundary draw (deck_knowledge.ordered_draw_counts)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Ordered draws as exact integer numerators over one denominator. `num` is
+/// flattened `K^3`, indexed `(a * K + b) * K + c`.
+struct DrawCounts {
+    k: usize,
+    num: Vec<f64>,
+    den: f64,
+}
+
+/// Numerators of `n` ordered draws without replacement, flattened `K^n`,
+/// and the falling-factorial denominator.
+fn without_replacement(counts: &[f64], n: usize) -> (Vec<f64>, f64) {
+    let k = counts.len();
+    let eye = |i: usize, j: usize| if i == j { 1.0 } else { 0.0 };
+    let num: Vec<f64> = match n {
+        0 => vec![1.0],
+        1 => counts.to_vec(),
+        2 => {
+            let mut out = Vec::with_capacity(k * k);
+            for a in 0..k {
+                for b in 0..k {
+                    out.push(counts[a] * (counts[b] - eye(a, b)));
+                }
+            }
+            out
+        }
+        3 => {
+            let mut out = Vec::with_capacity(k * k * k);
+            for a in 0..k {
+                for b in 0..k {
+                    for c in 0..k {
+                        out.push(
+                            counts[a]
+                                * (counts[b] - eye(a, b))
+                                * (counts[c] - eye(a, c) - eye(b, c)),
+                        );
+                    }
+                }
+            }
+            out
+        }
+        _ => panic!("a boundary draws at most three cards, not {n}"),
+    };
+    let total: f64 = counts.iter().sum();
+    let mut den = 1.0f64;
+    for i in 0..n {
+        den *= total - i as f64;
+    }
+    (num.into_iter().map(|v| v.max(0.0)).collect(), den)
+}
+
+fn ordered_draw_counts(deck: &[f64], pool: &[f64]) -> DrawCounts {
+    let k = deck.len();
+    let deck_total: f64 = deck.iter().sum();
+    let from_deck = (deck_total.round() as usize).min(3);
+    let (num_deck, den_deck) = without_replacement(deck, from_deck);
+    let (num_pool, den_pool) = without_replacement(pool, 3 - from_deck);
+    let mut num = Vec::with_capacity(k * k * k);
+    for &d in &num_deck {
+        for &p in &num_pool {
+            num.push(d * p);
+        }
+    }
+    debug_assert_eq!(num.len(), k * k * k);
+    DrawCounts { k, num, den: den_deck * den_pool }
+}
+
+impl DrawCounts {
+    /// `deck_knowledge.draw_probability`: P(draw i lands in `masks[i]`, all i).
+    fn probability(&self, masks: [&[f64]; 3]) -> f64 {
+        let k = self.k;
+        let mut hits = 0.0f64;
+        for a in 0..k {
+            if masks[0][a] == 0.0 {
+                continue;
+            }
+            for b in 0..k {
+                if masks[1][b] == 0.0 {
+                    continue;
+                }
+                let base = (a * k + b) * k;
+                for c in 0..k {
+                    if masks[2][c] != 0.0 {
+                        hits += self.num[base + c];
+                    }
+                }
+            }
+        }
+        (hits / self.den.max(EPS)).max(0.0).min(1.0)
+    }
+}
+
+fn to_f64<const N: usize>(values: &[f32; N]) -> [f64; N] {
+    let mut out = [0.0f64; N];
+    for i in 0..N {
+        out[i] = values[i] as f64;
+    }
+    out
+}
+
+/// `np.cumsum(np.rint(counts))` with a leading zero.
+fn prefix(counts: &[f32; NUM_NUMBERS]) -> [i64; NUM_NUMBERS + 1] {
+    let mut out = [0i64; NUM_NUMBERS + 1];
+    for i in 0..NUM_NUMBERS {
+        out[i + 1] = out[i] + (counts[i] as f64).round_ties_even() as i64;
+    }
+    out
+}
+
+/// Cards whose printed number `n` satisfies `low < n < high`.
+fn count_in_open_interval(prefix: &[i64; NUM_NUMBERS + 1], low: i32, high: i32) -> i64 {
+    let lo = low.max(0).min(NUM_NUMBERS as i32) as usize;
+    let hi = (high - 1).max(0).min(NUM_NUMBERS as i32) as usize;
+    if hi > lo {
+        prefix[hi] - prefix[lo]
+    } else {
+        0
+    }
+}
+
+/// `encoder.py::_DeckView` — everything the whole state shares.
+struct DeckView {
+    deck_prefix: [i64; NUM_NUMBERS + 1],
+    reshuffled_prefix: [i64; NUM_NUMBERS + 1],
+    deck_total: f64,
+    reshuffled_total: f64,
+    deck_matrix: Matrix,
+    reshuffled_matrix: Matrix,
+    deck_numbers: [f32; NUM_NUMBERS],
+    deck_effects: [f32; NUM_EFFECTS],
+    reshuffled_numbers: [f32; NUM_NUMBERS],
+    reshuffled_effects: [f32; NUM_EFFECTS],
+    effect_rate: [f64; NUM_EFFECTS],
+    next_effects: [Option<Effect>; 3],
+    next_is_temp: [bool; 3],
+    joint: DrawCounts,
+}
+
+impl DeckView {
+    fn new(game: &Game, viewer: usize) -> DeckView {
+        let deck_matrix = deck_composition(game, viewer);
+        let pool_matrix = add_matrix(&discard_composition(game), &aside_composition(game));
+        let reshuffled_matrix = add_matrix(&deck_matrix, &pool_matrix);
+        let deck_numbers = row_sums(&deck_matrix);
+        let reform_numbers = row_sums(&pool_matrix);
+        let reshuffled_numbers = row_sums(&reshuffled_matrix);
+
+        let deck_prefix = prefix(&deck_numbers);
+        // `_prefix(deck + pool)`: the f32 sum of two row-sum vectors.
+        let mut deck_plus_pool = [0.0f32; NUM_NUMBERS];
+        for i in 0..NUM_NUMBERS {
+            deck_plus_pool[i] = deck_numbers[i] + reform_numbers[i];
+        }
+        let reshuffled_prefix = prefix(&deck_plus_pool);
+
+        // §9.3 effect_supply_rate, branching on the viewer's OWN vote.
+        let (rate_deck, rate_pool) = if game.reshuffle_vote_for(viewer) {
+            (to_f64(&column_sums(&reshuffled_matrix)), [0.0f64; NUM_EFFECTS])
+        } else {
+            (
+                to_f64(&column_sums(&deck_matrix)),
+                to_f64(&column_sums(&pool_matrix)),
+            )
+        };
+        let effect_joint = ordered_draw_counts(&rate_deck, &rate_pool);
+        let mut effect_rate = [0.0f64; NUM_EFFECTS];
+        for e in 0..NUM_EFFECTS {
+            let mut miss = [1.0f64; NUM_EFFECTS];
+            miss[e] = 0.0;
+            let p = effect_joint.probability([&miss, &miss, &miss]);
+            effect_rate[e] = (1.0 - p).max(0.0).min(1.0);
+        }
+
+        let next_effects = game.next_effects(viewer);
+        let next_is_temp = [
+            next_effects[0] == Some(Effect::Temp),
+            next_effects[1] == Some(Effect::Temp),
+            next_effects[2] == Some(Effect::Temp),
+        ];
+        let joint = ordered_draw_counts(&to_f64(&deck_numbers), &to_f64(&reform_numbers));
+
+        DeckView {
+            deck_total: deck_prefix[NUM_NUMBERS] as f64,
+            reshuffled_total: reshuffled_prefix[NUM_NUMBERS] as f64,
+            deck_prefix,
+            reshuffled_prefix,
+            deck_effects: column_sums(&deck_matrix),
+            reshuffled_effects: column_sums(&reshuffled_matrix),
+            deck_matrix,
+            reshuffled_matrix,
+            deck_numbers,
+            reshuffled_numbers,
+            effect_rate,
+            next_effects,
+            next_is_temp,
+            joint,
+        }
+    }
+
+    fn deck_count(&self, low: i32, high: i32) -> i64 {
+        count_in_open_interval(&self.deck_prefix, low, high)
+    }
+
+    fn fit_deck(&self, low: i32, high: i32) -> f64 {
+        ratio(self.deck_count(low, high) as f64, self.deck_total)
+    }
+
+    fn fit_reshuffled(&self, low: i32, high: i32) -> f64 {
+        ratio(
+            count_in_open_interval(&self.reshuffled_prefix, low, high) as f64,
+            self.reshuffled_total,
+        )
+    }
+
+    fn draw_probability(&self, masks: [&[f64]; 3]) -> f64 {
+        self.joint.probability(masks)
+    }
+}
+
+/// §7.5: P(some stack next turn reveals a number fitting this gap).
+fn p_fit_next_turn(view: &DeckView, low: i32, high: i32) -> f64 {
+    let fit_notemp = view.deck_count(low, high) as f64;
+    let fit_temp = view.deck_count(low - 2, high + 2) as f64;
+    let fits: Vec<f64> = view
+        .next_is_temp
+        .iter()
+        .map(|&temp| if temp { fit_temp } else { fit_notemp })
+        .collect();
+
+    let total = view.deck_total;
+    if total >= 3.0 {
+        let misses = [total - fits[0], total - fits[1], total - fits[2]];
+        let p12 = total - fits[0].max(fits[1]);
+        let p13 = total - fits[0].max(fits[2]);
+        let p23 = total - fits[1].max(fits[2]);
+        let r = total - fits[0].max(fits[1]).max(fits[2]);
+        let none = misses[0] * misses[1] * misses[2] - p12 * misses[2] - p13 * misses[1]
+            - p23 * misses[0]
+            + 2.0 * r;
+        let denom = total * (total - 1.0) * (total - 2.0);
+        return (1.0 - none / denom.max(EPS)).max(0.0).min(1.0);
+    }
+
+    // D < 3: the draw reforms mid-way, so enumerate it literally.
+    let mut masks = [[1.0f64; NUM_NUMBERS]; 3];
+    for (i, &temp) in view.next_is_temp.iter().enumerate() {
+        let (lo, hi) = if temp { (low - 2, high + 2) } else { (low, high) };
+        for (j, n) in (1..=NUM_NUMBERS as i32).enumerate() {
+            if lo < n && n < hi {
+                masks[i][j] = 0.0;
+            }
+        }
+    }
+    (1.0 - view.draw_probability([&masks[0], &masks[1], &masks[2]]))
+        .max(0.0)
+        .min(1.0)
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Spatial planes
+// ──────────────────────────────────────────────────────────────────────────
+
+/// `_roundabout_bounds`: mirrors `span_if_roundabout`'s tie-break exactly.
+fn roundabout_bounds(sheet: &Sheet, x: usize, y: usize, available: bool) -> (i32, i32) {
+    let (first, last, low, high) = sheet.gap_bounds(x, y).expect("empty box");
+    if !available {
+        return (low, high);
+    }
+    let mut best = (low, high);
+    let mut best_span = (high - low - 1).max(0);
+    if y > first {
+        let span = (high - LOW_SENTINEL - 1).max(0);
+        if span > best_span {
+            best = (LOW_SENTINEL, high);
+            best_span = span;
+        }
+    }
+    if y < last {
+        let span = (HIGH_SENTINEL - low - 1).max(0);
+        if span > best_span {
+            best = (low, HIGH_SENTINEL);
+        }
+    }
+    best
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_sheet_planes(
+    game: &Game,
+    viewer: usize,
+    seat: usize,
+    sheet: &Sheet,
+    base_numbers: &[i32],
+    all_numbers: &[i32],
+    view: &DeckView,
+    axis: usize,
+    out: &mut [f32],
+) {
+    let mut writable_base = [[false; MAX_STREET_LEN]; NUM_STREETS];
+    for &n in base_numbers {
+        for (x, y) in sheet.available_locations(Some(n)) {
+            writable_base[x][y] = true;
+        }
+    }
+    let mut writable_any = writable_base;
+    for &n in all_numbers {
+        for (x, y) in sheet.available_locations(Some(n)) {
+            writable_any[x][y] = true;
+        }
+    }
+
+    let spans = sheet.box_spans();
+    let roundabout_open = game.config.advanced && sheet.can_build_roundabout();
+    let spans_ra = sheet.span_if_roundabout(roundabout_open);
+
+    let mut targets = [[[false; MAX_STREET_LEN]; NUM_STREETS]; 3];
+    for slot in 0..3 {
+        if banked(game, viewer, seat, slot) {
+            continue;
+        }
+        for (x, y) in requirements(&PLANS[game.plan_ids[slot]], sheet).target_boxes {
+            targets[slot][x][y] = true;
+        }
+    }
+
+    let mut set = |plane: usize, x: usize, y: usize, value: f32| {
+        out[sheet_plane_index(axis, plane, x, y)] = value;
+    };
+
+    for x in 0..NUM_STREETS {
+        let size = STREET_SIZES[x];
+        for y in 0..size {
+            let n = sheet.numbers[x][y];
+            set(P_VALID, x, y, 1.0);
+            if n != EMPTY {
+                set(P_WRITTEN, x, y, 1.0);
+                if n == ROUNDABOUT {
+                    set(P_ROUNDABOUT, x, y, 1.0);
+                } else {
+                    set(P_NUMBER, x, y, ratio_i32(n, 17));
+                }
+            }
+            set(P_BIS, x, y, sheet.is_bis[x][y] as u8 as f32);
+            set(P_TOP_FENCE, x, y, sheet.top_fences[x][y] as u8 as f32);
+            if y + 1 < size {
+                set(P_FENCE_RIGHT, x, y, sheet.fences[x][y] as u8 as f32);
+            }
+            set(P_POOL, x, y, POOL_POSITIONS.contains(&(x, y)) as u8 as f32);
+            set(P_WRITABLE, x, y, writable_base[x][y] as u8 as f32);
+            set(
+                P_WRITABLE_TEMP,
+                x,
+                y,
+                (writable_any[x][y] && !writable_base[x][y]) as u8 as f32,
+            );
+            set(P_SPAN, x, y, ratio_i32(spans[x][y], 18));
+            set(P_SPAN_ROUNDABOUT, x, y, ratio_i32(spans_ra[x][y], 18));
+            for k in 0..3 {
+                set(P_PLAN_TARGET[k], x, y, targets[k][x][y] as u8 as f32);
+            }
+
+            if n != EMPTY {
+                continue;
+            }
+
+            // ⚠ §5.2: positional_fit over the DELTA-0 numbers only.
+            let mut best: Option<f64> = None;
+            for &v in base_numbers {
+                if let Some(fit) = sheet.positional_fit(v, x, y) {
+                    best = Some(best.map_or(fit, |old: f64| old.max(fit)));
+                }
+            }
+            if let Some(fit) = best {
+                set(P_FIT, x, y, (1.0f64 / (1.0f64 - fit)) as f32);
+            }
+
+            let (_first, _last, low, high) = sheet.gap_bounds(x, y).expect("empty box");
+            set(P_FIT_DECK, x, y, view.fit_deck(low, high) as f32);
+            set(P_FIT_TEMP, x, y, view.fit_deck(low - 2, high + 2) as f32);
+            set(P_FIT_RESHUFFLE, x, y, view.fit_reshuffled(low, high) as f32);
+            set(P_FIT_NEXT_TURN, x, y, p_fit_next_turn(view, low, high) as f32);
+
+            let (ra_low, ra_high) = roundabout_bounds(sheet, x, y, roundabout_open);
+            set(P_FIT_ROUNDABOUT, x, y, view.fit_deck(ra_low, ra_high) as f32);
+        }
+    }
+    for (x, start, estate_size) in sheet.estates() {
+        for y in start..start + estate_size {
+            out[sheet_plane_index(axis, P_ESTATE_SIZE, x, y)] = estate_size as f32 / 6.0f32;
+        }
+    }
+}
+
+/// ⚠ `game.ctx` belongs to `game.actor`, so this reads it only when the viewer
+/// *is* the actor. See `encoder.py::_viewer_plane` for the full argument.
+fn write_viewer_plane(game: &Game, viewer: usize, out: &mut [f32]) {
+    if viewer != game.actor {
+        return;
+    }
+    let sheet = &game.sheets[viewer];
+    let mut boxes = [[false; MAX_STREET_LEN]; NUM_STREETS];
+    if game.phase == Phase::WriteNumber {
+        if let (Some(number), Some(effect)) = (game.ctx.number, game.ctx.effect) {
+            for candidate in game.numbers_for(number, effect) {
+                for (x, y) in sheet.available_locations(Some(candidate)) {
+                    boxes[x][y] = true;
+                }
+            }
+        }
+    } else if game.phase == Phase::RoundaboutPlace {
+        for (x, y) in sheet.available_locations(None) {
+            boxes[x][y] = true;
+        }
+    }
+    for x in 0..NUM_STREETS {
+        for y in 0..STREET_SIZES[x] {
+            out[viewer_plane_index(x, y)] = boxes[x][y] as u8 as f32;
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Flat features
+// ──────────────────────────────────────────────────────────────────────────
+struct Writer {
+    buf: Vec<f32>,
+    pos: usize,
+}
+
+impl Writer {
+    fn new(size: usize) -> Writer {
+        Writer {
+            buf: vec![0.0; size],
+            pos: 0,
+        }
+    }
+
+    fn put(&mut self, value: f32) {
+        self.buf[self.pos] = value;
+        self.pos += 1;
+    }
+
+    fn put_f64(&mut self, value: f64) {
+        self.put(value as f32);
+    }
+
+    fn put_array(&mut self, values: &[f32]) {
+        self.buf[self.pos..self.pos + values.len()].copy_from_slice(values);
+        self.pos += values.len();
+    }
+
+    fn one_hot(&mut self, index: Option<usize>, size: usize) {
+        if let Some(index) = index {
+            if index < size {
+                self.buf[self.pos + index] = 1.0;
+            }
+        }
+        self.pos += size;
+    }
+
+    fn skip(&mut self, count: usize) {
+        self.pos += count;
+    }
+}
+
+/// ⚠ SPEC GAP 4: marks of each effect this plan still needs, as ordered
+/// `(effect index, marks)` pairs — the order is `encoder.py::_effect_needs`'s
+/// dict order, which the float sum depends on.
+fn effect_needs(plan: &Plan, req: &Requirements, steps_left: i32) -> Vec<(usize, i32)> {
+    match plan.kind {
+        PlanKind::SevenTemp => vec![(E_TEMP, req.temps_needed)],
+        PlanKind::Estate => vec![(E_SURVEYOR, req.estate_steps_left)],
+        PlanKind::FiveBis => (0..NUM_STREETS)
+            .filter(|&x| req.street_serves[x] != 0)
+            .map(|x| req.bis_needed[x])
+            .min()
+            .map(|m| vec![(E_BIS, m)])
+            .unwrap_or_default(),
+        PlanKind::FullStreet | PlanKind::Extremities => Vec::new(),
+        PlanKind::CompleteStreet => (0..NUM_STREETS)
+            .filter(|&x| req.street_serves[x] != 0)
+            .min_by_key(|&x| {
+                (
+                    req.parks_needed[x] + req.pools_needed[x] + req.roundabout_needed[x],
+                    x,
+                )
+            })
+            .map(|best| {
+                vec![
+                    (E_PARK, req.parks_needed[best]),
+                    (E_POOL, req.pools_needed[best]),
+                ]
+            })
+            .unwrap_or_default(),
+        PlanKind::Decorative => match plan.params[0].text() {
+            "pool&park" => {
+                let x = plan.params[1].int() as usize;
+                vec![(E_PARK, req.parks_needed[x]), (E_POOL, req.pools_needed[x])]
+            }
+            "park" => vec![(E_PARK, steps_left)],
+            _ => vec![(E_POOL, steps_left)],
+        },
+        PlanKind::Unsupported => Vec::new(),
+    }
+}
+
+/// One plan slot's 34 floats (§3.4, without the demoted §6.4 pair).
+#[allow(clippy::too_many_arguments)]
+fn plan_block(
+    game: &Game,
+    viewer: usize,
+    seat: usize,
+    sheet: &Sheet,
+    slot: usize,
+    view: &DeckView,
+    w: &mut Writer,
+) {
+    let plan = &PLANS[game.plan_ids[slot]];
+    let (fraction, steps) = progress(plan, sheet);
+    let is_banked = banked(game, viewer, seat, slot);
+    let req = requirements(plan, sheet);
+
+    w.put_f64(fraction);
+    w.put_f64((steps as f64).min(STEPS_SCALE) / STEPS_SCALE);
+    w.put(is_banked as u8 as f32);
+
+    w.put_f64(ratio(req.temps_needed as f64, 7.0));
+    w.put_f64(if plan.kind == PlanKind::Estate {
+        ratio(req.estate_steps_left as f64, 6.0)
+    } else {
+        0.0
+    });
+
+    for s in 0..MAX_ESTATE_SIZE {
+        w.put_f64(ratio(req.estate_shortfall[s] as f64, 6.0));
+    }
+
+    for x in 0..NUM_STREETS {
+        w.put_f64(ratio(req.parks_needed[x] as f64, PARK_BOXES[x] as f64));
+        w.put_f64(ratio(req.pools_needed[x] as f64, 3.0));
+        w.put_f64(ratio(req.houses_needed[x] as f64, STREET_SIZES[x] as f64));
+        w.put_f64(ratio(req.bis_needed[x] as f64, 5.0));
+        w.put_f64(req.roundabout_needed[x] as f64);
+        w.put_f64(req.street_serves[x] as f64);
+    }
+
+    w.put(if feasible(plan, sheet) { 1.0 } else { 0.0 });
+    w.put_f64(turns(turns_lower_bound(plan, sheet) as f64));
+
+    let mut effect_turns_raw = 0.0f64;
+    for (effect, marks) in effect_needs(plan, &req, steps) {
+        if marks <= 0 {
+            continue;
+        }
+        effect_turns_raw += marks as f64 / view.effect_rate[effect].max(EPS);
+    }
+    w.put_f64(turns(effect_turns_raw));
+
+    // §6.3 number_rate_supply: the deck fraction supplying the target gaps.
+    let houses_total: i32 = req.houses_needed.iter().sum();
+    let mut supply_numbers = [false; NUM_NUMBERS];
+    for &(x, y) in &req.target_boxes {
+        if let Some((_f, _l, low, high)) = sheet.gap_bounds(x, y) {
+            for n in 1..=NUM_NUMBERS as i32 {
+                if low < n && n < high {
+                    supply_numbers[(n - 1) as usize] = true;
+                }
+            }
+        }
+    }
+    let mut supply = 0.0f64;
+    for i in 0..NUM_NUMBERS {
+        if supply_numbers[i] {
+            supply += view.deck_numbers[i] as f64;
+        }
+    }
+    let number_rate_supply = ratio(supply, view.deck_total);
+    w.put_f64(number_rate_supply);
+
+    let number_turns_raw = if houses_total != 0 {
+        houses_total as f64 / number_rate_supply.max(EPS)
+    } else {
+        0.0
+    };
+    w.put_f64(turns(effect_turns_raw.max(number_turns_raw)));
+}
+
+/// §7.2: legal `(empty box, value)` pairs, per value 0..17.
+fn number_demand(sheet: &Sheet) -> [f64; NUM_NUMBER_VALUES] {
+    let mut demand = [0.0f64; NUM_NUMBER_VALUES];
+    for x in 0..NUM_STREETS {
+        let size = STREET_SIZES[x];
+        let mut y = 0usize;
+        while y < size {
+            if sheet.numbers[x][y] != EMPTY {
+                y += 1;
+                continue;
+            }
+            let (first, last, low, high) = sheet.gap_bounds(x, y).expect("empty box");
+            let length = (last - first + 1) as f64;
+            let lo = (low + 1).max(MIN_NUMBER);
+            let hi = (high - 1).min(MAX_NUMBER);
+            if hi >= lo {
+                for v in lo..=hi {
+                    demand[v as usize] += length;
+                }
+            }
+            y = last + 1;
+        }
+    }
+    demand
+}
+
+/// §7.2: the scoring value of one more ESTATE mark, over ALL estates.
+fn estate_demand(sheet: &Sheet) -> f64 {
+    let counts = sheet.estate_size_counts();
+    let mut total = 0.0f64;
+    for i in 0..MAX_ESTATE_SIZE {
+        let marks = sheet.estate_marks[i];
+        if marks >= ESTATE_ROW_BOXES[i] {
+            continue;
+        }
+        let row = ESTATE_ROW_SCORES[i];
+        let delta = row[(marks + 1) as usize] - row[marks as usize];
+        total += (counts[i] * delta) as f64;
+    }
+    total
+}
+
+fn effect_demand(game: &Game, sheet: &Sheet, viewer: usize, seat: usize) -> [f64; NUM_EFFECTS] {
+    let mut out = [0.0f64; NUM_EFFECTS];
+    let park_total: i32 = PARK_BOXES.iter().sum();
+    let parks: i32 = sheet.parks.iter().sum();
+    out[E_PARK] = ratio(((park_total - parks) as f64).max(0.0), park_total as f64);
+    out[E_POOL] = ratio(((POOL_BOXES - sheet.pool_count()) as f64).max(0.0), POOL_BOXES as f64);
+    out[E_TEMP] = ratio(((TEMP_BOXES - sheet.temps) as f64).max(0.0), TEMP_BOXES as f64);
+    out[E_BIS] = ratio(((BIS_BOXES - sheet.bis_marks) as f64).max(0.0), BIS_BOXES as f64);
+
+    let mut fences = 0i32;
+    for slot in 0..3 {
+        if banked(game, viewer, seat, slot) {
+            continue;
+        }
+        let plan = &PLANS[game.plan_ids[slot]];
+        if plan.kind == PlanKind::Estate {
+            fences += requirements(plan, sheet).estate_steps_left;
+        }
+    }
+    out[E_SURVEYOR] = ratio(fences as f64, SURVEYOR_DEMAND_SCALE);
+    out[E_ESTATE] = ratio(estate_demand(sheet), ESTATE_DEMAND_SCALE);
+    out
+}
+
+/// §7.3: per printed number 1..15, how many empty BOXES it could serve.
+fn card_demand(sheet: &Sheet, with_temp: bool) -> [f64; NUM_NUMBERS] {
+    let mut out = [0.0f64; NUM_NUMBERS];
+    let deltas: &[i32] = if with_temp { &TEMP_DELTAS } else { &[0] };
+    for x in 0..NUM_STREETS {
+        let size = STREET_SIZES[x];
+        let mut y = 0usize;
+        while y < size {
+            if sheet.numbers[x][y] != EMPTY {
+                y += 1;
+                continue;
+            }
+            let (first, last, low, high) = sheet.gap_bounds(x, y).expect("empty box");
+            let length = (last - first + 1) as f64;
+            for i in 0..NUM_NUMBERS {
+                let n = i as i32 + 1;
+                for &d in deltas {
+                    let v = (n + d).max(MIN_NUMBER).min(MAX_NUMBER);
+                    if low < v && v < high {
+                        out[i] += length;
+                        break;
+                    }
+                }
+            }
+            y = last + 1;
+        }
+    }
+    out
+}
+
+/// §7.3's 8 floats. ⚠ SPEC GAP 2: the temp half's two effect entries equal the
+/// no-temp half's by construction; the literal width is kept.
+fn reshuffle_contraction(
+    sheet: &Sheet,
+    effect_demand: &[f64; NUM_EFFECTS],
+    view: &DeckView,
+    w: &mut Writer,
+) {
+    let fit_rate = |demand: &[f64; NUM_NUMBERS], supply: &[f32; NUM_NUMBERS]| -> f64 {
+        // Integer-valued on both sides, so the sum is exact in any order.
+        let total: f32 = supply.iter().sum();
+        let mut num = 0.0f64;
+        for i in 0..NUM_NUMBERS {
+            num += demand[i] * supply[i] as f64;
+        }
+        ratio(num, FIT_RATE_BOX_SCALE * total as f64)
+    };
+    let eff_rate = |supply: &[f32; NUM_EFFECTS]| -> f64 {
+        // ⚠ §10.6: left to right, as encoder.py does it.
+        let mut demand_total = 0.0f64;
+        let mut weighted = 0.0f64;
+        for e in 0..NUM_EFFECTS {
+            demand_total += effect_demand[e];
+            weighted += effect_demand[e] * supply[e] as f64;
+        }
+        let supply_total: f32 = supply.iter().sum();
+        ratio(weighted, supply_total as f64 * demand_total)
+    };
+    for with_temp in [false, true] {
+        let demand = card_demand(sheet, with_temp);
+        for (numbers, effects) in [
+            (&view.deck_numbers, &view.deck_effects),
+            (&view.reshuffled_numbers, &view.reshuffled_effects),
+        ] {
+            w.put_f64(fit_rate(&demand, numbers));
+            w.put_f64(eff_rate(effects));
+        }
+    }
+}
+
+fn any_writable(sheet: &Sheet, number: i32, effect: Effect) -> bool {
+    numbers_for(number, effect)
+        .into_iter()
+        .any(|v| !sheet.available_locations(Some(v)).is_empty())
+}
+
+/// Per stack, the printed numbers with NO legal write next turn (1.0 = miss),
+/// and the same for the printed number alone.
+fn playable_sets(sheet: &Sheet, view: &DeckView) -> ([[f64; NUM_NUMBERS]; 3], [f64; NUM_NUMBERS]) {
+    let mut miss = [[1.0f64; NUM_NUMBERS]; 3];
+    for (k, effect) in view.next_effects.iter().enumerate() {
+        if let Some(effect) = effect {
+            for i in 0..NUM_NUMBERS {
+                if any_writable(sheet, i as i32 + 1, *effect) {
+                    miss[k][i] = 0.0;
+                }
+            }
+        }
+    }
+    let mut printed = [1.0f64; NUM_NUMBERS];
+    for i in 0..NUM_NUMBERS {
+        if !sheet.available_locations(Some(i as i32 + 1)).is_empty() {
+            printed[i] = 0.0;
+        }
+    }
+    (miss, printed)
+}
+
+fn joint_miss(view: &DeckView, masks: &[[f64; NUM_NUMBERS]; 3]) -> f64 {
+    view.draw_probability([&masks[0], &masks[1], &masks[2]])
+}
+
+/// ⚠ SPEC GAP 3: the roundabout maximising total placement capacity,
+/// tie-broken by lowest `(street, box)`.
+fn best_roundabout_sheet(game: &Game, sheet: &Sheet) -> Option<Sheet> {
+    if !(game.config.advanced && sheet.can_build_roundabout()) || !sheet.has_free_box() {
+        return None;
+    }
+    let mut best: Option<Sheet> = None;
+    let mut best_key = -1i32;
+    for x in 0..NUM_STREETS {
+        for y in 0..STREET_SIZES[x] {
+            if sheet.numbers[x][y] != EMPTY {
+                continue;
+            }
+            let mut candidate = sheet.clone();
+            candidate.build_roundabout((x, y), 0);
+            let total: i32 = candidate.placement_capacity().iter().sum();
+            if total > best_key {
+                best_key = total;
+                best = Some(candidate);
+            }
+        }
+    }
+    best
+}
+
+/// §8's 5 floats.
+fn refusal_block(game: &Game, sheet: &Sheet, view: &DeckView, w: &mut Writer) {
+    let (miss, printed_miss) = playable_sets(sheet, view);
+    w.put_f64(joint_miss(view, &miss));
+
+    let after = best_roundabout_sheet(game, sheet);
+    let (p_after, rescue) = match &after {
+        None => (joint_miss(view, &miss), 0.0),
+        Some(after) => {
+            let (miss_after, _) = playable_sets(after, view);
+            let rescued = (0..3).any(|k| (0..NUM_NUMBERS).any(|i| miss_after[k][i] < miss[k][i]));
+            (joint_miss(view, &miss_after), rescued as u8 as f64)
+        }
+    };
+    w.put_f64(p_after);
+
+    let mut placeable = [0.0f64; NUM_NUMBERS];
+    for i in 0..NUM_NUMBERS {
+        placeable[i] = 1.0 - printed_miss[i];
+    }
+    let all_placeable = joint_miss(view, &[placeable, placeable, placeable]);
+    w.put_f64((1.0 - all_placeable).max(0.0).min(1.0));
+
+    w.put_f64(rescue);
+
+    // p_forced_refusal_steady: hypergeometric over the unplayable CARDS.
+    let steady_sheet = after.as_ref().unwrap_or(sheet);
+    let mut matrix = &view.deck_matrix;
+    let mut total = matrix.iter().flatten().sum::<f32>() as f64;
+    if total < 3.0 {
+        matrix = &view.reshuffled_matrix;
+        total = matrix.iter().flatten().sum::<f32>() as f64;
+    }
+    let mut unplayable = 0.0f64;
+    for i in 0..NUM_NUMBERS {
+        for (e, &effect) in EFFECT_ORDER.iter().enumerate() {
+            let count = matrix[i][e] as f64;
+            if count <= 0.0 {
+                continue;
+            }
+            if !any_writable(steady_sheet, i as i32 + 1, effect) {
+                unplayable += count;
+            }
+        }
+    }
+    if total < 3.0 {
+        w.put(0.0);
+    } else {
+        let num = unplayable * (unplayable - 1.0).max(0.0) * (unplayable - 2.0).max(0.0);
+        let den = total * (total - 1.0) * (total - 2.0);
+        w.put_f64(ratio(num, den));
+    }
+}
+
+/// `game.py::max_houses_this_turn` — 0-3, maximised over legal sequences.
+pub fn max_houses_this_turn(game: &Game, viewer: usize, seat: usize) -> i32 {
+    let sheet = game.sheet_for(viewer, seat);
+    let offers = offers(game, viewer);
+    let mut starts: Vec<(Sheet, i32)> = vec![(sheet.clone(), 0)];
+    if game.config.advanced && sheet.can_build_roundabout() && sheet.has_free_box() {
+        for pos in sheet.available_locations(None) {
+            let mut opened = sheet.clone();
+            opened.build_roundabout(pos, 0);
+            starts.push((opened, 1));
+        }
+    }
+    let mut best = 0i32;
+    for (start, placed) in &starts {
+        best = best.max(*placed);
+        for &(number, effect) in &offers {
+            for value in numbers_for(number, effect) {
+                for pos in start.available_locations(Some(value)) {
+                    let mut written = start.clone();
+                    written.write(value, pos, 0, false);
+                    let mut total = placed + 1;
+                    if effect == Effect::Bis && !written.bis_candidates().is_empty() {
+                        total += 1;
+                    }
+                    best = best.max(total);
+                    if best >= 3 {
+                        return 3;
+                    }
+                }
+            }
+        }
+    }
+    best.min(3)
+}
+
+/// §9.2a's canonical satisfying selection, or `None` if none exists.
+fn selected_estates(plan: &Plan, sheet: &Sheet) -> Option<Vec<Pos>> {
+    let mut free = sheet.free_estates();
+    free.sort();
+    let mut sizes = plan.required_sizes();
+    sizes.sort_unstable_by(|a, b| b.cmp(a));
+    let mut used = vec![false; free.len()];
+    let mut taken = Vec::new();
+    for size in sizes {
+        let found = (0..free.len()).find(|&i| !used[i] && free[i].2 == size)?;
+        used[found] = true;
+        let (x, start, length) = free[found];
+        for k in 0..length {
+            taken.push((x, start + k));
+        }
+    }
+    Some(taken)
+}
+
+/// `T(slot)` — the boxes completing this plan would consume (§9.2a).
+fn target_boxes(game: &Game, viewer: usize, seat: usize, sheet: &Sheet, slot: usize) -> BTreeSet<Pos> {
+    if banked(game, viewer, seat, slot) {
+        return BTreeSet::new();
+    }
+    let plan = &PLANS[game.plan_ids[slot]];
+    match plan.kind {
+        PlanKind::FullStreet => {
+            let x = plan.params[0].int() as usize;
+            (0..STREET_SIZES[x]).map(|y| (x, y)).collect()
+        }
+        PlanKind::Extremities => EXTREMITY_POSITIONS.iter().copied().collect(),
+        PlanKind::Estate => selected_estates(plan, sheet)
+            .unwrap_or_default()
+            .into_iter()
+            .collect(),
+        _ => BTreeSet::new(),
+    }
+}
+
+/// §9.2a: 3 unordered overlaps + 6 directed kills.
+fn plan_conflict_seat(game: &Game, viewer: usize, seat: usize, sheet: &Sheet, w: &mut Writer) {
+    let sets: Vec<BTreeSet<Pos>> = (0..3)
+        .map(|s| target_boxes(game, viewer, seat, sheet, s))
+        .collect();
+
+    for (a, b) in [(0, 1), (0, 2), (1, 2)] {
+        if sets[a].is_empty() || sets[b].is_empty() {
+            w.put(0.0);
+            continue;
+        }
+        let inter = sets[a].intersection(&sets[b]).count();
+        w.put_f64(ratio(inter as f64, sets[a].len().min(sets[b].len()) as f64));
+    }
+
+    for (a, b) in [(0, 1), (1, 0), (0, 2), (2, 0), (1, 2), (2, 1)] {
+        if sets[a].is_empty() || banked(game, viewer, seat, b) {
+            w.put(0.0);
+            continue;
+        }
+        let mut hypothetical = sheet.clone();
+        for &(x, y) in &sets[a] {
+            hypothetical.top_fences[x][y] = true;
+        }
+        let plan_b = &PLANS[game.plan_ids[b]];
+        w.put(if feasible(plan_b, &hypothetical) { 0.0 } else { 1.0 });
+    }
+}
+
+fn sheet_scalars(game: &Game, viewer: usize, seat: usize, view: &DeckView) -> Vec<f32> {
+    let sheet = game.sheet_for(viewer, seat);
+    let mut w = Writer::new(NUM_SHEET_SCALAR);
+
+    // tracks (26)
+    for x in 0..NUM_STREETS {
+        w.put(ratio_i32(sheet.parks[x], PARK_BOXES[x]));
+    }
+    w.put(ratio_i32(sheet.pool_count(), POOL_BOXES));
+    w.put(ratio_i32(sheet.temps, TEMP_BOXES));
+    w.put(ratio_i32(sheet.bis_marks, BIS_BOXES));
+    w.put(ratio_i32(sheet.permits, PERMIT_BOXES));
+    w.put(ratio_i32(sheet.roundabouts, ROUNDABOUT_BOXES));
+    for i in 0..MAX_ESTATE_SIZE {
+        w.put(ratio_i32(sheet.estate_marks[i], ESTATE_ROW_BOXES[i]));
+    }
+    for count in sheet.estate_size_counts() {
+        w.put_f64(count as f64 / 4.0);
+    }
+    for count in sheet.free_estate_size_counts() {
+        w.put_f64(count as f64 / 4.0);
+    }
+
+    // score components (9)
+    let breakdown = game.score_breakdown(seat, Some(viewer));
+    for value in [
+        breakdown.parks,
+        breakdown.pools,
+        breakdown.estates,
+        breakdown.plans,
+        breakdown.temp,
+        breakdown.bis,
+        breakdown.permits,
+        breakdown.roundabouts,
+    ] {
+        w.put_f64(value as f64 / SCORE_SCALE);
+    }
+    w.put_f64(breakdown.total() as f64 / 100.0);
+
+    // placement capacity (4)
+    let capacity = sheet.placement_capacity();
+    for x in 0..NUM_STREETS {
+        w.put(ratio_i32(capacity[x], STREET_SIZES[x] as i32));
+    }
+    w.put_f64(capacity.iter().sum::<i32>() as f64 / NUM_BOXES as f64);
+
+    // §4: roundabout repair (3) and total span (1)
+    let roundabout_open = game.config.advanced && sheet.can_build_roundabout();
+    let repair = sheet.capacity_if_roundabout(roundabout_open);
+    for x in 0..NUM_STREETS {
+        w.put_f64(ratio(repair[x] as f64, STREET_SIZES[x] as f64));
+    }
+    w.put_f64(ratio(sheet.total_span() as f64, TOTAL_SPAN_SCALE));
+
+    // THE RACE (102)
+    for slot in 0..3 {
+        plan_block(game, viewer, seat, sheet, slot, view, &mut w);
+    }
+
+    // demand (24)
+    for value in number_demand(sheet) {
+        w.put_f64(value / NUM_BOXES as f64);
+    }
+    let demand = effect_demand(game, sheet, viewer, seat);
+    for value in demand {
+        w.put_f64(value);
+    }
+
+    // reshuffle contraction (8)
+    reshuffle_contraction(sheet, &demand, view, &mut w);
+
+    // refusal (5)
+    refusal_block(game, sheet, view, &mut w);
+
+    // houses this turn (2)
+    w.put_f64(max_houses_this_turn(game, viewer, seat) as f64 / 3.0);
+    w.put(if sheet.bis_candidates().is_empty() { 0.0 } else { 1.0 });
+
+    // plan conflict (9)
+    plan_conflict_seat(game, viewer, seat, sheet, &mut w);
+
+    // free boxes, is_viewer, seat_valid (3)
+    let written = (0..NUM_STREETS)
+        .map(|x| (0..STREET_SIZES[x]).filter(|&y| sheet.numbers[x][y] != EMPTY).count())
+        .sum::<usize>();
+    w.put_f64((NUM_BOXES - written) as f64 / NUM_BOXES as f64);
+    w.put((seat == viewer) as u8 as f32);
+    w.put(1.0);
+    debug_assert_eq!(w.pos, NUM_SHEET_SCALAR);
+    w.buf
+}
+
+fn global_scalars(game: &Game, viewer: usize, view: &DeckView) -> EngineResult<Vec<f32>> {
     let mut w = Writer::new(NUM_GLOBAL_SCALAR);
     w.one_hot(Some(game.phase as usize), 12);
     w.put_f64(game.turn as f64 / TURN_SCALE);
 
     for slot in 0..3 {
         let (number, effect) = game.combination_faces(slot, viewer);
-        w.one_hot(
-            number.and_then(|n| usize::try_from(n).ok()),
-            NUM_NUMBER_VALUES,
-        );
+        w.one_hot(number.and_then(|n| usize::try_from(n).ok()), NUM_NUMBER_VALUES);
         w.one_hot(effect.and_then(effect_index), NUM_EFFECTS);
     }
     let playable = if viewer == game.actor {
@@ -427,27 +1353,20 @@ fn global_scalars(game: &Game, viewer: usize) -> EngineResult<Vec<f32>> {
     }
 
     let owns_ctx = viewer == game.actor;
-    if owns_ctx {
-        if let Some(number) = game.ctx.number {
-            w.one_hot(usize::try_from(number).ok(), NUM_NUMBER_VALUES);
-            w.one_hot(game.ctx.effect.and_then(effect_index), NUM_EFFECTS);
-            w.put(1.0);
-        } else {
-            w.skip(NUM_NUMBER_VALUES + NUM_EFFECTS + 1);
-        }
+    if owns_ctx && game.ctx.number.is_some() {
+        w.one_hot(game.ctx.number.and_then(|n| usize::try_from(n).ok()), NUM_NUMBER_VALUES);
+        w.one_hot(game.ctx.effect.and_then(effect_index), NUM_EFFECTS);
+        w.put(1.0);
     } else {
         w.skip(NUM_NUMBER_VALUES + NUM_EFFECTS + 1);
     }
 
-    if owns_ctx {
-        if let Some((x, y)) = game.ctx.last_house {
+    match (owns_ctx, game.ctx.last_house) {
+        (true, Some((x, y))) => {
             w.one_hot(Some(box_index(x, y)), NUM_BOXES);
             w.put(1.0);
-        } else {
-            w.skip(NUM_BOXES + 1);
         }
-    } else {
-        w.skip(NUM_BOXES + 1);
+        _ => w.skip(NUM_BOXES + 1),
     }
 
     if owns_ctx && !game.ctx.pending_sizes.is_empty() {
@@ -472,7 +1391,7 @@ fn global_scalars(game: &Game, viewer: usize) -> EngineResult<Vec<f32>> {
     w.put(game.may_ask_reshuffle() as u8 as f32);
     w.put(game.reshuffle_vote_for(viewer) as u8 as f32);
 
-    for effect in game.next_effects(viewer) {
+    for effect in view.next_effects {
         let mut row = [0.0f32; NUM_EFFECTS];
         if let Some(index) = effect.and_then(effect_index) {
             row[index] = 1.0;
@@ -480,30 +1399,33 @@ fn global_scalars(game: &Game, viewer: usize) -> EngineResult<Vec<f32>> {
         w.put_array(&row);
     }
 
-    let deck = deck_composition(game, viewer);
     let discard = discard_composition(game);
-    let reshuffled = add_matrix(&add_matrix(&deck, &discard), &aside_composition(game));
     w.put_f64(game.deck_remaining() as f64 / num_base_cards() as f64);
     w.put_f64(game.discard.len() as f64 / num_base_cards() as f64);
+    for value in view.deck_numbers {
+        w.put_f64(value as f64 / 9.0);
+    }
+    for value in view.deck_effects {
+        w.put_f64(value as f64 / 20.0);
+    }
+    for value in row_sums(&discard) {
+        w.put_f64(value as f64 / 9.0);
+    }
+    for value in column_sums(&discard) {
+        w.put_f64(value as f64 / 20.0);
+    }
+    w.put_array(&normalize(&view.deck_numbers, true));
+    w.put_array(&normalize(&view.reshuffled_numbers, false));
 
-    let deck_numbers = row_sums(&deck);
-    let deck_effects = column_sums(&deck);
-    let discard_numbers = row_sums(&discard);
-    let discard_effects = column_sums(&discard);
-    for value in deck_numbers {
-        w.put_f64(value as f64 / 9.0);
+    // §9.3 boundary-draw rates
+    for value in view.effect_rate {
+        w.put_f64(value);
     }
-    for value in deck_effects {
-        w.put_f64(value as f64 / 20.0);
-    }
-    for value in discard_numbers {
-        w.put_f64(value as f64 / 9.0);
-    }
-    for value in discard_effects {
-        w.put_f64(value as f64 / 20.0);
-    }
-    w.put_array(&normalize(&deck_numbers, true));
-    w.put_array(&normalize(&row_sums(&reshuffled), false));
+    w.put_f64(view.effect_rate[E_TEMP]);
+    w.put_f64(view.effect_rate[E_BIS]);
+
+    // §7.4 reveals_to_reform, an upper bound
+    w.put_f64(turns((game.deck_remaining() / 3 + 1) as f64));
 
     w.put(game.config.advanced as u8 as f32);
     w.put(game.config.expert as u8 as f32);
@@ -518,6 +1440,25 @@ fn global_scalars(game: &Game, viewer: usize) -> EngineResult<Vec<f32>> {
     Ok(w.buf)
 }
 
+/// §0.5: the 2+ player standard game only, and never a boundary afterstate.
+fn require_scope(game: &Game) -> EngineResult<()> {
+    if !game.config.standard() || game.config.players < 2 {
+        return Err(EngineError::Invalid(
+            "the v3 encoder is defined for the 2+ player standard game only, \
+             not expert or one-seat play (ENCODER_V3_SPEC.md §0.5)"
+                .into(),
+        ));
+    }
+    if game.boundary_prepared {
+        return Err(EngineError::Invalid(
+            "the v3 encoder reads a mid-turn state; this is a prepared boundary \
+             afterstate, whose discard step has already run"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn encode_state(game: &Game, viewer: usize) -> EngineResult<EncodedState> {
     if viewer >= game.config.players {
         return Err(EngineError::Invalid(format!(
@@ -525,18 +1466,33 @@ pub fn encode_state(game: &Game, viewer: usize) -> EngineResult<EncodedState> {
             game.config.players
         )));
     }
+    require_scope(game)?;
     let mut sheet_planes = vec![0.0f32; SHEET_PLANES_LEN];
     let mut sheet_scalars_out = vec![0.0f32; SHEET_SCALARS_LEN];
     let mut viewer_plane = vec![0.0f32; VIEWER_PLANE_LEN];
-    let offered = offered_numbers(game, viewer);
+
+    let view = DeckView::new(game, viewer);
+    let offered = offers(game, viewer);
+    let base_numbers: Vec<i32> = offered.iter().map(|&(n, _)| n).collect();
+    let all_numbers: Vec<i32> = offered
+        .iter()
+        .flat_map(|&(n, e)| numbers_for(n, e))
+        .collect();
+
     for (axis, seat) in seat_order(game, viewer).into_iter().enumerate() {
+        let sheet = game.sheet_for(viewer, seat);
         write_sheet_planes(
-            game.sheet_for(viewer, seat),
-            &offered,
+            game,
+            viewer,
+            seat,
+            sheet,
+            &base_numbers,
+            &all_numbers,
+            &view,
             axis,
             &mut sheet_planes,
         );
-        let scalars = sheet_scalars(game, viewer, seat);
+        let scalars = sheet_scalars(game, viewer, seat, &view);
         let start = axis * NUM_SHEET_SCALAR;
         sheet_scalars_out[start..start + NUM_SHEET_SCALAR].copy_from_slice(&scalars);
     }
@@ -545,7 +1501,7 @@ pub fn encode_state(game: &Game, viewer: usize) -> EngineResult<EncodedState> {
         sheet_planes,
         sheet_scalars: sheet_scalars_out,
         viewer_plane,
-        global_scalars: global_scalars(game, viewer)?,
+        global_scalars: global_scalars(game, viewer, &view)?,
     })
 }
 
@@ -555,12 +1511,13 @@ mod tests {
     use crate::game::Config;
 
     #[test]
-    fn encoder_layout_is_the_frozen_v2_shape() {
-        assert_eq!(SHEET_PLANES_LEN, 1728);
-        assert_eq!(SHEET_SCALARS_LEN, 180);
+    fn encoder_layout_is_the_v3_shape() {
+        assert_eq!(SHEET_PLANES_LEN, 4 * 22 * 36);
+        assert_eq!(SHEET_SCALARS_LEN, 4 * 196);
         assert_eq!(VIEWER_PLANE_LEN, 36);
-        assert_eq!(NUM_GLOBAL_SCALAR, 358);
+        assert_eq!(NUM_GLOBAL_SCALAR, 367);
         assert_eq!(NUM_DEALT_PLANS, 28);
+        assert_eq!(3 * PLAN_SLOT_WIDTH, 102);
     }
 
     #[test]
@@ -582,5 +1539,20 @@ mod tests {
             assert_eq!(encoded.viewer_plane.len(), VIEWER_PLANE_LEN);
             assert_eq!(encoded.global_scalars.len(), NUM_GLOBAL_SCALAR);
         }
+    }
+
+    #[test]
+    fn expert_play_is_out_of_scope() {
+        let game = Game::new(
+            3,
+            Config {
+                players: 2,
+                advanced: false,
+                expert: true,
+                solo_rules: false,
+            },
+        )
+        .expect("game");
+        assert!(encode_state(&game, 0).is_err());
     }
 }

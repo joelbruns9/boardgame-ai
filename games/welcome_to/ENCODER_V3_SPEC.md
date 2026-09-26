@@ -1,6 +1,6 @@
 # Welcome To… — encoder v3 specification
 
-**Status: draft, review round 1 applied 2026-08-30. Nothing here is implemented.**
+**Status: BUILT through §12 step 6 (2026-09-25). ⚠ §6.4 is DEMOTED -- not encoded; see §19. Final shape 22 planes / 196 per-sheet / 367 global.**
 
 Round 1 raised nine findings, all valid. Four were outright errors in the draft
 (§6.1, §6.2, §6.4, §7.2) and five were underspecification (§6.4 scope, §9.3,
@@ -97,7 +97,7 @@ The user's call: **v3 is built for the 2–4 player standard game only.** Solo (
 | | v2 shipped | v2 spec | **v3** |
 |---|---:|---:|---:|
 | planes per seat | 12 | 17 | **22** |
-| scalars per seat | 45 | 127 | **202** |
+| scalars per seat | 45 | 127 | **196** (202 before §19) |
 | global scalars | 358 | 380 ⚠ | **367** |
 | viewer plane | 1 | 1 | 1 |
 
@@ -108,7 +108,7 @@ global block beyond v2's list (`turns_to_reform`, §7.4).
 
 ```
 sheet_planes    (4, 22, 3, 12)   one block per seat, identical function
-sheet_scalars   (4, 202)         one block per seat, identical function
+sheet_scalars   (4, 196)         one block per seat, identical function
 viewer_plane    (1, 3, 12)       phase scratch, viewer only
 global_scalars  (367,)           game-wide and viewer-relative
 ```
@@ -261,7 +261,7 @@ per box, and it embeds a behavioural assumption — the exact category-2 line v2
 draws. Estate direction is carried by `estate_shortfall`, and the exact question
 is answered by `can_complete_this_turn` (§6.4).
 
-### 3.4 The resulting plan block — 3 slots × 36
+### 3.4 The resulting plan block — 3 slots × 34 (was 36; §19)
 
 | field(s) | n | source |
 |---|---|---|
@@ -275,9 +275,9 @@ is answered by `can_complete_this_turn` (§6.4).
 | `effect_rate_turns` | 1 | §6.3 |
 | `number_rate_supply` | 1 | §6.3 |
 | `expected_turns_to_plan` | 1 | §6.3 — **ablation target** |
-| `can_complete_this_turn` | 1 | §6.4 |
-| `p_complete_next_turn` | 1 | §6.4 |
-| | **36** | |
+| ~~`can_complete_this_turn`~~ | ~~1~~ | §6.4 — **demoted, not encoded (§19)** |
+| ~~`p_complete_next_turn`~~ | ~~1~~ | §6.4 — **demoted, not encoded (§19)** |
+| | **34** | |
 
 `banked` is carried over from the shipped implementation; v2 §6.3's table
 omitted it, which was an oversight — whether this seat has already scored the
@@ -589,6 +589,10 @@ exactly this arithmetic composition, and it is a **first-class ablation**.
 `effect_rate_turns` and `number_rate_supply` are clean facts and stay regardless.
 
 ### 6.4 Threat — `can_complete_this_turn`, `p_complete_next_turn`
+
+⚠ **DEMOTED 2026-09-25 (§19): these two are NOT encoded.** The predicates
+remain in `game.py`, tested, as an ablation to re-add. The text below is
+kept as their definition.
 
 ⚠ **R1 — scope: `config.standard` only.** The premise "all seats see the same
 three stacks" is `Globals::isStandard` (`game.py:174-177`), i.e. **not expert and
@@ -1137,7 +1141,7 @@ How many are actually placed is behavioural. The feature states the ceiling.
 12. Keep the `P_*` constants public in both languages so tests cannot drift, and
 never refer to a plane by literal index outside those constants.
 
-### 9.2 Per-sheet scalars (202)
+### 9.2 Per-sheet scalars (196)
 
 | block | size | § |
 |---|---|---|
@@ -1146,7 +1150,7 @@ never refer to a plane by literal index outside those constants.
 | `capacity` | 4 | shipped |
 | `roundabout_repair` | 3 | §4 |
 | `total_span` | 1 | v2 §6 |
-| `plans` | 108 | 3 slots × 36 (§3.4) |
+| `plans` | 102 | 3 slots × 34 (§3.4, §19) |
 | `demand` | 24 | §7.2 |
 | `reshuffle_contraction` | 8 | §7.3 |
 | `refusal` | 5 | §8 |
@@ -1155,7 +1159,7 @@ never refer to a plane by literal index outside those constants.
 | `free_boxes` | 1 | shipped |
 | `is_viewer` | 1 | shipped |
 | `seat_valid` | 1 | shipped |
-| | **202** | |
+| | **196** | |
 
 ### 9.2a `plan_conflict_seat` (9) — where the real conflict lives
 
@@ -1608,6 +1612,8 @@ back-compatibility, no legacy head zero-fill (§0.4).
 | 7 | network shapes (auto-derived from `encoder` constants), regenerate WTS shards | `network.py`, `self_play.py`, `samples.rs` |
 | 8 | re-run S0 from scratch; gate per §11.2 | `train.py`, `datagen.py` |
 
+**Build status (2026-09-25):** steps 1–6 DONE (§19); step 7 next.
+
 **Build status (2026-09-14):** steps 1–3 DONE. Step 3 shipped `number_prefix_sums`, `count_in_open_interval`, `boundary_pool_composition` (`discard + aside`), `ordered_draw_distribution` (the one boundary-draw helper §6.4/§7.5/§9.3 share) and `effect_supply_rate`, plus `EPS` in `constants.py`.
 
 Steps 1–4 are independently testable and land before the encoder touches them.
@@ -1795,3 +1801,44 @@ bis and fences — all four.**
 Shape is unchanged by this round: **22 planes / 202 per-sheet / 367 global**,
 4,379 floats per row. No finding added or removed a float; every one changed a
 value, a guard or a denominator.
+
+## 19. §6.4 demoted, and step 6 — 2026-09-25
+
+**The user's call: demote the §6.4 threat pair.** `can_complete_this_turn` and
+`p_complete_next_turn` were 96.5% of Python encode time -- 25.2 ms median /
+271 ms mean / 2.83 s max, against 4.3 ms median without them -- because
+`one_turn_sheets` fans out to ~32,000 sheets per (number, stack) at turns 5-6.
+Batching across slots and deduplicating candidate sheets were both measured
+worthless. Their job is to tell the net whether a City Plan can finish this
+turn or next; the requirement, feasibility, `turns_lower_bound` and rate fields
+that remain carry the inputs for that, so the net is expected to learn it. The
+predicates stay in `game.py` under `test_plan_threat.py` as an ablation to
+re-add.
+
+Shape: **22 planes / 196 per-sheet / 367 global**, plan slot 34 floats.
+`ENCODER_ABI_VERSION` stays **2**: nothing was ever generated or trained at
+the 202-wide layout, and the Rust port lands in the same change.
+
+**§10.6 made reachable.** Bit-exact equality needs every non-integer float
+reduction to have one defined order. Two changes, both in Python:
+
+* boundary-draw probabilities are now **integer numerator sums over one
+  denominator** (`deck_knowledge.ordered_draw_counts` + `draw_probability`).
+  Numerators are exact integers in float64 (at most `81·80·79`), so any
+  summation order gives the same sum and the only rounding is the final
+  division. Summing the float joint went through NumPy's pairwise summation,
+  which Rust would have to copy bit for bit.
+* `eff_rate` (§7.3) sums `effect_demand` -- not integer-valued -- in an explicit
+  left-to-right loop. Never `ndarray.sum()` (pairwise) or builtin `sum()`
+  (compensated since Python 3.12).
+
+**Step 6 result.** `rust_encode_equiv` over 20,876 encodings / 6,564 states /
+35 games (every seat count × rule set × driver): zero divergences. A coverage
+replay of the same workload reaches every rare branch: `D < 3` in §7.5 (3,326
+gaps), the viewer-voted §9.3 rate (12 encodings), roundabout rescue (2,778),
+the steady-state refusal falling back to the reshuffle pool (703), plan-conflict
+kills (4,515). A planted bug in the thinnest of those (the viewer-voted rate)
+was caught at seed 13. Rust encodes in 0.32 ms median / 2.0 ms max; Python in
+11.3 ms median / 117 ms max (`max_houses_this_turn` is now the Python hot spot,
+and returns early at the 3-house ceiling).
+

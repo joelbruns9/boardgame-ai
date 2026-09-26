@@ -315,23 +315,55 @@ def ordered_draw_distribution(
     Denominators follow §9.4 (``max(den, EPS)``);
     a pool too small to finish the draw gives an all-zero joint, a state the
     engine itself raises on.
+
+    For a probability over a *set* of outcomes use :func:`ordered_draw_counts`
+    and :func:`draw_probability`, not a sum over this array -- see there.
+    """
+    num, den = ordered_draw_counts(deck, pool, draws)
+    return num / max(den, EPS)
+
+
+def ordered_draw_counts(
+    deck: np.ndarray, pool: np.ndarray, draws: int = 3
+) -> tuple[np.ndarray, float]:
+    """:func:`ordered_draw_distribution` as ``(numerators, denominator)``.
+
+    Every numerator is a product of card counts -- an exact integer held in
+    float64 (at most ``81 * 80 * 79``) -- so any masked sum of them is exact in
+    ANY summation order, and a probability is one division at the end.
+
+    ⚠ This is what makes §10.6 reachable.  Summing the float joint instead goes
+    through numpy's pairwise summation, whose order Rust would have to copy
+    bit for bit; summing integers makes the order irrelevant.
     """
     deck = np.asarray(deck, dtype=np.float64)
     pool = np.asarray(pool, dtype=np.float64)
     from_deck = min(int(round(deck.sum())), draws)
-    return np.asarray(
-        np.multiply.outer(
-            _without_replacement(deck, from_deck),
-            _without_replacement(pool, draws - from_deck),
-        ),
-        dtype=np.float64,
-    )
+    num_deck, den_deck = _without_replacement(deck, from_deck)
+    num_pool, den_pool = _without_replacement(pool, draws - from_deck)
+    num = np.asarray(np.multiply.outer(num_deck, num_pool), dtype=np.float64)
+    return num, den_deck * den_pool
 
 
-def _without_replacement(counts: np.ndarray, n: int) -> np.ndarray:
-    """Ordered joint of ``n`` draws without replacement, ``(K,)*n`` (a scalar at 0)."""
+def draw_probability(num: np.ndarray, den: float, masks) -> float:
+    """P(draw ``i`` lands in ``masks[i]`` for every ``i``), from :func:`ordered_draw_counts`.
+
+    ``masks`` are 0/1 vectors, one per draw.  Exact: the masked numerator sum is
+    an integer, and the only rounding is the final division.
+    """
+    mask = np.multiply.outer(np.multiply.outer(masks[0], masks[1]), masks[2])
+    hits = float((num * mask).sum())
+    return min(1.0, max(0.0, hits / max(den, EPS)))
+
+
+def _without_replacement(counts: np.ndarray, n: int) -> tuple[np.ndarray, float]:
+    """Ordered joint of ``n`` draws without replacement as ``(numerators, den)``.
+
+    ``(K,)*n`` numerators (a scalar ``1.0`` at ``n = 0``) and the falling
+    factorial ``total * (total - 1) * ...`` of ``n`` terms.
+    """
     if n == 0:
-        return np.float64(1.0)
+        return np.float64(1.0), 1.0
     k = counts.shape[0]
     eye = np.eye(k)
     if n == 1:
@@ -350,7 +382,7 @@ def _without_replacement(counts: np.ndarray, n: int) -> np.ndarray:
     den = 1.0
     for i in range(n):
         den *= total - i
-    return np.clip(num, 0.0, None) / max(den, EPS)
+    return np.clip(num, 0.0, None), den
 
 
 def effect_supply_rate(state: GameState, player: int) -> np.ndarray:
@@ -381,11 +413,11 @@ def effect_supply_rate(state: GameState, player: int) -> np.ndarray:
     else:
         deck = deck_composition(state, player).sum(axis=0)
         pool = boundary_pool_composition(state, player).sum(axis=0)
-    joint = ordered_draw_distribution(deck, pool)
+    num, den = ordered_draw_counts(deck, pool)
     rate = np.empty(NUM_EFFECTS, dtype=np.float64)
     for e in range(NUM_EFFECTS):
-        miss = np.arange(NUM_EFFECTS) != e
-        rate[e] = 1.0 - joint[np.ix_(miss, miss, miss)].sum()
+        miss = (np.arange(NUM_EFFECTS) != e).astype(np.float64)
+        rate[e] = 1.0 - draw_probability(num, den, (miss, miss, miss))
     return np.clip(rate, 0.0, 1.0)
 
 

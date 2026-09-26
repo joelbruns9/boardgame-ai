@@ -5,7 +5,8 @@
 //! fidelity and are never dealt; their predicates panic rather than guess.
 
 use crate::constants::{
-    EXTREMITY_POSITIONS, MAX_ESTATE_SIZE, NUM_STREETS, PARK_BOXES, STREET_SIZES,
+    EMPTY, EXTREMITY_POSITIONS, FENCE_SIZES, MAX_ESTATE_SIZE, NUM_STREETS, PARK_BOXES,
+    POOL_POSITIONS, STREET_SIZES, TEMP_BOXES,
 };
 use crate::sheet::{Estate, Pos, Sheet};
 
@@ -372,6 +373,281 @@ pub fn validation_cells(plan: &Plan, chosen_estates: &[Estate]) -> Vec<Pos> {
         PlanKind::Extremities => EXTREMITY_POSITIONS.to_vec(),
         _ => Vec::new(),
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Encoder v3: requirements, feasibility and a hard turn bound
+//
+// Mirrors plans.py (ENCODER_V3_SPEC §2, §3, §6.1, §6.2). Read §6.1 before
+// touching `feasible`: a roundabout, a bis and a fence each put a house on the
+// sheet without a drawn number, and forgetting any one made a death test unsound.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// What a plan still wants from one sheet — "how much" AND "where".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Requirements {
+    pub temps_needed: i32,
+    pub estate_steps_left: i32,
+    pub estate_shortfall: [i32; MAX_ESTATE_SIZE],
+    pub parks_needed: [i32; NUM_STREETS],
+    pub pools_needed: [i32; NUM_STREETS],
+    pub houses_needed: [i32; NUM_STREETS],
+    pub bis_needed: [i32; NUM_STREETS],
+    pub roundabout_needed: [i32; NUM_STREETS],
+    pub street_serves: [i32; NUM_STREETS],
+    pub target_boxes: Vec<Pos>,
+}
+
+/// Per-size counts of `required_sizes`, indexed `size - 1`.
+fn need_counts(plan: &Plan) -> [i32; MAX_ESTATE_SIZE] {
+    let mut need = [0i32; MAX_ESTATE_SIZE];
+    for size in plan.required_sizes() {
+        need[size - 1] += 1;
+    }
+    need
+}
+
+/// Loose upper bound on estates of each size 1..6 this sheet could still hold
+/// (`plans.py::reachable_estate_counts`, spec §13.2). Counts boxes, not free
+/// boxes: one fence re-partitions a built run while consuming nothing.
+pub fn reachable_estate_counts(sheet: &Sheet) -> [i32; MAX_ESTATE_SIZE] {
+    let mut counts = [0i32; MAX_ESTATE_SIZE];
+    for x in 0..NUM_STREETS {
+        let size = STREET_SIZES[x];
+        let mut start = 0usize;
+        for j in 0..size {
+            if j == size - 1 || (j < FENCE_SIZES[x] && sheet.fences[x][j]) {
+                let usable = (start..=j).filter(|&y| !sheet.top_fences[x][y]).count() as i32;
+                for s in 1..=MAX_ESTATE_SIZE {
+                    counts[s - 1] += usable / s as i32;
+                }
+                start = j + 1;
+            }
+        }
+    }
+    counts
+}
+
+/// Pool positions in street `x` that could still take a house.
+///
+/// ⚠ `span_if_roundabout(true)` regardless of the variant, exactly as
+/// `plans.py::_pool_boxes_alive` calls it with its default.
+fn pool_boxes_alive(sheet: &Sheet, x: usize) -> i32 {
+    let spans = sheet.span_if_roundabout(true);
+    let mut alive = 0;
+    for &(px, py) in POOL_POSITIONS.iter() {
+        if px != x || sheet.numbers[x][py] != EMPTY {
+            continue;
+        }
+        if spans[x][py] > 0 || sheet.bis_reachable(x, py) {
+            alive += 1;
+        }
+    }
+    alive
+}
+
+/// Is `plan` still reachable on `sheet`? **Sound, not complete.**
+pub fn feasible(plan: &Plan, sheet: &Sheet) -> bool {
+    match plan.kind {
+        PlanKind::Estate => {
+            let supply = free_estate_supply(sheet);
+            let reachable = reachable_estate_counts(sheet);
+            let need = need_counts(plan);
+            (0..MAX_ESTATE_SIZE).all(|i| need[i] <= supply[i] as i32 + reachable[i])
+        }
+        PlanKind::FullStreet => {
+            let x = plan.params[0].int() as usize;
+            !(0..STREET_SIZES[x]).any(|y| sheet.top_fences[x][y])
+        }
+        PlanKind::Extremities => {
+            let spans = sheet.span_if_roundabout(true);
+            for &(x, y) in EXTREMITY_POSITIONS.iter() {
+                if sheet.top_fences[x][y] {
+                    return false;
+                }
+                if !sheet.is_empty(x, y) {
+                    continue;
+                }
+                if spans[x][y] == 0 && !sheet.bis_reachable(x, y) {
+                    return false;
+                }
+            }
+            true
+        }
+        PlanKind::FiveBis => {
+            let reach = sheet.bis_reach();
+            let counts = sheet.bis_count_per_street();
+            (0..NUM_STREETS).any(|x| counts[x] + reach[x] >= 5)
+        }
+        PlanKind::SevenTemp => TEMP_BOXES >= 7,
+        PlanKind::CompleteStreet => (0..NUM_STREETS).any(|x| {
+            sheet.pools[x] + pool_boxes_alive(sheet, x) >= 3
+                && (sheet.has_roundabout_in_street(x) || sheet.can_build_roundabout())
+        }),
+        PlanKind::Decorative => match plan.params[0].text() {
+            "park" => true,
+            "pool" => {
+                (0..NUM_STREETS)
+                    .filter(|&x| sheet.pools[x] + pool_boxes_alive(sheet, x) >= 3)
+                    .count()
+                    >= 2
+            }
+            "pool&park" => {
+                let x = plan.params[1].int() as usize;
+                sheet.pools[x] + pool_boxes_alive(sheet, x) >= 3
+            }
+            other => panic!("seasonal decorative plan {other:?} is not supported"),
+        },
+        PlanKind::Unsupported => {
+            panic!("plan {} belongs to an unsupported expansion", plan.id)
+        }
+    }
+}
+
+/// What `plan` still wants from `sheet`, split by locus (spec §3).
+pub fn requirements(plan: &Plan, sheet: &Sheet) -> Requirements {
+    let mut r = Requirements {
+        temps_needed: 0,
+        estate_steps_left: 0,
+        estate_shortfall: [0; MAX_ESTATE_SIZE],
+        parks_needed: [0; NUM_STREETS],
+        pools_needed: [0; NUM_STREETS],
+        houses_needed: [0; NUM_STREETS],
+        bis_needed: [0; NUM_STREETS],
+        roundabout_needed: [0; NUM_STREETS],
+        street_serves: [0; NUM_STREETS],
+        target_boxes: Vec::new(),
+    };
+    let alive = feasible(plan, sheet);
+    let done = can_be_scored(plan, sheet);
+    let alive_flag = alive as i32;
+
+    match plan.kind {
+        PlanKind::Estate => {
+            let supply = free_estate_supply(sheet);
+            let need = need_counts(plan);
+            for i in 0..MAX_ESTATE_SIZE {
+                if need[i] > 0 {
+                    r.estate_shortfall[i] = (need[i] - supply[i] as i32).max(0);
+                }
+            }
+            r.estate_steps_left = progress(plan, sheet).1;
+            r.street_serves = [alive_flag; NUM_STREETS];
+        }
+        PlanKind::FullStreet => {
+            let x = plan.params[0].int() as usize;
+            r.street_serves[x] = alive_flag;
+            for y in 0..STREET_SIZES[x] {
+                if sheet.is_empty(x, y) {
+                    r.houses_needed[x] += 1;
+                    r.target_boxes.push((x, y));
+                }
+            }
+        }
+        PlanKind::Extremities => {
+            for &(x, y) in EXTREMITY_POSITIONS.iter() {
+                r.street_serves[x] = alive_flag;
+                if sheet.is_empty(x, y) {
+                    r.houses_needed[x] += 1;
+                    r.target_boxes.push((x, y));
+                }
+            }
+        }
+        PlanKind::FiveBis => {
+            let reach = sheet.bis_reach();
+            let counts = sheet.bis_count_per_street();
+            for x in 0..NUM_STREETS {
+                if counts[x] + reach[x] >= 5 {
+                    r.street_serves[x] = 1;
+                    r.bis_needed[x] = (5 - counts[x]).max(0);
+                }
+            }
+        }
+        PlanKind::SevenTemp => {
+            r.temps_needed = (7 - sheet.temps).max(0);
+        }
+        PlanKind::CompleteStreet => {
+            for x in 0..NUM_STREETS {
+                if sheet.pools[x] + pool_boxes_alive(sheet, x) < 3 {
+                    continue;
+                }
+                if !sheet.has_roundabout_in_street(x) && !sheet.can_build_roundabout() {
+                    continue;
+                }
+                r.street_serves[x] = 1;
+                r.parks_needed[x] = PARK_BOXES[x] - sheet.parks[x];
+                r.pools_needed[x] = 3 - sheet.pools[x];
+                r.roundabout_needed[x] = if sheet.has_roundabout_in_street(x) { 0 } else { 1 };
+            }
+        }
+        PlanKind::Decorative => {
+            let what = plan.params[0].text();
+            let wants_pool = what == "pool" || what == "pool&park";
+            let wants_park = what == "park" || what == "pool&park";
+            let streets: Vec<usize> = if what == "pool&park" {
+                vec![plan.params[1].int() as usize]
+            } else {
+                (0..NUM_STREETS).collect()
+            };
+            for x in streets {
+                if wants_pool && sheet.pools[x] + pool_boxes_alive(sheet, x) < 3 {
+                    continue;
+                }
+                r.street_serves[x] = 1;
+                if wants_park {
+                    r.parks_needed[x] = PARK_BOXES[x] - sheet.parks[x];
+                }
+                if wants_pool {
+                    r.pools_needed[x] = 3 - sheet.pools[x];
+                }
+            }
+        }
+        PlanKind::Unsupported => {
+            panic!("plan {} belongs to an unsupported expansion", plan.id)
+        }
+    }
+
+    if done {
+        // A completed plan wants nothing; its streets stay alive (see plans.py).
+        r.temps_needed = 0;
+        r.estate_steps_left = 0;
+        r.estate_shortfall = [0; MAX_ESTATE_SIZE];
+        r.parks_needed = [0; NUM_STREETS];
+        r.pools_needed = [0; NUM_STREETS];
+        r.houses_needed = [0; NUM_STREETS];
+        r.bis_needed = [0; NUM_STREETS];
+        r.roundabout_needed = [0; NUM_STREETS];
+        r.target_boxes.clear();
+    }
+    if !alive {
+        r.street_serves = [0; NUM_STREETS];
+    }
+    r
+}
+
+/// The most `progress()` steps one turn could close for `plan`
+/// (`game.py::one_turn_ceiling`).
+pub fn one_turn_ceiling(plan: &Plan) -> i32 {
+    match plan.kind {
+        PlanKind::Estate => plan.params.len() as i32,
+        PlanKind::FullStreet | PlanKind::Extremities => 3,
+        PlanKind::FiveBis | PlanKind::SevenTemp | PlanKind::Decorative => 1,
+        PlanKind::CompleteStreet => 2,
+        PlanKind::Unsupported => panic!("plan {} has no one-turn ceiling", plan.id),
+    }
+}
+
+/// Fewest turns in which `plan` could still complete. A hard bound (§6.2).
+pub fn turns_lower_bound(plan: &Plan, sheet: &Sheet) -> i32 {
+    let steps = progress(plan, sheet).1;
+    if steps == 0 {
+        return 0;
+    }
+    let ceiling = one_turn_ceiling(plan).max(1);
+    let step_term = (steps + ceiling - 1) / ceiling;
+    let houses: i32 = requirements(plan, sheet).houses_needed.iter().sum();
+    let house_term = (houses + 2) / 3;
+    step_term.max(house_term)
 }
 
 /// Kept next to the tables it reads so the unused-import warning does not push
