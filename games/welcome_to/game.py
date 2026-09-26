@@ -1748,11 +1748,23 @@ def max_houses_this_turn(state: "GameState", viewer: int, seat: int) -> int:
             opened.build_roundabout(pos, turn=0)
             starts.append((opened, 1))
 
+    # Exact shortcuts, mirrored in encoder.rs: a non-BIS write scores
+    # `placed + 1` wherever it lands, so it needs one legal box and no copy; and
+    # a start whose ceiling `placed + 1 + any BIS offer` cannot beat `best` is
+    # skipped.
+    bis_offered = any(effect is Effect.BIS for _, effect in offers)
     for start, placed in starts:
         best = max(best, placed)
+        if best >= placed + 1 + int(bis_offered):
+            continue
         for number, effect in offers:
             for value in _numbers_for(number, effect):
-                for pos in start.available_locations(value):
+                locations = start.available_locations(value)
+                if effect is not Effect.BIS:
+                    if locations:
+                        best = max(best, placed + 1)
+                    continue
+                for pos in locations:
                     written = start.copy()
                     written.write(value, pos, turn=0)
                     total = placed + 1

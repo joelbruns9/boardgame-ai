@@ -400,6 +400,31 @@ def test_s2_rust_training_loader_batches_match_the_row_oracle(captured_generatio
     assert np.array_equal(random_first, random_second)
 
 
+@pytest.mark.parametrize("version", [1, 2])
+def test_pre_v3_shards_are_refused_as_encoder_abi_one(tmp_path, version):
+    """Shard versions 1-2 hold encoder-ABI-1 rows of another width (spec §0.4).
+
+    Before the refusal they failed only by accident ("ended inside a sample"),
+    and a short enough shard could have lined up and been misread.
+    """
+    path = tmp_path / "old.wts"
+    path.write_bytes(
+        self_play._WTS_HEADER.pack(
+            b"WTSHRD01",
+            version,
+            len(training.GLOBAL_TARGETS),
+            len(training.PER_SEAT_TARGETS),
+            training.MAX_SEATS,
+            int(self_play.wr.table_signature()),
+            0,
+        )
+    )
+    with pytest.raises(ValueError, match="encoder ABI 1"):
+        self_play._read_training_shard(path)
+    with pytest.raises(Exception, match="encoder ABI 1"):
+        self_play.wr.RustTrainingBatchLoader([str(path)], [0], 1)
+
+
 def test_legacy_wts_targets_upgrade_without_inventing_plan_race_order():
     assert tuple(self_play.wr.LEGACY_TRAINING_PER_SEAT_TARGET_NAMES) == (
         training.LEGACY_PER_SEAT_TARGETS

@@ -1612,7 +1612,7 @@ back-compatibility, no legacy head zero-fill (§0.4).
 | 7 | network shapes (auto-derived from `encoder` constants), regenerate WTS shards | `network.py`, `self_play.py`, `samples.rs` |
 | 8 | re-run S0 from scratch; gate per §11.2 | `train.py`, `datagen.py` |
 
-**Build status (2026-09-25):** steps 1–6 DONE (§19); step 7 next.
+**Build status (2026-09-25):** steps 1–7 DONE (§19, §20); step 8 (S0 from scratch) next.
 
 **Build status (2026-09-14):** steps 1–3 DONE. Step 3 shipped `number_prefix_sums`, `count_in_open_interval`, `boundary_pool_composition` (`discard + aside`), `ordered_draw_distribution` (the one boundary-draw helper §6.4/§7.5/§9.3 share) and `effect_supply_rate`, plus `EPS` in `constants.py`.
 
@@ -1842,3 +1842,45 @@ was caught at seed 13. Rust encodes in 0.32 ms median / 2.0 ms max; Python in
 11.3 ms median / 117 ms max (`max_houses_this_turn` is now the Python hot spot,
 and returns early at the 3-house ceiling).
 
+## 20. Step 7 — shapes, shards, and the ABI guard — 2026-09-25
+
+**Shapes needed no change.** `network.py`, `self_play.py` and `samples.rs` all
+derive their widths from the encoder constants.
+
+**The real gap was the guard.** Neither shards nor checkpoints recorded the
+encoder ABI. An old `.wts` shard was refused only by accident ("ended inside a
+sample", because the rows got wider), and a short enough one could have lined
+up and been misread. Now:
+
+* `TRAINING_SHARD_VERSION` 2 → **3**. Versions 1–2 hold ABI-1 rows and are
+  refused by both readers with a message naming the ABI. The legacy *target*
+  upgrade is unreachable from a shard; it survives only for its unit test.
+* Checkpoints carry **`encoder_abi`**. `nw.require_encoder_abi` is called by
+  all three loaders (`train.load`, `s2_train.load_training_checkpoint`, the
+  advisor); an unstamped checkpoint is ABI 1 and refused.
+
+All existing `runs/welcome_to_s0` and `runs/welcome_to_s2` artifacts are ABI 1
+and now refuse to load, as §0.4 intends. Nothing is migrated.
+
+**Fresh v3 shards.** 500 games from an untrained production-size net (4.17M
+parameters) at the last ABI-1 run's generation config (inflight 256, 8
+workers, 200 simulations), then 200 training steps through the Rust `.wts`
+loader, and the checkpoint reloads.
+
+**Throughput cost, measured.** Evaluator rows/s fell 11,059 → 7,005 (−37%) at
+8 workers: encode rose from 0.028 to 0.305 ms per row inside the scheduler,
+and the coordinator's wait on workers from 13% to 37% of wall. Two exact
+encoder savings were taken first (both mirrored in Python and gate-checked:
+20,876 encodings, zero divergences): `max_houses_this_turn` needs no sheet
+copy for a non-BIS offer, and §8's writability test is one 18-value mask per
+sheet. Rust also caches each slot's `requirements`/`feasible` once per seat.
+Standalone Rust encode went 323 → 108 µs median.
+
+
+**More workers do not recover it.** The same 500 games at 12 workers: 5,932
+rows/s (worse), encode 0.63 ms/row (doubled). 16 logical cores are ~8 physical,
+so extra workers contend. Encode inside the scheduler (0.305 ms at 8 workers)
+is also ~3x the standalone 108 µs for the same reason. **Open for step 8:**
+accept −37% generation, or make the encoder cheaper still. The remaining cost
+is spread across the §8 refusal block, the per-plan requirement fields and
+the fit planes; there is no single hot spot left like the threat pair was.

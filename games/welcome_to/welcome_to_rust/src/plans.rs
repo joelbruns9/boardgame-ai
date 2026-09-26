@@ -505,7 +505,13 @@ pub fn feasible(plan: &Plan, sheet: &Sheet) -> bool {
 }
 
 /// What `plan` still wants from `sheet`, split by locus (spec §3).
+#[cfg_attr(not(test), allow(dead_code))] // the Python-mirroring API; the encoder caches
 pub fn requirements(plan: &Plan, sheet: &Sheet) -> Requirements {
+    requirements_given(plan, sheet, feasible(plan, sheet))
+}
+
+/// `requirements` with `alive = feasible(plan, sheet)` already in hand.
+pub fn requirements_given(plan: &Plan, sheet: &Sheet, alive: bool) -> Requirements {
     let mut r = Requirements {
         temps_needed: 0,
         estate_steps_left: 0,
@@ -518,7 +524,6 @@ pub fn requirements(plan: &Plan, sheet: &Sheet) -> Requirements {
         street_serves: [0; NUM_STREETS],
         target_boxes: Vec::new(),
     };
-    let alive = feasible(plan, sheet);
     let done = can_be_scored(plan, sheet);
     let alive_flag = alive as i32;
 
@@ -638,14 +643,19 @@ pub fn one_turn_ceiling(plan: &Plan) -> i32 {
 }
 
 /// Fewest turns in which `plan` could still complete. A hard bound (§6.2).
+#[cfg_attr(not(test), allow(dead_code))] // the Python-mirroring API; the encoder caches
 pub fn turns_lower_bound(plan: &Plan, sheet: &Sheet) -> i32 {
-    let steps = progress(plan, sheet).1;
+    turns_lower_bound_given(plan, progress(plan, sheet).1, &requirements(plan, sheet))
+}
+
+/// `turns_lower_bound` from `progress(plan, sheet).1` and `requirements(plan, sheet)`.
+pub fn turns_lower_bound_given(plan: &Plan, steps: i32, req: &Requirements) -> i32 {
     if steps == 0 {
         return 0;
     }
     let ceiling = one_turn_ceiling(plan).max(1);
     let step_term = (steps + ceiling - 1) / ceiling;
-    let houses: i32 = requirements(plan, sheet).houses_needed.iter().sum();
+    let houses: i32 = req.houses_needed.iter().sum();
     let house_term = (houses + 2) / 3;
     step_term.max(house_term)
 }
@@ -665,6 +675,22 @@ mod tests {
     fn plan_ids_are_their_own_indices() {
         for (i, plan) in PLANS.iter().enumerate() {
             assert_eq!(plan.id, i);
+        }
+    }
+
+    #[test]
+    fn cached_forms_match_the_plain_ones() {
+        let mut sheet = Sheet::new();
+        sheet.write(3, (0, 0), 1, false);
+        sheet.write(9, (1, 4), 1, false);
+        sheet.build_roundabout((2, 6), 1);
+        for plan in PLANS.iter().filter(|p| p.kind != PlanKind::Unsupported) {
+            let req = requirements(plan, &sheet);
+            assert_eq!(req, requirements_given(plan, &sheet, feasible(plan, &sheet)));
+            assert_eq!(
+                turns_lower_bound(plan, &sheet),
+                turns_lower_bound_given(plan, progress(plan, &sheet).1, &req)
+            );
         }
     }
 

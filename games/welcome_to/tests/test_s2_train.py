@@ -10,6 +10,7 @@ from dataclasses import asdict
 import pytest
 import torch
 
+from games.welcome_to import encoder as enc
 from games.welcome_to import network as nw
 from games.welcome_to import s2_train
 from games.welcome_to import self_play
@@ -245,6 +246,16 @@ def test_version_one_checkpoint_expands_appended_plan_heads_deterministically(tm
         },
         path,
     )
+    # Every real version-1 checkpoint predates the ABI stamp and was trained on
+    # encoder ABI 1 inputs, so both loaders refuse it outright (spec §0.4)...
+    for loader in (s2_train.load_training_checkpoint, s0_train.load):
+        with pytest.raises(ValueError, match="encoder ABI 1"):
+            loader(path)
+
+    # ...while the head expansion itself stays deterministic for a stamped blob.
+    blob = torch.load(path, weights_only=False)
+    blob["encoder_abi"] = enc.ENCODER_ABI_VERSION
+    torch.save(blob, path)
     loaded, _ = s2_train.load_training_checkpoint(path)
     generic = s0_train.load(path)
     for name in output_keys:

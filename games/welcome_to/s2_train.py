@@ -25,6 +25,7 @@ from typing import Any, Mapping, Optional, Sequence
 import torch
 from torch.nn import functional as F
 
+from games.welcome_to import encoder as enc
 from games.welcome_to import network as nw
 from games.welcome_to import s2_replay
 from games.welcome_to import self_play
@@ -678,6 +679,7 @@ def save_checkpoint(
             name: value.detach().cpu().clone()
             for name, value in net.state_dict().items()
         },
+        "encoder_abi": enc.ENCODER_ABI_VERSION,
         "net_config": asdict(net.config),
         "train_config": asdict(config),
         "optimizer_state": optimizer.state_dict(),
@@ -715,6 +717,7 @@ def load_training_checkpoint(
         raise ValueError(
             f"unsupported S2 checkpoint version {payload.get('version')}"
         )
+    nw.require_encoder_abi(payload, path)
     net = nw.WelcomeToNet(nw.NetConfig(**payload["net_config"]))
     nw.load_state_dict_compatible(net, payload["state_dict"])
     return net.to(device), payload

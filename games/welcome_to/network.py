@@ -454,6 +454,23 @@ def parameter_count(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
+def require_encoder_abi(blob: Mapping[str, object], path: object = "<checkpoint>") -> None:
+    """Refuse a checkpoint trained against a different encoder layout.
+
+    Checkpoints carry ``encoder_abi`` from ABI 2 on; one without it predates
+    that and was trained on ABI 1 inputs.  A shape mismatch would usually
+    surface anyway, but as a tensor-name error that says nothing about why --
+    and a same-width layout change would load silently.  §0.4: no migration.
+    """
+    found = blob.get("encoder_abi")
+    if found != enc.ENCODER_ABI_VERSION:
+        raise ValueError(
+            f"{path} was trained against encoder ABI "
+            f"{found if found is not None else '1 (unstamped)'}, this build is "
+            f"ABI {enc.ENCODER_ABI_VERSION}; there is no migration (ENCODER_V3_SPEC section 0.4)"
+        )
+
+
 def load_state_dict_compatible(
     model: WelcomeToNet, state_dict: Mapping[str, Tensor]
 ) -> bool:

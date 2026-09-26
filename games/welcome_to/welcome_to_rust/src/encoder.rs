@@ -27,8 +27,8 @@ use crate::constants::{
 };
 use crate::game::{EngineError, EngineResult, Game, Phase, NO_CARD};
 use crate::plans::{
-    dense_index, feasible, progress, requirements, turns_lower_bound, Plan, PlanKind,
-    Requirements, NUM_DEALT_PLANS, PLANS,
+    dense_index, feasible, progress, requirements_given, turns_lower_bound_given, Plan,
+    PlanKind, Requirements, NUM_DEALT_PLANS, PLANS,
 };
 use crate::sheet::{Pos, Sheet};
 
@@ -38,6 +38,7 @@ pub const MAX_PLAYERS: usize = 6;
 pub const SHEET_PLANES: usize = 22;
 pub const NUM_SHEET_SCALAR: usize = 196;
 pub const NUM_GLOBAL_SCALAR: usize = 367;
+#[allow(dead_code)] // mirrors encoder.PLAN_SLOT_WIDTH; asserted in tests
 pub const PLAN_SLOT_WIDTH: usize = 34;
 pub const SHEET_PLANES_LEN: usize = MAX_SEATS * SHEET_PLANES * NUM_STREETS * MAX_STREET_LEN;
 pub const SHEET_SCALARS_LEN: usize = MAX_SEATS * NUM_SHEET_SCALAR;
@@ -424,6 +425,33 @@ fn count_in_open_interval(prefix: &[i64; NUM_NUMBERS + 1], low: i32, high: i32) 
     }
 }
 
+/// One plan slot's per-sheet facts, computed once per seat and shared by the
+/// planes, the plan block and `effect_demand` (Python recomputes them; the
+/// values are identical).
+struct SlotFacts {
+    fraction: f64,
+    steps: i32,
+    alive: bool,
+    turns_lower_bound: i32,
+    req: Requirements,
+}
+
+fn slot_facts(game: &Game, sheet: &Sheet) -> [SlotFacts; 3] {
+    std::array::from_fn(|slot| {
+        let plan = &PLANS[game.plan_ids[slot]];
+        let (fraction, steps) = progress(plan, sheet);
+        let alive = feasible(plan, sheet);
+        let req = requirements_given(plan, sheet, alive);
+        SlotFacts {
+            fraction,
+            steps,
+            alive,
+            turns_lower_bound: turns_lower_bound_given(plan, steps, &req),
+            req,
+        }
+    })
+}
+
 /// `encoder.py::_DeckView` — everything the whole state shares.
 struct DeckView {
     deck_prefix: [i64; NUM_NUMBERS + 1],
@@ -599,6 +627,7 @@ fn write_sheet_planes(
     base_numbers: &[i32],
     all_numbers: &[i32],
     view: &DeckView,
+    facts: &[SlotFacts; 3],
     axis: usize,
     out: &mut [f32],
 ) {
@@ -624,7 +653,7 @@ fn write_sheet_planes(
         if banked(game, viewer, seat, slot) {
             continue;
         }
-        for (x, y) in requirements(&PLANS[game.plan_ids[slot]], sheet).target_boxes {
+        for &(x, y) in &facts[slot].req.target_boxes {
             targets[slot][x][y] = true;
         }
     }
@@ -819,12 +848,14 @@ fn plan_block(
     sheet: &Sheet,
     slot: usize,
     view: &DeckView,
+    facts: &[SlotFacts; 3],
     w: &mut Writer,
 ) {
     let plan = &PLANS[game.plan_ids[slot]];
-    let (fraction, steps) = progress(plan, sheet);
+    let facts = &facts[slot];
+    let (fraction, steps) = (facts.fraction, facts.steps);
     let is_banked = banked(game, viewer, seat, slot);
-    let req = requirements(plan, sheet);
+    let req = &facts.req;
 
     w.put_f64(fraction);
     w.put_f64((steps as f64).min(STEPS_SCALE) / STEPS_SCALE);
@@ -850,11 +881,11 @@ fn plan_block(
         w.put_f64(req.street_serves[x] as f64);
     }
 
-    w.put(if feasible(plan, sheet) { 1.0 } else { 0.0 });
-    w.put_f64(turns(turns_lower_bound(plan, sheet) as f64));
+    w.put(if facts.alive { 1.0 } else { 0.0 });
+    w.put_f64(turns(facts.turns_lower_bound as f64));
 
     let mut effect_turns_raw = 0.0f64;
-    for (effect, marks) in effect_needs(plan, &req, steps) {
+    for (effect, marks) in effect_needs(plan, req, steps) {
         if marks <= 0 {
             continue;
         }
@@ -933,7 +964,13 @@ fn estate_demand(sheet: &Sheet) -> f64 {
     total
 }
 
-fn effect_demand(game: &Game, sheet: &Sheet, viewer: usize, seat: usize) -> [f64; NUM_EFFECTS] {
+fn effect_demand(
+    game: &Game,
+    sheet: &Sheet,
+    viewer: usize,
+    seat: usize,
+    facts: &[SlotFacts; 3],
+) -> [f64; NUM_EFFECTS] {
     let mut out = [0.0f64; NUM_EFFECTS];
     let park_total: i32 = PARK_BOXES.iter().sum();
     let parks: i32 = sheet.parks.iter().sum();
@@ -949,7 +986,7 @@ fn effect_demand(game: &Game, sheet: &Sheet, viewer: usize, seat: usize) -> [f64
         }
         let plan = &PLANS[game.plan_ids[slot]];
         if plan.kind == PlanKind::Estate {
-            fences += requirements(plan, sheet).estate_steps_left;
+            fences += facts[slot].req.estate_steps_left;
         }
     }
     out[E_SURVEYOR] = ratio(fences as f64, SURVEYOR_DEMAND_SCALE);
@@ -1027,20 +1064,30 @@ fn reshuffle_contraction(
     }
 }
 
-fn any_writable(sheet: &Sheet, number: i32, effect: Effect) -> bool {
+/// `encoder.py::_writable_values`: per value 0..17, any legal box at all.
+fn writable_values(sheet: &Sheet) -> [bool; NUM_NUMBER_VALUES] {
+    let mut out = [false; NUM_NUMBER_VALUES];
+    for v in 0..NUM_NUMBER_VALUES {
+        out[v] = !sheet.available_locations(Some(v as i32)).is_empty();
+    }
+    out
+}
+
+fn any_writable(writable: &[bool; NUM_NUMBER_VALUES], number: i32, effect: Effect) -> bool {
     numbers_for(number, effect)
         .into_iter()
-        .any(|v| !sheet.available_locations(Some(v)).is_empty())
+        .any(|v| writable[v as usize])
 }
 
 /// Per stack, the printed numbers with NO legal write next turn (1.0 = miss),
 /// and the same for the printed number alone.
 fn playable_sets(sheet: &Sheet, view: &DeckView) -> ([[f64; NUM_NUMBERS]; 3], [f64; NUM_NUMBERS]) {
+    let writable = writable_values(sheet);
     let mut miss = [[1.0f64; NUM_NUMBERS]; 3];
     for (k, effect) in view.next_effects.iter().enumerate() {
         if let Some(effect) = effect {
             for i in 0..NUM_NUMBERS {
-                if any_writable(sheet, i as i32 + 1, *effect) {
+                if any_writable(&writable, i as i32 + 1, *effect) {
                     miss[k][i] = 0.0;
                 }
             }
@@ -1048,7 +1095,7 @@ fn playable_sets(sheet: &Sheet, view: &DeckView) -> ([[f64; NUM_NUMBERS]; 3], [f
     }
     let mut printed = [1.0f64; NUM_NUMBERS];
     for i in 0..NUM_NUMBERS {
-        if !sheet.available_locations(Some(i as i32 + 1)).is_empty() {
+        if writable[i + 1] {
             printed[i] = 0.0;
         }
     }
@@ -1117,6 +1164,7 @@ fn refusal_block(game: &Game, sheet: &Sheet, view: &DeckView, w: &mut Writer) {
         matrix = &view.reshuffled_matrix;
         total = matrix.iter().flatten().sum::<f32>() as f64;
     }
+    let steady_writable = writable_values(steady_sheet);
     let mut unplayable = 0.0f64;
     for i in 0..NUM_NUMBERS {
         for (e, &effect) in EFFECT_ORDER.iter().enumerate() {
@@ -1124,7 +1172,7 @@ fn refusal_block(game: &Game, sheet: &Sheet, view: &DeckView, w: &mut Writer) {
             if count <= 0.0 {
                 continue;
             }
-            if !any_writable(steady_sheet, i as i32 + 1, effect) {
+            if !any_writable(&steady_writable, i as i32 + 1, effect) {
                 unplayable += count;
             }
         }
@@ -1150,16 +1198,30 @@ pub fn max_houses_this_turn(game: &Game, viewer: usize, seat: usize) -> i32 {
             starts.push((opened, 1));
         }
     }
+    // Exact shortcuts, mirrored in game.py: a non-BIS write scores `placed + 1`
+    // wherever it lands, so it needs one legal box and no copy; and a start
+    // whose ceiling `placed + 1 + any BIS offer` cannot beat `best` is skipped.
+    let bis_offered = offers.iter().any(|&(_, effect)| effect == Effect::Bis);
     let mut best = 0i32;
     for (start, placed) in &starts {
         best = best.max(*placed);
+        if best >= placed + 1 + bis_offered as i32 {
+            continue;
+        }
         for &(number, effect) in &offers {
             for value in numbers_for(number, effect) {
-                for pos in start.available_locations(Some(value)) {
+                let locations = start.available_locations(Some(value));
+                if effect != Effect::Bis {
+                    if !locations.is_empty() {
+                        best = best.max(placed + 1);
+                    }
+                    continue;
+                }
+                for pos in locations {
                     let mut written = start.clone();
                     written.write(value, pos, 0, false);
                     let mut total = placed + 1;
-                    if effect == Effect::Bis && !written.bis_candidates().is_empty() {
+                    if !written.bis_candidates().is_empty() {
                         total += 1;
                     }
                     best = best.max(total);
@@ -1241,7 +1303,13 @@ fn plan_conflict_seat(game: &Game, viewer: usize, seat: usize, sheet: &Sheet, w:
     }
 }
 
-fn sheet_scalars(game: &Game, viewer: usize, seat: usize, view: &DeckView) -> Vec<f32> {
+fn sheet_scalars(
+    game: &Game,
+    viewer: usize,
+    seat: usize,
+    view: &DeckView,
+    facts: &[SlotFacts; 3],
+) -> Vec<f32> {
     let sheet = game.sheet_for(viewer, seat);
     let mut w = Writer::new(NUM_SHEET_SCALAR);
 
@@ -1297,14 +1365,14 @@ fn sheet_scalars(game: &Game, viewer: usize, seat: usize, view: &DeckView) -> Ve
 
     // THE RACE (102)
     for slot in 0..3 {
-        plan_block(game, viewer, seat, sheet, slot, view, &mut w);
+        plan_block(game, viewer, seat, sheet, slot, view, facts, &mut w);
     }
 
     // demand (24)
     for value in number_demand(sheet) {
         w.put_f64(value / NUM_BOXES as f64);
     }
-    let demand = effect_demand(game, sheet, viewer, seat);
+    let demand = effect_demand(game, sheet, viewer, seat, facts);
     for value in demand {
         w.put_f64(value);
     }
@@ -1481,6 +1549,7 @@ pub fn encode_state(game: &Game, viewer: usize) -> EngineResult<EncodedState> {
 
     for (axis, seat) in seat_order(game, viewer).into_iter().enumerate() {
         let sheet = game.sheet_for(viewer, seat);
+        let facts = slot_facts(game, sheet);
         write_sheet_planes(
             game,
             viewer,
@@ -1489,10 +1558,11 @@ pub fn encode_state(game: &Game, viewer: usize) -> EngineResult<EncodedState> {
             &base_numbers,
             &all_numbers,
             &view,
+            &facts,
             axis,
             &mut sheet_planes,
         );
-        let scalars = sheet_scalars(game, viewer, seat, &view);
+        let scalars = sheet_scalars(game, viewer, seat, &view, &facts);
         let start = axis * NUM_SHEET_SCALAR;
         sheet_scalars_out[start..start + NUM_SHEET_SCALAR].copy_from_slice(&scalars);
     }

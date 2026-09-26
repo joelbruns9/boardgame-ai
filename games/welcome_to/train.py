@@ -467,6 +467,7 @@ def train(
         torch.save(
             {
                 "state_dict": net.state_dict(),
+                "encoder_abi": enc.ENCODER_ABI_VERSION,
                 "net_config": asdict(net.config),
                 "train_config": asdict(config),
                 "metrics": metrics,
@@ -481,6 +482,7 @@ def train(
 
 def load(path: str | Path, device: str = "cpu") -> nw.WelcomeToNet:
     blob = torch.load(Path(path), map_location=device, weights_only=False)
+    nw.require_encoder_abi(blob, path)
     net = nw.WelcomeToNet(nw.NetConfig(**blob["net_config"]))
     nw.load_state_dict_compatible(net, blob["state_dict"])
     return net.to(device)

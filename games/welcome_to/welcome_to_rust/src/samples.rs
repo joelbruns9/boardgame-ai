@@ -24,8 +24,9 @@ use crate::rng::Rng;
 use crate::tables;
 use crate::{to_py, RustGameState};
 
-pub const TRAINING_SHARD_VERSION: u16 = 2;
-const LEGACY_TRAINING_SHARD_VERSION: u16 = 1;
+/// 3: encoder v3 rows (ENCODER_ABI_VERSION 2). Versions 1 and 2 hold ABI-1
+/// rows of a different width and are refused, never read (spec §0.4).
+pub const TRAINING_SHARD_VERSION: u16 = 3;
 pub const GLOBAL_TARGET_NAMES: [&str; 9] = [
     "turns_left",
     "rank_p_0",
@@ -600,14 +601,17 @@ fn read_shard_header(reader: &mut impl Read) -> Result<(usize, usize), String> {
     let per_seat_targets = read_u16(reader)? as usize;
     let max_seats = read_u16(reader)? as usize;
     let signature = read_u64(reader)?;
+    if &magic == MAGIC && version < TRAINING_SHARD_VERSION {
+        return Err(format!(
+            "training shard version {version} holds encoder ABI 1 rows; this build              reads version {TRAINING_SHARD_VERSION} (encoder ABI {}) only",
+            encoder::ENCODER_ABI_VERSION
+        ));
+    }
     let current = version == TRAINING_SHARD_VERSION
         && global_targets == GLOBAL_TARGET_COUNT
         && per_seat_targets == PER_SEAT_TARGET_COUNT;
-    let legacy = version == LEGACY_TRAINING_SHARD_VERSION
-        && global_targets == GLOBAL_TARGET_COUNT
-        && per_seat_targets == LEGACY_PER_SEAT_TARGET_COUNT;
     if &magic != MAGIC
-        || !(current || legacy)
+        || !current
         || max_seats != encoder::MAX_SEATS
         || signature != tables::table_signature()
     {

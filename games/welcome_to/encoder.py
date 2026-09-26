@@ -992,6 +992,15 @@ def _reshuffle_contraction(
             w.put(fit_rate(demand, supply_numbers), eff_rate(supply_effects))
 
 
+def _writable_values(sheet: Sheet) -> list[bool]:
+    """Per value 0..17, whether it has any legal box -- one scan per sheet.
+
+    ``bool(sheet.available_locations(v))`` exactly, precomputed because §8 asks
+    it ~200 times per sheet.
+    """
+    return [bool(sheet.available_locations(v)) for v in range(NUM_NUMBER_VALUES)]
+
+
 def _playable_sets(
     state: GameState, sheet: Sheet, view: _DeckView
 ) -> tuple[list[np.ndarray], np.ndarray]:
@@ -1001,20 +1010,21 @@ def _playable_sets(
     :data:`CARD_NUMBERS` and holds 1.0 where the number is **unplayable**, which
     is the form §8's probabilities contract against.
     """
+    writable = _writable_values(sheet)
     miss: list[np.ndarray] = []
     for effect in view.next_effects:
         m = np.ones(_NUM_NUMBERS, dtype=np.float64)
         if effect is not None:
             for i, n in enumerate(CARD_NUMBERS):
                 for v in state.numbers_for(n, effect):
-                    if sheet.available_locations(v):
+                    if writable[v]:
                         m[i] = 0.0
                         break
         miss.append(m)
 
     printed = np.ones(_NUM_NUMBERS, dtype=np.float64)
     for i, n in enumerate(CARD_NUMBERS):
-        if sheet.available_locations(n):
+        if writable[n]:
             printed[i] = 0.0
     return miss, printed
 
@@ -1104,16 +1114,14 @@ def _refusal_block(
     if total < 3.0:
         matrix = view.reshuffled_matrix
         total = float(matrix.sum())
+    steady_writable = _writable_values(steady_sheet)
     unplayable = 0.0
     for i, n in enumerate(CARD_NUMBERS):
         for effect in DECK_EFFECT_ORDER:
             count = float(matrix[i, _EFFECT_INDEX[effect]])
             if count <= 0.0:
                 continue
-            if not any(
-                steady_sheet.available_locations(v)
-                for v in state.numbers_for(n, effect)
-            ):
+            if not any(steady_writable[v] for v in state.numbers_for(n, effect)):
                 unplayable += count
     if total < 3.0:
         w.put(0.0)

@@ -613,13 +613,16 @@ def _read_training_shard(path: Path) -> list[SelfPlayTrajectory]:
             and tuple(wr.TRAINING_GLOBAL_TARGET_NAMES) == training.GLOBAL_TARGETS
             and tuple(wr.TRAINING_PER_SEAT_TARGET_NAMES) == training.PER_SEAT_TARGETS
         )
-        legacy_schema = (
-            version == 1
-            and globals_ == len(training.GLOBAL_TARGETS)
-            and per_seat == len(training.LEGACY_PER_SEAT_TARGETS)
-            and tuple(wr.LEGACY_TRAINING_PER_SEAT_TARGET_NAMES)
-            == training.LEGACY_PER_SEAT_TARGETS
-        )
+        # Versions 1 and 2 hold encoder-ABI-1 rows of a different width.  §0.4:
+        # refused, never read -- the legacy TARGET upgrade below is unreachable
+        # from a shard and survives only for its own unit test.
+        legacy_schema = False
+        if magic == b"WTSHRD01" and version < int(wr.TRAINING_SHARD_VERSION):
+            raise ValueError(
+                f"training shard {path} is version {version} (encoder ABI 1 rows); "
+                f"this build reads version {int(wr.TRAINING_SHARD_VERSION)} "
+                f"(encoder ABI {enc.ENCODER_ABI_VERSION}) only"
+            )
         if (
             magic != b"WTSHRD01"
             or not (current_schema or legacy_schema)

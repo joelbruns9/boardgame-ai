@@ -798,6 +798,7 @@ def load_net(path: str, device: str = "cpu") -> LoadedNet:
         ):
             raise ValueError("unsupported S2 checkpoint version %r" % (version,))
         source = "s2 v%d" % (version,)
+    nw.require_encoder_abi(blob, path)
     net = nw.WelcomeToNet(nw.NetConfig(**blob["net_config"]))
     legacy = nw.load_state_dict_compatible(net, blob["state_dict"])
     return LoadedNet(
