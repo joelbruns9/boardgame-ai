@@ -412,8 +412,113 @@ menus built. A test shows a cap of 50 plays exactly the same games.
 
 ### Phase 4 — Full training run, all variants (the original Phase 2 gate)
 
-Now on the Rust engine, and now worth wiring into `games/az_loop` for
-checkpointing, run log and gating.
+**Phase 4 run plan (drafted 2026-09-26, after the 2p-base plateau).**
+
+Why now: every lever tried on 2p base lands at the same strength (~57-58%
+vs the heuristic):
+- LR step-down: +1 pt;
+- exact targets at λ=0.7: 0;
+- λ=0 + exact + personas: 0 to +2 (the definitive final-vs-start match was
+  49.8%);
+- stop-bias recalibration: 0;
+- k=4 lookahead: 0.
+
+2p base looks close to saturated at one-turn search depth. The open
+questions -- one net across variants, and whether interaction-heavy
+variants reward more value accuracy or more search -- live in the other
+nine variants. The user's own table game is 3 players, 4 columns,
+blocking, which is also the Phase 5 target.
+
+*Staying on `train.py`, not `games/az_loop`:* the standalone loop already
+has the replay window, passes, TD targets, search options, personas, LR
+schedule and the Rust pool. az_loop is built around policy+value AlphaZero
+learners; wiring it is cost without a measured benefit.
+
+**Measured sizing** (2026-09-26, pool on the RTX 3070 laptop, the 2p net
+playing every variant off-distribution -- lengths and costs, not
+strength):
+
+| variant | rows/game | turns/game | net rows/game | plain games/h | exact games/h |
+|---|---|---|---|---|---|
+| 2p, 3 col | 9.8 | 10.8 | 121k | 52.6k | 10.3k |
+| 2p, 3 col, blocking | 9.8 | 10.8 | 114k | 50.7k | 11.3k |
+| 2p, 5 col | 20.5 | 21.5 | 143k | 39.4k | 9.8k |
+| 2p, 5 col, blocking | 20.1 | 21.1 | 138k | 38.6k | 9.1k |
+| 3p, 3 col | 29.0 | 30.0 | 450k | 17.4k | 3.5k |
+| 3p, 3 col, blocking | 29.3 | 30.3 | 455k | 17.3k | 3.4k |
+| 3p, 4 col | 41.2 | 42.2 | 324k | 16.9k | 4.8k |
+| 3p, 4 col, blocking | 50.0 | 51.0 | 300k | 15.2k | 4.2k |
+| 4p, 3 col | 29.1 | 30.1 | 452k | 17.0k | 3.4k |
+| 4p, 3 col, blocking | 28.2 | 29.2 | 437k | 17.7k | 3.3k |
+
+Rows per game span 5x (2p base ~10, 3p 4-col blocking ~50), so
+equal-games sampling would give the 3-player extended variants 5x the 2p
+base share. But the COST per row is nearly flat: ~0.5-0.8M rows/hour plain
+and ~0.1-0.2M exact in every variant. Balancing by rows therefore also
+roughly balances compute.
+
+**Decisions proposed** (the user's to confirm):
+1. **Start fresh, from a random net.** It is the clean test of the recipe
+   as Phase 4 means it, and the plan's original decision. The 2p specialist
+   (`runs/td0_personas/iter_0120.pt`) becomes the Phase 5 comparison on
+   2p base. Warm-starting from it is the fallback if the fresh run learns
+   too slowly.
+2. **Targets: λ=0, sampled first, exact later** (PureTD's staging). Exact
+   costs ~5x in every variant and showed no measured gain on 2p. Sampled
+   λ=0 is effectively variable-depth on opening busts (review), which is
+   acceptable. Switch to exact when the heuristic matches flatten.
+   *Needs `--exact-from ITER`.*
+3. **Rows, not games, per variant:** ~4,000 rows per variant per
+   iteration, 40k total -- the same per-variant volume as the 2p runs.
+   Games per variant adapt each iteration from the previous one's
+   rows/game, seeded from the table above. *Needs `--rows-per-variant`.*
+4. **Replay:** 10-iteration window (400k rows), 5 lifetime passes, so
+   ~200k samples ~ 780 steps of 256 per iteration.
+5. **Net:** 512-512-256-256 (0.51M). The capacity probe tied 92k-5.4M on
+   2p data, but ten variants are richer. Re-run `capacity_probe` on
+   Phase 4 data after ~20 iterations before changing size.
+6. **Personas:** keep 20% conservative / 10% aggressive (user's choice).
+   The 2p evidence is neutral (+1.6 / +2.5 pts, within noise). Measure per
+   variant against fixed persona opponents at checkpoints.
+7. **LR:** `--lr-schedule 1:1e-3 40:3e-4 80:1e-4 120:5e-5`.
+
+**Evaluation** (all per variant):
+- **vs heuristic:** the challenger against n-1 heuristic copies, seats
+  rotated, even = 1/n, Wilson interval; 200 games per variant every 5
+  iterations (`--arena-every 5`).
+- **vs a frozen reference:** the iteration-0 net early, then a fixed
+  checkpoint (e.g. iteration 40) as the review's frozen-opponent monitor.
+- **Probe-set monitor** (review): a fixed set of ~50 boards per variant,
+  sampled uniformly once. Each iteration logs the net's value against an
+  exact one-turn search from the same net (RMSE and bias per variant). A
+  growing residual means λ=0 bootstrapping is drifting.
+- Per-variant log columns: games, rows, turns, turn length, seat wins.
+
+**Gate (Phase 4 passes when):**
+- in all 10 variants the heuristic match's lower 95% bound clears 1/n,
+  and the trend is still rising or flat, not falling;
+- the probe residual stays bounded;
+- the 2p-base generalist is carried into Phase 5 against the 2p
+  specialist.
+
+**Throughput estimate:** 40k rows per iteration ~ 4-5 min generation plain,
+plus <1 min training, plus arena every 5 iterations (~3-4 min). About 5-6
+min per iteration, so ~90-100 iterations per overnight run while sampled;
+about 5x slower after the switch to exact.
+
+**Code work before the first run** (each with tests, Python reference where
+it touches the pool):
+1. `--rows-per-variant`: the adaptive per-variant game schedule, and the
+   persona seating over the mixed schedule.
+2. Per-variant evaluation: heuristic and frozen-reference matches for
+   every variant, n-player seating, `--arena-every`.
+3. Probe-set monitor, logged per variant.
+4. `--exact-from ITER`: staged sampled-to-exact targets.
+5. Per-variant log columns.
+
+Rough size: a day of work, mostly (2) and (3).
+
+**Earlier Phase 4 notes** (targets, search options, diagnosis):
 
 - **Sampling:** balance by **rows per variant**, not games (4-player and
   5-column games are longer, so equal games silently trains a 4-player
@@ -552,8 +657,11 @@ checkpointing, run log and gating.
   Otherwise fall back to per-player-count nets and re-test.
 ### Later (not scheduled)
 
-- Shallow opponent-turn lookahead on top of the solver.
-- Bootstrapped value targets.
+- ~~Shallow opponent-turn lookahead on top of the solver.~~ Built
+  (selective, `lookahead_k`), parked for training: no gain on 2p base at
+  k=4. Retest in 3-4p blocking once a Phase 4 net exists.
+- ~~Bootstrapped value targets.~~ Built (TD(λ), exact root).
+- Opponent modelling (exploiting cautious humans explicitly).
 - BGA advisor on the shared `games/advisor` host (see `bga_recon.md`).
 
 ## Resolved questions
