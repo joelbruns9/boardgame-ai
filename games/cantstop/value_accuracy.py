@@ -14,6 +14,11 @@ from it many times with fresh dice. Every estimator is scored against that:
 If two-turn search is much closer to the truth than one-turn, lookahead
 targets would teach the net a more accurate win probability.
 
+Scope (review, 2026-09-25): the truth is the value under PLAIN one-turn
+play by this net. Lower error against it is neither necessary nor
+sufficient for a search that changes decisions to play better -- judge
+search with head-to-head matches; use this for calibration.
+
 Rollout noise is binomial and known, so it is subtracted: for each board the
 unbiased estimate of an estimator's squared error is
     (est - p_hat)^2 - p_hat (1 - p_hat) / (R - 1).
@@ -47,16 +52,48 @@ ESTIMATORS = {
 
 def sample_boards(rules, ev, games, count, rng):
     """End-of-turn boards from the net's own games (so the distribution is
-    the one it is trained and asked on), spread over the whole game."""
+    the one it is trained and asked on), drawn uniformly without
+    replacement. Returns (boards, source game id per board).
+
+    Review finding 3: the first version drew 3*count indices, SORTED them
+    and kept the first count -- i.e. the lowest indices, so the boards came
+    from the earliest-generated games (mean percentile 19%, not 50%)."""
     results = run_pool([rules] * games, game_seeds(rng, games), [ev])
-    pool = []
+    pool, game_of = [], []
     n = rules.num_players
-    for r in results:
+    for g, r in enumerate(results):
         for row, slot in zip(r.features, r.winner_slots):
             active = (r.winner - int(slot)) % n
             pool.append(decode_features(row, active))
-    idx = sorted({rng.randrange(len(pool)) for _ in range(count * 3)})[:count]
-    return [pool[i] for i in idx]
+            game_of.append(g)
+    idx = uniform_indices(len(pool), count, rng)
+    return [pool[i] for i in idx], [game_of[i] for i in idx]
+
+
+def uniform_indices(n, count, rng):
+    """``count`` distinct indices from range(n), uniformly (sorted only
+    AFTER the draw)."""
+    if count > n:
+        raise ValueError(f"asked for {count} of {n}")
+    order = list(range(n))
+    rng.shuffle(order)
+    return sorted(order[:count])
+
+
+def cluster_bootstrap(values, clusters, reps=2000, seed=0):
+    """Standard error of the mean of per-board ``values`` resampling whole
+    source GAMES, since boards from one game are correlated (review: the
+    per-board SE ignored that)."""
+    values = np.asarray(values, dtype=np.float64)
+    ids = sorted(set(clusters))
+    by = {c: values[[i for i, g in enumerate(clusters) if g == c]] for c in ids}
+    gen = np.random.default_rng(seed)
+    means = []
+    for _ in range(reps):
+        pick = gen.choice(len(ids), size=len(ids), replace=True)
+        chunk = np.concatenate([by[ids[j]] for j in pick])
+        means.append(chunk.mean())
+    return float(np.std(means, ddof=1))
 
 
 def net_estimates(ev, boards):
@@ -102,7 +139,10 @@ def main(argv=None):
     rng = PortableRng(args.seed)
     started = time.perf_counter()
 
-    boards = sample_boards(rules, ev, args.source_games, args.boards, rng)
+    if args.rollouts < 2:
+        raise SystemExit("--rollouts must be at least 2 (noise correction)")
+    boards, games_of = sample_boards(rules, ev, args.source_games,
+                                     args.boards, rng)
     movers = [b.active_player for b in boards]
     est = {"net": [v[a] for v, a in zip(net_estimates(ev, boards), movers)]}
     cost = {"net": 0.0}
@@ -118,7 +158,8 @@ def main(argv=None):
 
     noise = p_hat * (1 - p_hat) / (args.rollouts - 1)
     sq = {k: (np.asarray(v) - p_hat) ** 2 - noise for k, v in est.items()}
-    report = {"boards": len(boards), "rollouts": args.rollouts,
+    report = {"boards": len(boards), "source_games": len(set(games_of)),
+              "rollouts": args.rollouts,
               "rollout_noise_rmse": float(math.sqrt(noise.mean())),
               "estimators": {}, "vs_net": {}, "vs_search1": {}}
     for k, v in sq.items():
@@ -137,7 +178,8 @@ def main(argv=None):
             d = sq[k] - sq[base]
             report[f"vs_{base}"][k] = {
                 "mse_change": float(d.mean()),
-                "se": float(d.std(ddof=1) / math.sqrt(len(d))),
+                "se_per_board": float(d.std(ddof=1) / math.sqrt(len(d))),
+                "se": cluster_bootstrap(d, games_of),
                 "relative": float(d.mean() / sq[base].mean())
                 if sq[base].mean() > 0 else None,
             }
@@ -147,6 +189,7 @@ def main(argv=None):
     if args.out:
         with open(args.out, "w", encoding="utf-8") as fh:
             json.dump({"report": report, "p_hat": p_hat.tolist(),
+                   "source_game": games_of,
                        "estimates": {k: list(map(float, v))
                                      for k, v in est.items()}}, fh)
 

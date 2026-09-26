@@ -77,8 +77,14 @@ def train_one(hidden, x_tr, y_tr, x_ho, y_ho, epochs, batch, lr, device,
         best = min(best, ho)
         curve.append((round(tr, 5), round(ho, 5)))
     params = sum(p.numel() for p in net.parameters())
+    # Cross-entropy includes the targets' own entropy, a floor no net can go
+    # below; CE - H is the part a better net could still remove (review).
+    with torch.no_grad():
+        t = y_ho.clamp_min(1e-12)
+        h_ho = float(-(y_ho * torch.log(t)).sum(dim=-1).mean())
     return {"params": params, "best_heldout": best, "final_train": curve[-1][0],
-            "final_heldout": curve[-1][1], "curve": curve}
+            "final_heldout": curve[-1][1], "heldout_target_entropy": h_ho,
+            "best_heldout_minus_entropy": best - h_ho, "curve": curve}
 
 
 def main(argv=None):
@@ -116,7 +122,9 @@ def main(argv=None):
         r["seconds"] = round(time.perf_counter() - t)
         report["sizes"][name] = r
         print(f"{name:34} params {r['params']:>9,}  best held-out "
-              f"{r['best_heldout']:.5f}  final train {r['final_train']:.5f} "
+              f"{r['best_heldout']:.5f} (CE-H "
+              f"{r['best_heldout_minus_entropy']:.5f})  "
+              f"final train {r['final_train']:.5f} "
               f"held-out {r['final_heldout']:.5f}  ({r['seconds']}s)",
               flush=True)
     if args.out:

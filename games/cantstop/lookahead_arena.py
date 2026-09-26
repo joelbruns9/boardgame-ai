@@ -31,8 +31,9 @@ def main(argv=None):
     ap.add_argument("--k", type=int, default=4)
     ap.add_argument("--no-offset", action="store_true")
     ap.add_argument("--exact", action="store_true",
-                    help="exact_root for the lookahead side (values only; "
-                         "decisions are unchanged by it)")
+                    help="exact_root for the lookahead side. With k > 0 this "
+                         "CHANGES decisions: refinement is chosen by reach "
+                         "from the solve's root, before vs after the roll")
     ap.add_argument("--games", type=int, default=400)
     ap.add_argument("--players", type=int, default=2)
     ap.add_argument("--extended", action="store_true")

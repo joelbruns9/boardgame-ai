@@ -41,6 +41,25 @@ pub fn choose(main: &TurnSolver, k: usize) -> Result<(Vec<usize>, Vec<f64>), Sol
     Ok((leaves, weights))
 }
 
+/// Clip negatives to zero and renormalise, in seat order (Python mirrors
+/// the order). Review finding P1: a common shift keeps each row's SUM at 1
+/// but not its entries >= 0 -- a hashed-mock 3p position gave a root value
+/// of -0.005 for one seat and training targets down to -0.14, which the
+/// soft cross-entropy rewards without bound. A shifted row always keeps a
+/// positive entry (the shift sums to zero), so the total is positive.
+fn project_to_simplex(row: &mut [f64]) {
+    let mut total = 0.0f64;
+    for x in row.iter_mut() {
+        if *x < 0.0 {
+            *x = 0.0;
+        }
+        total += *x;
+    }
+    for x in row.iter_mut() {
+        *x /= total;
+    }
+}
+
 /// New leaf values: `v1` (row-major, `n` per leaf) with the chosen leaves
 /// replaced by `refined` and, if `offset`, the rest shifted by the
 /// reach-weighted mean of (refined - v1) over the chosen leaves.
@@ -71,6 +90,7 @@ pub fn combine(
                     for s in 0..n {
                         row[s] += d[s];
                     }
+                    project_to_simplex(&mut row[..n]);
                 }
             }
         }

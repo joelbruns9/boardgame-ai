@@ -223,8 +223,12 @@ def test_refine_replaces_chosen_leaves_and_shifts_the_rest():
                               TurnSolver(board, ev).value(board))
     others = [k for k in v1_stop if k not in chosen and not ps.winning[k]]
     shifts = {tuple(np.round(ps.stop_values[k] - v1_stop[k], 12))
-              for k in others}
-    assert len(shifts) == 1              # one common offset
+              for k in others
+              if np.all(ps.stop_values[k] > 0)}       # not clipped
+    assert len(shifts) == 1              # one common offset where unclipped
+    for k in others:                     # clipped rows: projected (review P1)
+        v = ps.stop_values[k]
+        assert v.min() >= 0 and abs(v.sum() - 1) < 1e-9
     raw = TurnSolver(state, ev)
     refine(raw, state, ev, 3, offset=False)
     for k in others:

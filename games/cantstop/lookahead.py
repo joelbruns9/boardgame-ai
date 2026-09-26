@@ -15,8 +15,13 @@ turn of search across the turn boundary, where it counts:
    refined value;
 4. ``refine``: chosen leaves take the refined value; with ``offset``, every
    other leaf shifts by the reach-weighted mean refinement, so an option is
-   neither favoured nor penalised just for having been looked at; back up
-   again.
+   neither favoured nor penalised just for having been looked at, and is
+   then projected back onto the probability simplex (review finding P1: a
+   shift keeps the sum but not the signs); back up again.
+
+The offset is an UNVALIDATED heuristic (review, 2026-09-25): lookahead is
+parked for training until it shows strength per unit time in balanced-seat
+matches.
 
 Cost: k extra turn-start solves per turn, each with its own leaves for the
 net. Every sum runs in a fixed order so Rust matches bit for bit.
@@ -70,6 +75,18 @@ def choose(ps, state, k):
     return leaves, weights
 
 
+def _project(row):
+    """Clip negatives to zero and renormalise, in seat order -- as
+    ``project_to_simplex`` in Rust. Review finding P1: the common shift
+    kept each row's sum but not its entries >= 0, and negative entries
+    became negative training targets."""
+    row = [x if x >= 0.0 else 0.0 for x in row]
+    total = 0.0
+    for x in row:
+        total += x
+    return [x / total for x in row]
+
+
 def refine(ps, state, evaluate, k, offset=True):
     """Apply the lookahead to a solved ``ps`` in place. Returns the refined
     leaves (for tests)."""
@@ -98,7 +115,7 @@ def refine(ps, state, evaluate, k, offset=True):
             chosen = set(leaves)
             for leaf, v in v1.items():
                 if leaf not in chosen:
-                    new[leaf] = [v[s] + d[s] for s in range(n)]
+                    new[leaf] = _project([v[s] + d[s] for s in range(n)])
     for leaf, r in zip(leaves, refined):
         new[leaf] = r
     import numpy as np

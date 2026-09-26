@@ -195,6 +195,21 @@ def train_steps(net, buffer, opt, steps, batch_size, device, rng):
     return float(np.mean(losses))
 
 
+def arena_search_for(search):
+    """The search the per-iteration matches use for a self-play ``search``.
+
+    With no lookahead, exact_root changes only the RECORDED value, never a
+    move, so the matches drop it: same games at a fifth of the cost. With
+    lookahead it DOES change moves -- refined leaves are chosen by reach
+    from the solve's root, before vs after the roll -- so it stays (review
+    finding 2: the arena was measuring a different search).
+    """
+    from dataclasses import replace
+    if search.lookahead_k == 0:
+        return replace(search, exact_root=False)
+    return search
+
+
 def parse_lr_schedule(items):
     """``["1:1e-3", "60:3e-4", "150:1e-4"]`` -> {1: 1e-3, 60: 3e-4, ...}:
     from iteration 60 on the rate is 3e-4, and so on."""
@@ -240,10 +255,7 @@ def run(out_dir, iterations, games, rule_sets=(MVP_RULES,), hidden=(256, 256),
     ``arena_search`` how both sides of the per-iteration matches search
     (default: the same)."""
     if arena_search is None:
-        # exact_root changes only the RECORDED value, never a move, so the
-        # matches drop it: same games at a fifth of the cost.
-        from dataclasses import replace
-        arena_search = replace(search, exact_root=False)
+        arena_search = arena_search_for(search)
     """``steps=None`` derives each iteration's steps from ``passes`` and
     ``replay_window`` (``steps_for_passes``); an integer fixes them, as
     the pre-window loop did."""

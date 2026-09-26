@@ -212,7 +212,9 @@ training run.
 
 ### Phase 3 — Rust port and multicore (moved ahead of the full run)
 
-External review brief for M0-M3: `PHASE3_RUST_PORT_REVIEW_REQUEST.md`.
+External review brief for M0-M3: `PHASE3_RUST_PORT_REVIEW_REQUEST.md`. For
+the training targets, search options and personas built after it:
+`TRAINING_SEARCH_REVIEW_REQUEST.md`.
 
 Read [[project_kingdomino_rust]] and [[welcome_to_rust_m1]] first. Crate at
 `games/cantstop/cantstop_rust`, pyo3 0.28, `maturin develop --release`.
@@ -495,6 +497,48 @@ checkpointing, run log and gating.
     Exploiting a cautious human is opponent modelling -- not built.
 - **LR schedule (BUILT):** `--lr-schedule 1:1e-3 60:3e-4 ...`, a step
   schedule by iteration; `lr` is logged each iteration.
+- **External review of 3d72ef3..403ad7d (2026-09-25)**, brief
+  `TRAINING_SEARCH_REVIEW_REQUEST.md`; notes in the main checkout,
+  `reviews/cantstop-training-search-403ad7d.md`. Next recipe approved as a
+  controlled k=0 trial. All four findings reproduced as stated and fixed:
+  - **[P1] Offset lookahead produced negative targets.** A common shift
+    keeps a row's sum but not its signs. A hashed-mock 3-player root came
+    out [0.310, -0.005, 0.696], and 2,579 of 6,029 stop vectors had a
+    negative entry; negative soft-CE targets are unbounded below.
+    - Shifted rows are now projected onto the simplex (clip, renormalise),
+      bit-identical in Rust and Python.
+    - `check_targets` refuses invalid targets at the training boundary.
+    - A 3-player end-to-end test.
+    - **Lookahead stays parked for training:** the offset is an
+      unvalidated heuristic.
+  - **[P2] The arena measured a different search.** Dropping `exact_root`
+    is only move-neutral without lookahead; with k > 0 it changes which
+    leaves are refined. `train.arena_search_for` keeps it when k > 0.
+  - **[P2] `value_accuracy.py` took the LOWEST indices** (mean percentile
+    19%, not 50%): it sorted before truncating.
+    - Now uniform without replacement, with source game ids kept and a
+      game-cluster bootstrap SE.
+    - **The 60-board accuracy numbers above are therefore unreliable
+      until re-run.** They are also scoped to calibration against plain
+      play, not a search-investment criterion.
+  - **[P2] Persona targets with k > 0 still depend on the persona**:
+    refinement is chosen under the biased policy. Documented as an
+    approximation; k = 0 runs are unaffected.
+  - Corrections accepted:
+    - Terminal anchors are NOT confined to the last played turn: the
+      solver scores every enumerated winning stop exactly.
+    - Sampled and exact targets differ on opening busts. Exact uses the
+      net's value of the passed-turn board; sampled forwards the next
+      search, so sampled is effectively variable-depth there.
+    - The capacity tie supports only "no demonstrated benefit for this
+      dataset and procedure"; `capacity_probe` now reports CE - H(target).
+    - The PureTD comparison is qualified: it trains on fresh data for one
+      epoch, and we use a replay window.
+    - A weights-only resume resets Adam and the buffer. Pass the rate
+      explicitly (the next run's `--lr-schedule 1:1e-4` does).
+  - Monitoring suggested for the λ=0 run, not built yet: frozen-opponent
+    win rates, calibration on independent rollout boards, and exact-backup
+    residuals on a fixed probe set.
 - **Baselines:** heuristic-leaf solver (all variants); earlier checkpoints.
 - **Gate:** win rate vs the heuristic-leaf solver rises across iterations in
   **every** variant, not just the common ones.

@@ -43,7 +43,13 @@ class Search:
     lookahead_k       selective 2-turn lookahead: refine this many leaves
                       (the bust board + the top k-1 stop leaves by reach) by
                       solving the next player's turn from them. 0 = off.
-    lookahead_offset  shift unrefined leaves by the mean refinement.
+    lookahead_offset  shift unrefined leaves by the mean refinement (then
+                      project back onto the probability simplex).
+                      Parked for training: an unvalidated heuristic.
+                      With a persona, the refinement is chosen under the
+                      persona's BIASED policy; only the final backup is
+                      unbiased, so persona targets with k > 0 still depend
+                      on the persona (review finding 4) -- an approximation.
     stop_bias         risk attitude: stop when stop value + bias >= roll
                       value. 0 = best play; +0.03 a conservative persona,
                       -0.03 an aggressive one. Own turn only: a lookahead's
@@ -250,8 +256,24 @@ def stack_training(results, lam):
     usable = [r for r in results if len(r)]
     if not usable:
         raise ValueError("no rows to stack")
-    return (np.concatenate([r.features for r in usable]),
-            np.concatenate([td_targets(r, lam) for r in usable]))
+    targets = np.concatenate([td_targets(r, lam) for r in usable])
+    check_targets(targets)
+    return (np.concatenate([r.features for r in usable]), targets)
+
+
+def check_targets(targets, tol=1e-6):
+    """Refuse anything but probability distributions. A negative target
+    makes the soft cross-entropy unbounded below (review finding P1: the
+    lookahead offset produced them), so this fails loudly at the training
+    boundary instead of training on it."""
+    t = np.asarray(targets, dtype=np.float64)
+    if not np.all(np.isfinite(t)):
+        raise ValueError("non-finite value target")
+    if t.size and t.min() < -tol:
+        raise ValueError(f"negative value target {t.min():.6g}")
+    sums = t.sum(axis=1)
+    if t.size and np.abs(sums - 1.0).max() > tol:
+        raise ValueError(f"value target sums to {sums[np.argmax(np.abs(sums - 1))]:.6g}")
 
 
 def summarize(results):
