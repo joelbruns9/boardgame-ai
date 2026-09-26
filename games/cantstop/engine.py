@@ -285,3 +285,35 @@ def _next_player(state):
     state.active_player = (state.active_player + 1) % state.rules.num_players
     state.dice = None
     state.phase = Phase.AWAIT_ROLL
+
+
+# ---- Column reflection ----
+#
+# Columns c <-> 14 - c (2<->12, 3<->11, ... 7 fixed) with every die d -> 7 - d
+# is an exact symmetry of the game: a pair sum s maps to 14 - s, column
+# heights are symmetric, and blocking treats every column alike. Best-play
+# values of a board and its mirror are equal. (Plan review, 2026-09-26: the
+# 2p net was off by 1.1 pts on average and 12.4 at worst under it.)
+
+def reflect_column(col):
+    return 14 - col
+
+
+def reflect_dice(dice):
+    return tuple(7 - d for d in dice)
+
+
+def reflect_move(move):
+    return tuple(sorted(reflect_column(c) for c in move))
+
+
+def reflect_state(state):
+    """The mirrored position (dice mirrored too, if held)."""
+    m = state.clone()
+    m.progress = [{c: prog[reflect_column(c)] for c in COLUMNS}
+                  for prog in state.progress]
+    m.claimed_by = {c: state.claimed_by[reflect_column(c)] for c in COLUMNS}
+    m.runners = {reflect_column(c): pos for c, pos in state.runners.items()}
+    if state.dice is not None:
+        m.dice = tuple(sorted(reflect_dice(state.dice)))
+    return m

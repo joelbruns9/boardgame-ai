@@ -166,8 +166,19 @@ def generate(rule_sets, games_per_ruleset, evaluate, rng, backend="auto",
             for rules, seed, seats in zip(schedule, seeds, seat_searches)]
 
 
-def train_steps(net, buffer, opt, steps, batch_size, device, rng):
-    """Sample minibatches from the buffer and fit. Returns the mean loss."""
+def reflect_half(x, rng, perm):
+    """Mirror each row of a minibatch with probability 1/2 (column
+    reflection is an exact symmetry; targets are seat slots, which do not
+    move). Returns the batch and the number of rows mirrored."""
+    flip = torch.tensor([rng.random() < 0.5 for _ in range(len(x))],
+                        device=x.device)
+    return torch.where(flip[:, None], x.index_select(1, perm), x), int(flip.sum())
+
+
+def train_steps(net, buffer, opt, steps, batch_size, device, rng,
+                reflect=False):
+    """Sample minibatches from the buffer and fit. Returns the mean loss.
+    ``reflect``: randomly mirror half of every minibatch (augmentation)."""
     x_all, y_all = buffer.arrays()
     if not len(x_all):
         return float("nan")
@@ -178,6 +189,9 @@ def train_steps(net, buffer, opt, steps, batch_size, device, rng):
     # (a distribution over slots, ``self_play.td_targets``).
     soft = y_all.ndim == 2
     loss_fn = masked_soft_cross_entropy if soft else masked_cross_entropy
+    if reflect:
+        from .encoder import REFLECTION
+        perm = torch.as_tensor(REFLECTION, device=x_all.device)
 
     net.train()
     losses = []
@@ -187,7 +201,10 @@ def train_steps(net, buffer, opt, steps, batch_size, device, rng):
             np.array([rng.randrange(n) for _ in range(min(batch_size, n))])
         ).to(device)
         opt.zero_grad()
-        loss = loss_fn(net(x_all[idx]), y_all[idx], mask_all[idx])
+        xb = x_all[idx]
+        if reflect:
+            xb, _ = reflect_half(xb, rng, perm)
+        loss = loss_fn(net(xb), y_all[idx], mask_all[idx])
         loss.backward()
         opt.step()
         losses.append(loss.item())
@@ -250,7 +267,8 @@ def run(out_dir, iterations, games, rule_sets=(MVP_RULES,), hidden=(256, 256),
         buffer_rows=None, arena_games=60, seed=0, device=None,
         init_checkpoint=None, backend="auto", threads=0, in_flight=None,
         td_lambda=0.7, search=PLAIN, arena_search=None, lr_schedule=None,
-        conservative=0.0, aggressive=0.0, persona_bias=0.03):
+        conservative=0.0, aggressive=0.0, persona_bias=0.03,
+        reflect_augment=False):
     """``search`` is how self-play searches (``self_play.Search``);
     ``arena_search`` how both sides of the per-iteration matches search
     (default: the same)."""
@@ -262,6 +280,18 @@ def run(out_dir, iterations, games, rule_sets=(MVP_RULES,), hidden=(256, 256),
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     log_path = out / "run.jsonl"
+    from .experiment import identity, write_json
+    write_json(out / "run_meta.json", identity(
+        nets={"init": init_checkpoint} if init_checkpoint else None,
+        rule_sets=[str(r) for r in rule_sets], iterations=iterations,
+        games=games, hidden=hidden, lr=lr, lr_schedule=lr_schedule,
+        batch_size=batch_size, steps=steps, passes=passes,
+        replay_window=replay_window, buffer_rows=buffer_rows,
+        td_lambda=td_lambda, search=search, conservative=conservative,
+        aggressive=aggressive, persona_bias=persona_bias,
+        reflect_augment=reflect_augment, seed=seed,
+        note="weights-only warm start: optimizer, replay and RNG restart"
+             if init_checkpoint else "fresh"))
 
     device = torch.device(device or ("cuda" if torch.cuda.is_available()
                                      else "cpu"))
@@ -305,7 +335,7 @@ def run(out_dir, iterations, games, rule_sets=(MVP_RULES,), hidden=(256, 256),
                     steps_for_passes(len(buffer), passes, replay_window,
                                      batch_size))
         loss = train_steps(net, buffer, opt, it_steps, batch_size, device,
-                           torch_rng)
+                           torch_rng, reflect=reflect_augment)
         samples = it_steps * min(batch_size, len(buffer))
 
         record = {
@@ -317,6 +347,7 @@ def run(out_dir, iterations, games, rule_sets=(MVP_RULES,), hidden=(256, 256),
             "window_iterations": buffer.iterations,
             "td_lambda": td_lambda,
             "lr": it_lr,
+            "reflect_augment": reflect_augment,
             "personas": {"conservative": conservative,
                          "aggressive": aggressive, "bias": persona_bias},
             "search": vars(search) if hasattr(search, "__dict__") else
@@ -375,6 +406,9 @@ def main(argv=None):
                    help="fraction of self-play games with one aggressive seat")
     p.add_argument("--persona-bias", type=float, default=0.03,
                    help="the personas' stop bias, in win probability")
+    p.add_argument("--reflect-augment", action="store_true",
+                   help="mirror half of every training minibatch (columns "
+                        "c <-> 14-c, an exact symmetry of the game)")
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--steps", type=int, default=None,
                    help="fixed optimizer steps per iteration; overrides "
@@ -427,6 +461,7 @@ def main(argv=None):
         conservative=args.conservative,
         aggressive=args.aggressive,
         persona_bias=args.persona_bias,
+        reflect_augment=args.reflect_augment,
         batch_size=args.batch_size,
         steps=args.steps,
         passes=args.passes,

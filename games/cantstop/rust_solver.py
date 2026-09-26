@@ -106,6 +106,13 @@ class RustTurnSolver:
         answer = self._s.should_stop(sorted(state.runners.items()))
         return state.phase == Phase.AWAIT_DECISION and answer
 
+    def stop_roll(self, state):
+        """(stop value, roll-on value) at ``state``'s runners, absolute
+        seats; either is None where it does not exist."""
+        stop, roll = self._s.stop_roll(sorted(state.runners.items()))
+        as_arr = lambda v: None if v is None else np.asarray(v)
+        return as_arr(stop), as_arr(roll)
+
 
 def leaf_features(rust_solver):
     """A Rust solver's leaves as an (N, FEATURE_SIZE) float32 array.

@@ -113,8 +113,14 @@ class NetEvaluator:
     and seat to move, so one rotation serves the whole batch.
     """
 
-    def __init__(self, net, device=None, batch_size=None):
+    def __init__(self, net, device=None, batch_size=None,
+                 mirror_average=False):
+        """``mirror_average``: average each prediction with the prediction
+        for the column-mirrored board. Exactly symmetric by construction,
+        at twice the forward cost -- its own speed/strength comparison
+        (plan review)."""
         self.net = net
+        self.mirror_average = mirror_average
         self.device = torch.device(
             device if device is not None
             else ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -141,11 +147,23 @@ class NetEvaluator:
         step = self.batch_size or 262_144
         for start in range(0, len(features), step):
             x = torch.from_numpy(features[start:start + step]).to(self.device)
-            chunks.append(self.net.win_probs(x).cpu().numpy())
+            probs = self.net.win_probs(x)
+            if self.mirror_average:
+                probs = (probs + self.net.win_probs(
+                    x.index_select(1, self._reflection(x.device)))) / 2
+            chunks.append(probs.cpu().numpy())
         probs = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
         self.calls += 1
         self.rows += len(features)
         return probs
+
+    def _reflection(self, device):
+        from .encoder import REFLECTION
+        cached = getattr(self, "_reflection_idx", None)
+        if cached is None or cached.device != device:
+            cached = torch.as_tensor(REFLECTION, device=device)
+            self._reflection_idx = cached
+        return cached
 
     def evaluate_features(self, features, reference):
         """The same, from already-encoded boards. ``reference`` is any board

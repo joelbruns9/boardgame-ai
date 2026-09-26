@@ -810,6 +810,17 @@ impl TurnSolver {
         Ok(self.nodes[i].stoppable && self.stops[i])
     }
 
+    /// The two sides of a stop-or-roll decision at `key`: the stop value
+    /// (None if stopping is not allowed) and the roll-on value (None for a
+    /// winning configuration, which is never expanded). Absolute seats.
+    pub fn stop_roll(&self, key: RKey) -> Result<(Option<Vec<f64>>, Option<Vec<f64>>), SolveError> {
+        let i = self.node(key)?;
+        let n = self.num_players;
+        let stop = (self.nodes[i].stoppable && self.has_stop[i]).then(|| Self::row(&self.stop_values, i, n));
+        let roll = self.has_roll[i].then(|| Self::row(&self.roll_values, i, n));
+        Ok((stop, roll))
+    }
+
     /// Per-seat values under best play, as `TurnSolver.value`.
     pub fn value(&self, key: RKey, phase: Phase, dice: Option<[u8; 4]>) -> Result<Vec<f64>, SolveError> {
         let n = self.num_players;

@@ -478,6 +478,11 @@ impl PyTurnSolver {
         Ok(self.inner.should_stop(key_in(runners)?)?)
     }
 
+    /// `(stop value or None, roll-on value or None)` at a configuration.
+    fn stop_roll(&self, runners: PyKey) -> PyResult<(Option<Vec<f64>>, Option<Vec<f64>>)> {
+        Ok(self.inner.stop_roll(key_in(runners)?)?)
+    }
+
     #[pyo3(signature = (runners, phase, dice=None))]
     fn value(&self, runners: PyKey, phase: u8, dice: Option<Vec<i64>>) -> PyResult<Vec<f64>> {
         let phase = Phase::from_u8(phase).ok_or_else(|| PyValueError::new_err("bad phase"))?;

@@ -204,3 +204,26 @@ def decode_features(row, active_player):
             state.progress[seat][col] = int(round(
                 float(row[base + i]) * COLUMN_HEIGHTS[col]))
     return state
+
+
+def _reflection_permutation():
+    """Feature index permutation for the column mirror: within every seat
+    slot, the 11 progress entries and the 11 claimed flags reverse (column
+    i <-> 10 - i, i.e. c <-> 14 - c). Seat slots, columns-needed, the
+    present flags and the globals do not move -- turn order matters, so
+    seats are never permuted."""
+    perm = np.arange(FEATURE_SIZE)
+    for slot in range(MAX_SEATS):
+        for block in (0, NUM_COLUMNS):
+            start = slot * PER_SEAT + block
+            idx = np.arange(start, start + NUM_COLUMNS)
+            perm[idx] = idx[::-1]
+    return perm
+
+
+REFLECTION = _reflection_permutation()
+
+
+def reflect_features(features):
+    """Mirror encoded boards (last axis): numpy or torch."""
+    return features[..., REFLECTION]

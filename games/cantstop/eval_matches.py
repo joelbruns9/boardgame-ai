@@ -67,8 +67,12 @@ def main(argv=None):
         print(f"{name:32} {r['wins']}  {r['win_rate']:.3f} "
               f"[{lo:.3f}, {hi:.3f}]  ({r['seconds']}s)", flush=True)
     if args.out:
-        with open(args.out, "w", encoding="utf-8") as fh:
-            json.dump(report, fh, indent=1)
+        from .experiment import identity, write_json
+        write_json(args.out, {
+            "meta": identity(nets={"new": args.new, "old": args.old},
+                             rules=str(rules), games=args.games,
+                             bias=args.bias, seed=args.seed),
+            "matches": report})
 
 
 if __name__ == "__main__":
