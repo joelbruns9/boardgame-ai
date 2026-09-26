@@ -72,6 +72,11 @@ class GraphedForward(torch.nn.Module):
         self.max_rows = int(max_rows)
         self._graphs: dict = {}
         self._failed: set = set()
+        #: Set by the first failed capture. A failure can leave the caching
+        #: allocator recording into the pool ("beginAllocateToPool: already
+        #: recording"), after which every later capture fails too -- so stop
+        #: trying and run eager for the life of this wrapper.
+        self._disabled = False
         self._pool = None
         self.replays = 0
         self.eager_calls = 0
@@ -88,7 +93,8 @@ class GraphedForward(torch.nn.Module):
     def forward(self, batch: dict) -> dict:
         rows = _rows_of(batch)
         if (
-            rows is None
+            self._disabled
+            or rows is None
             or rows > self.max_rows
             or not all(v.is_cuda for v in batch.values())
         ):
@@ -134,6 +140,7 @@ class GraphedForward(torch.nn.Module):
             else contextlib.nullcontext()
         )
         static_in = {name: value.clone() for name, value in padded.items()}
+        original_stream = torch.cuda.current_stream()
         try:
             side = torch.cuda.Stream()
             side.wait_stream(torch.cuda.current_stream())
@@ -144,12 +151,22 @@ class GraphedForward(torch.nn.Module):
             if self._pool is None:
                 self._pool = torch.cuda.graph_pool_handle()
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=self._pool), autocast:
+            # THREAD-LOCAL: the default ("global") mode fails the capture if ANY
+            # other thread in the process makes an unsafe CUDA call meanwhile --
+            # on the box something did, and the capture died with
+            # cudaErrorStreamCaptureInvalidated. Nothing else in the process
+            # touches this model's tensors, so the global guard buys nothing.
+            with torch.cuda.graph(
+                graph, pool=self._pool, capture_error_mode="thread_local"
+            ), autocast:
                 static_out = self.model(static_in)
         except Exception as error:  # noqa: BLE001 -- any failure means eager
+            _recover_from_failed_capture(original_stream, self._pool)
             self._failed.add(key)
-            print(f"cuda graphs: capture failed, running eager for {key[0]} rows: "
-                  f"{type(error).__name__}: {error}", flush=True)
+            self._disabled = True
+            print(f"cuda graphs: capture failed at {key[0]} rows, running EAGER from "
+                  f"now on: {type(error).__name__}: {str(error).splitlines()[0]}",
+                  flush=True)
             return None
         if not isinstance(static_out, dict):
             self._failed.add(key)
@@ -158,6 +175,33 @@ class GraphedForward(torch.nn.Module):
         entry = (graph, static_in, static_out)
         self._graphs[key] = entry
         return entry
+
+
+def _recover_from_failed_capture(original_stream, pool) -> None:
+    """Undo what a failed `torch.cuda.graph` leaves behind.
+
+    Its `__exit__` raises from `capture_end()` BEFORE restoring the thread's
+    stream, so every later op on this thread lands on the dead capture stream
+    ("operation failed due to a previous error during capture"), and the
+    caching allocator is left recording into the pool ("beginAllocateToPool:
+    already recording" on the next capture). Both seen on the box.
+    """
+
+    if pool is not None:
+        try:
+            torch._C._cuda_endAllocateToPool(original_stream.device.index, pool)
+        except Exception:  # noqa: BLE001 -- already ended is fine
+            pass
+    torch.cuda.set_stream(original_stream)
+    # The capture error is still pending and is reported by the NEXT kernel
+    # launch on this thread -- measured: one eager op fails, the one after it
+    # succeeds. Spend that report on a throwaway probe, not on real work.
+    for _ in range(3):
+        try:
+            torch.zeros(1, device=original_stream.device).add_(1).item()
+            return
+        except Exception:  # noqa: BLE001 -- this IS the pending error
+            continue
 
 
 def _rows_of(batch: dict):

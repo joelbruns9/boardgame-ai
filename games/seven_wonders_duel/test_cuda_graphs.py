@@ -91,3 +91,56 @@ def test_adapter_graphs_agree_with_eager_within_bf16_noise():
             assert abs(a[0] - b[0]) < 3e-2
             assert max(abs(p - q) for p, q in zip(a[1], b[1])) < 3e-2
     assert graphed._model.replays >= 3
+
+
+@cuda
+def test_capture_survives_another_thread_using_cuda():
+    """The box's failure: a second thread's CUDA call mid-capture.
+
+    In the default "global" capture mode this invalidated the capture and left
+    the allocator recording into the pool, so every later capture failed too.
+    """
+
+    import threading
+
+    model = _RowModel().cuda().eval()
+    graphed = GraphedForward(model)
+    stop = threading.Event()
+
+    def noisy():
+        while not stop.is_set():
+            torch.zeros(1, device="cuda").item()
+
+    thread = threading.Thread(target=noisy)
+    thread.start()
+    try:
+        with torch.no_grad():
+            for rows in (3, 40, 100, 300, 3):
+                batch = {"x": torch.randn(rows, 6, 4, device="cuda")}
+                torch.testing.assert_close(graphed(batch)["y"], model(batch)["y"])
+    finally:
+        stop.set()
+        thread.join()
+    assert graphed.eager_calls == 0 and graphed.replays == 5
+
+
+class _SyncingModel(_RowModel):
+    """Illegal under capture: reads a device value back to the host."""
+
+    def forward(self, batch):
+        if float(batch["x"].sum()) > 1e9:
+            raise AssertionError("unreachable")
+        return super().forward(batch)
+
+
+@cuda
+def test_failed_capture_disables_graphs_and_stays_correct():
+    model = _SyncingModel().cuda().eval()
+    graphed = GraphedForward(model)
+    with torch.no_grad():
+        for rows in (3, 40, 3):
+            batch = {"x": torch.randn(rows, 6, 4, device="cuda")}
+            torch.testing.assert_close(graphed(batch)["y"], model(batch)["y"])
+        # And CUDA still works afterwards: no allocator left recording.
+        torch.zeros(4, device="cuda").sum().item()
+    assert graphed.captures == 0 and graphed.eager_calls == 3
