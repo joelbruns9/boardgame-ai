@@ -535,13 +535,22 @@ def feasible(plan: Plan, sheet: "Sheet") -> bool:
         return not any(sheet.top_fences[plan.params[0]])
 
     if kind is PlanKind.EXTREMITIES:
+        # ⚠ Review F1: an empty extremity is dead only if NO house can reach it
+        # -- no number (span, allowing a roundabout elsewhere), no bis, AND no
+        # roundabout placed IN it.  `available_locations(None)` ignores numeric
+        # fit, so while a roundabout is left, every empty box can be built on.
         spans = sheet.span_if_roundabout()
+        roundabout_left = sheet.can_build_roundabout()
         for x, y in EXTREMITY_POSITIONS:
             if sheet.top_fences[x][y]:
                 return False
             if sheet.numbers[x][y] is not None:
                 continue
-            if spans[x][y] == 0 and not sheet.bis_reachable(x, y):
+            if (
+                spans[x][y] == 0
+                and not sheet.bis_reachable(x, y)
+                and not roundabout_left
+            ):
                 return False
         return True
 
@@ -628,9 +637,9 @@ def requirements(plan: Plan, sheet: "Sheet") -> Requirements:
         reach = sheet.bis_reach()
         counts = sheet.bis_count_per_street()
         for x in range(NUM_STREETS):
+            bis[x] = max(0, 5 - counts[x])
             if counts[x] + reach[x] >= 5:
                 serves[x] = 1
-                bis[x] = max(0, 5 - counts[x])
 
     elif kind is PlanKind.SEVEN_TEMP:
         temps_needed = max(0, 7 - sheet.temps)
@@ -638,29 +647,33 @@ def requirements(plan: Plan, sheet: "Sheet") -> Requirements:
 
     elif kind is PlanKind.COMPLETE_STREET:
         for x in range(NUM_STREETS):
+            parks[x] = PARK_BOXES[x] - sheet.parks[x]
+            pools[x] = 3 - sheet.pools[x]
+            roundabout[x] = 0 if sheet.has_roundabout_in_street(x) else 1
             if sheet.pools[x] + _pool_boxes_alive(sheet, x) < 3:
                 continue
             if not sheet.has_roundabout_in_street(x) and not sheet.can_build_roundabout():
                 continue
             serves[x] = 1
-            parks[x] = PARK_BOXES[x] - sheet.parks[x]
-            pools[x] = 3 - sheet.pools[x]
-            roundabout[x] = 0 if sheet.has_roundabout_in_street(x) else 1
 
     elif kind is PlanKind.DECORATIVE:
         what = plan.params[0]
         streets = range(NUM_STREETS) if what != "pool&park" else (plan.params[1],)
         wants_pool = what in ("pool", "pool&park")
         for x in streets:
-            if wants_pool and sheet.pools[x] + _pool_boxes_alive(sheet, x) < 3:
-                continue
-            serves[x] = 1
             if what in ("park", "pool&park"):
                 parks[x] = PARK_BOXES[x] - sheet.parks[x]
             if wants_pool:
                 pools[x] = 3 - sheet.pools[x]
+            if wants_pool and sheet.pools[x] + _pool_boxes_alive(sheet, x) < 3:
+                continue
+            serves[x] = 1
     else:
         raise NotImplementedError(f"plan {plan.id} belongs to an unsupported expansion")
+
+    # ⚠ Review F4: every branch above states a street's remaining work BEFORE
+    # testing that street's aliveness -- a dead alternative still wants what it
+    # wants, and only `street_serves` carries the verdict.
 
     if done:
         # A completed plan wants nothing.

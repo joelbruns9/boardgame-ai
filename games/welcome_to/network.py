@@ -79,14 +79,6 @@ PER_SEAT_HEAD_TARGETS: tuple[str, ...] = tuple(
     for name in training.PER_SEAT_TARGETS
     if name != "seat_valid" and not name.endswith("_mask")
 )
-LEGACY_PER_SEAT_HEAD_TARGETS: tuple[str, ...] = tuple(
-    name
-    for name in training.LEGACY_PER_SEAT_TARGETS
-    if name != "seat_valid" and not name.endswith("_mask")
-)
-assert PER_SEAT_HEAD_TARGETS[: len(LEGACY_PER_SEAT_HEAD_TARGETS)] == (
-    LEGACY_PER_SEAT_HEAD_TARGETS
-)
 #: Global regression outputs, in head order.  ``rank_logits`` is separate: it is
 #: a masked softmax over finishing positions, not a regression.
 GLOBAL_HEAD_TARGETS: tuple[str, ...] = ("turns_left",)
@@ -471,54 +463,20 @@ def require_encoder_abi(blob: Mapping[str, object], path: object = "<checkpoint>
         )
 
 
-def load_state_dict_compatible(
-    model: WelcomeToNet, state_dict: Mapping[str, Tensor]
-) -> bool:
-    """Load current weights, expanding the pre-plan-head output layer if needed.
+def load_state_dict_strict(model: WelcomeToNet, state_dict: Mapping[str, Tensor]) -> None:
+    """Load weights whose every tensor matches the current network exactly.
 
-    The new binary outputs are appended, so every historical output retains its
-    row exactly. New rows start at a deterministic neutral logit of zero.
-    Returns whether a legacy expansion was performed.
+    The pre-plan-head expansion that used to live here (zero rows appended for
+    the new binary heads) is gone, review 2026-09-25: every checkpoint that
+    needed it predates the encoder-ABI stamp and is refused by
+    :func:`require_encoder_abi` first.  A matching ABI means current shapes.
     """
     expected = model.state_dict()
-    mismatched = {
+    mismatched = sorted(
         name
         for name, value in state_dict.items()
         if name in expected and value.shape != expected[name].shape
-    }
-    if not mismatched:
-        model.load_state_dict(state_dict)
-        return False
-
-    final_index = max(
-        index
-        for index, module in enumerate(model.per_seat_head)
-        if isinstance(module, nn.Linear)
     )
-    expandable = {
-        f"per_seat_head.{final_index}.weight",
-        f"per_seat_head.{final_index}.bias",
-    }
-    if mismatched != expandable:
-        raise RuntimeError(
-            f"checkpoint has incompatible tensor shapes for {sorted(mismatched)}"
-        )
-
-    migrated = dict(state_dict)
-    old_rows = len(LEGACY_PER_SEAT_HEAD_TARGETS)
-    new_rows = len(PER_SEAT_HEAD_TARGETS)
-    for name in expandable:
-        old = state_dict[name]
-        target = expected[name]
-        if old.shape[0] != old_rows or target.shape[0] != new_rows or (
-            old.ndim > 1 and old.shape[1:] != target.shape[1:]
-        ):
-            raise RuntimeError(
-                f"checkpoint tensor {name} cannot expand from {tuple(old.shape)} "
-                f"to {tuple(target.shape)}"
-            )
-        expanded = torch.zeros_like(target)
-        expanded[:old_rows].copy_(old)
-        migrated[name] = expanded
-    model.load_state_dict(migrated)
-    return True
+    if mismatched:
+        raise RuntimeError(f"checkpoint has incompatible tensor shapes for {mismatched}")
+    model.load_state_dict(state_dict)

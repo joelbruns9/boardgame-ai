@@ -29,7 +29,7 @@ DESIGN CONTRACT
    returns four arrays::
 
        sheet_planes    (4, 22, 3, 12)   one block per seat, identical function
-       sheet_scalars   (4, 196)         one block per seat, identical function
+       sheet_scalars   (4, 194)         one block per seat, identical function
        viewer_plane    (1, 3, 12)       phase scratch, viewer only
        global_scalars  (367,)           game-wide and viewer-relative
 
@@ -52,8 +52,8 @@ DESIGN CONTRACT
 6. **Training-isolated.**  Nothing here imports a heuristic evaluator.
 
 ``ENCODER_V3_SPEC.md`` is the spec of record and this module implements its §12
-step 5: every plane and block at **22 planes / 196 per-sheet / 367 global**,
-ABI 1 -> 2.  Section references below are to that document.
+step 5: every plane and block at **22 planes / 194 per-sheet / 367 global**,
+ABI 3 after the 2026-09-25 review corrections.  Section references below are to that document.
 
 ⚠ **§6.4 DEMOTED (2026-09-25, user's call).**  ``can_complete_this_turn`` and
 ``p_complete_next_turn`` were 96.5% of encode time (25 ms median / 2.8 s max vs
@@ -89,7 +89,6 @@ from games.welcome_to import deck_knowledge as dk
 from games.welcome_to.constants import (
     BIS_BOXES,
     CARD_NUMBERS,
-    DECK_EFFECT_ORDER,
     EPS,
     ESTATE_ROW_BOXES,
     ESTATE_ROW_SCORES,
@@ -115,6 +114,7 @@ from games.welcome_to.constants import (
 from games.welcome_to.game import (
     GameState,
     Phase,
+    _numbers_for,
     bis_usable,
     max_houses_this_turn,
 )
@@ -141,7 +141,11 @@ MAX_OPPONENTS: int = MAX_SEATS - 1
 #
 # 2: ENCODER_V3_SPEC.md step 5.  A hard break -- no checkpoint migration, no WTS
 #    back-compatibility, no legacy head zero-fill (§0.4).
-ENCODER_ABI_VERSION: int = 2
+# 3: review 2026-09-25 corrections -- F2 empty-gap fit, F3 the viewer's
+#    reshuffle vote, F4 dead-street demand, F5 phase-aware houses, F6 card
+#    pairing, §8 rescue/best-roundabout semantics, and `reshuffle_contraction`
+#    8 -> 6 (SPEC GAP 2).  ABI 2 was never trained on.
+ENCODER_ABI_VERSION: int = 3
 #: Width of the seat-index one-hot.
 MAX_PLAYERS: int = 6
 
@@ -228,7 +232,7 @@ SHEET_SCALAR_BLOCKS: tuple[tuple[str, int], ...] = (
     ("total_span", 1),
     ("plans", 3 * 34),              # §3.4, minus the §6.4 threat pair
     ("demand", 24),                 # §7.2
-    ("reshuffle_contraction", 8),   # §7.3
+    ("reshuffle_contraction", 6),   # §7.3 (SPEC GAP 2: two duplicates dropped)
     ("refusal", 5),                 # §8
     ("houses_this_turn", 2),        # §8
     ("plan_conflict_seat", 9),      # §9.2a
@@ -331,7 +335,7 @@ class _DeckView:
         "deck_prefix", "reshuffled_prefix", "deck_total", "reshuffled_total",
         "deck_numbers", "reform_numbers", "deck_effects", "reshuffled_numbers",
         "reshuffled_effects", "effect_rate", "next_effects", "next_is_temp",
-        "joint", "deck_matrix", "reshuffled_matrix",
+        "deck_matrix", "reshuffled_matrix", "viewer_voted",
     )
 
     def __init__(self, state: GameState, viewer: int) -> None:
@@ -355,26 +359,43 @@ class _DeckView:
         self.reform_numbers = dk.boundary_pool_composition(state, viewer).sum(axis=1)
 
         self.effect_rate = dk.effect_supply_rate(state, viewer)
+        # ⚠ R5 #3 / review F3: the viewer's OWN yes vote queues a reshuffle,
+        # which redraws `stack_new` -- so the effects on show will never be
+        # offered and the next numbers come from the reshuffled pool.  Only the
+        # viewer's own vote is readable; `reshuffle_next_turn` would leak an
+        # earlier actor's hidden one.
+        self.viewer_voted = bool(state.reshuffle_vote_for(viewer))
         self.next_effects = list(state.next_effects(viewer))
         self.next_is_temp = tuple(e is Effect.TEMP for e in self.next_effects)
 
-        # The ordered joint over next turn's three NUMBERS, reforming mid-draw,
-        # as exact integer numerators over one denominator (see
-        # `dk.ordered_draw_counts` for why never the float joint).  Built
-        # lazily; §8's refusal block needs it on every sheet anyway.
-        self.joint: Optional[tuple[np.ndarray, float]] = None
+    # -- next turn's draws --------------------------------------------------
+    def next_numbers_all_in(self, mask) -> float:
+        """P(all three of next turn's NUMBERS land in ``mask``) -- effects unused.
 
-    def ordered_joint(self) -> tuple[np.ndarray, float]:
-        if self.joint is None:
-            self.joint = dk.ordered_draw_counts(
-                self.deck_numbers, self.reform_numbers
+        Without a vote: the literal boundary draw, reforming mid-draw.  With
+        the viewer's vote: the numbers are the second triple drawn from the
+        reshuffled pool, which by exchangeability is any three of it.
+        """
+        masks = (mask, mask, mask)
+        if self.viewer_voted:
+            return dk.next_draw_probability(
+                self.reshuffled_numbers, np.zeros(_NUM_NUMBERS), masks
             )
-        return self.joint
+        return dk.next_draw_probability(self.deck_numbers, self.reform_numbers, masks)
 
-    def draw_probability(self, masks) -> float:
-        """P(stack ``i``'s next number is in ``masks[i]``, for all three)."""
-        num, den = self.ordered_joint()
-        return dk.draw_probability(num, den, masks)
+    def next_stacks_all_in(self, mask_non_temp, mask_temp) -> float:
+        """P(every stack lands in its mask), the mask depending on its effect.
+
+        Without a vote, each stack's effect is printed and known.  With it, the
+        effects are unknown and marginalised by :func:`dk.two_triple_probability`
+        -- a stated approximation (independent effect and number triples).
+        """
+        if self.viewer_voted:
+            return dk.two_triple_probability(
+                self.reshuffled_matrix, mask_non_temp, mask_temp
+            )
+        masks = [mask_temp if temp else mask_non_temp for temp in self.next_is_temp]
+        return dk.next_draw_probability(self.deck_numbers, self.reform_numbers, masks)
 
     # -- interval lookups ---------------------------------------------------
     def fit_deck(self, low: int, high: int) -> float:
@@ -387,73 +408,40 @@ class _DeckView:
         count = dk.count_in_open_interval(self.reshuffled_prefix, low, high)
         return _ratio(float(count), self.reshuffled_total)
 
-    def deck_count(self, low: int, high: int) -> int:
-        return dk.count_in_open_interval(self.deck_prefix, low, high)
+
+def _gap_is_empty(low: int, high: int) -> bool:
+    """No integer strictly between the bounds -- nothing can EVER go here.
+
+    ⚠ Review F2: the temp widening ``(low - 2, high + 2)`` is valid only when the
+    gap itself holds a legal value.  ``7 _ 8`` takes no number at all, temp or
+    not, so widening it made printed 6..9 look useful.
+    """
+    return high - low <= 1
+
+
+def _interval_miss(low: int, high: int) -> list[int]:
+    """Over printed numbers 1..15: 1 where ``n`` is NOT in ``(low, high)``."""
+    return [0 if low < n < high else 1 for n in CARD_NUMBERS]
 
 
 def _p_fit_next_turn(view: _DeckView, low: int, high: int) -> float:
     """§7.5.  P(some stack next turn reveals a number fitting this gap).
 
-    Next turn's three *effects* are printed and known, so the only chance is the
-    three numbers.  Per stack ``i``, the fitting set is an interval::
+    Per stack, the fitting set is ``(low - 2, high + 2)`` if its effect is TEMP,
+    else ``(low, high)`` -- exclusive bounds, matching planes 15 and 14.  The
+    answer is ``1 - P(every stack misses)``, by the exact integer
+    inclusion-exclusion of :func:`dk.masked_draw_numerator` (never a product of
+    marginals), reforming mid-draw when ``D < 3``.
 
-        F_i = (low - 2, high + 2)   if stack i's known effect is TEMP
-              (low,     high)       otherwise
-
-    -- exclusive bounds, matching planes 15 and 14 exactly.  With ``x_i[n] = 1``
-    when ``n`` misses ``F_i``, ``M_i = sum x_i[n] c[n]``,
-    ``P_ij = sum x_i x_j c[n]`` and ``R = sum x_1 x_2 x_3 c[n]``::
-
-        none = M1*M2*M3 - P12*M3 - P13*M2 - P23*M1 + 2R
-
-    which is inclusion-exclusion over the three "two draws took the same card"
-    events, and ``2R`` because subtracting the three pairs removes the all-equal
-    case three times where it was counted once.  Falling factorials, never a
-    product of marginals.
-
-    The two intervals are NESTED (``F_notemp`` is a subset of ``F_temp``), so a
-    union of any subset of them is simply the widest member -- which is what
-    makes every ``P_ij`` and ``R`` one more prefix-sum lookup rather than a new
-    enumeration.  O(1) per gap.
-
-    ⚠ **R4: ``D < 3`` must NOT emit 0.0.**  The next reveal still produces three
-    cards -- ``_draw`` reforms the discard mid-draw and carries on -- so the true
-    probability is generally non-zero, and 0 would state a falsehood at exactly
-    the moment a dead-looking gap comes back to life.  Below three cards this
-    falls through to the literal boundary-draw enumeration, which reforms.
+    ⚠ An empty gap emits 0 (review F2).  ⚠ After the viewer's own yes vote the
+    effects are unknown and the pool is the reshuffled one (review F3).
     """
-    fit_notemp = view.deck_count(low, high)
-    fit_temp = view.deck_count(low - 2, high + 2)
-    fits = [fit_temp if temp else fit_notemp for temp in view.next_is_temp]
-
-    total = view.deck_total
-    if total >= 3.0:
-        misses = [total - f for f in fits]
-        # union of nested intervals == the wider one
-        p12 = total - max(fits[0], fits[1])
-        p13 = total - max(fits[0], fits[2])
-        p23 = total - max(fits[1], fits[2])
-        r = total - max(fits)
-        none = (
-            misses[0] * misses[1] * misses[2]
-            - p12 * misses[2]
-            - p13 * misses[1]
-            - p23 * misses[0]
-            + 2.0 * r
-        )
-        denom = total * (total - 1.0) * (total - 2.0)
-        return min(1.0, max(0.0, 1.0 - none / max(denom, EPS)))
-
-    # D < 3: the draw reforms mid-way, so enumerate it literally.
-    masks = []
-    for temp in view.next_is_temp:
-        lo, hi = (low - 2, high + 2) if temp else (low, high)
-        miss = np.ones(_NUM_NUMBERS, dtype=np.float64)
-        for i, n in enumerate(CARD_NUMBERS):
-            if lo < n < hi:
-                miss[i] = 0.0
-        masks.append(miss)
-    return min(1.0, max(0.0, 1.0 - view.draw_probability(masks)))
+    if _gap_is_empty(low, high):
+        return 0.0
+    miss = view.next_stacks_all_in(
+        _interval_miss(low, high), _interval_miss(low - 2, high + 2)
+    )
+    return min(1.0, max(0.0, 1.0 - miss))
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -614,7 +602,7 @@ def _sheet_planes(
             if cached is None:
                 cached = (
                     view.fit_deck(low, high),
-                    view.fit_deck(low - 2, high + 2),
+                    0.0 if _gap_is_empty(low, high) else view.fit_deck(low - 2, high + 2),
                     view.fit_reshuffled(low, high),
                     _p_fit_next_turn(view, low, high),
                 )
@@ -949,16 +937,15 @@ def _card_demand(sheet: Sheet, with_temp: bool) -> np.ndarray:
 def _reshuffle_contraction(
     sheet: Sheet, effect_demand: np.ndarray, view: _DeckView, w: _Writer
 ) -> None:
-    """§7.3's 8 floats: does the post-reshuffle deck fit my holes better?
+    """§7.3's 6 floats: does the post-reshuffle deck fit my holes better?
 
-    ⚠ **SPEC GAP 2.**  §7.3 lays the block out as
-    ``notemp/temp x number/effect x deck/reshuffled = 8``, but ``eff_rate`` does
-    not read the card-demand vector at all, so the two effect entries of the
-    temp half are **equal by construction** to those of the no-temp half.  The
-    literal layout is kept -- the block width and the field order are what Rust
-    must match, and silently emitting 6 would desynchronise the two
-    implementations -- but those two floats carry no information.  Worth
-    revisiting when the block is next opened.
+    Layout: ``fit, eff`` against the deck, ``fit, eff`` against the reshuffled
+    pool (no temp), then ``fit`` against each with temp.
+
+    SPEC GAP 2, resolved by review (2026-09-25): the literal
+    ``notemp/temp x number/effect x deck/reshuffled = 8`` carried two exact
+    duplicates -- ``eff_rate`` never reads card demand, so the temp half's two
+    effect entries equalled the no-temp half's.  They are dropped.
     """
     def fit_rate(demand: np.ndarray, supply: np.ndarray) -> float:
         total = float(supply.sum())
@@ -983,152 +970,145 @@ def _reshuffle_contraction(
         norm = float(supply.sum()) * demand_total
         return _ratio(weighted, norm)
 
-    for with_temp in (False, True):
-        demand = _card_demand(sheet, with_temp)
-        for supply_numbers, supply_effects in (
-            (view.deck_numbers, view.deck_effects),
-            (view.reshuffled_numbers, view.reshuffled_effects),
-        ):
-            w.put(fit_rate(demand, supply_numbers), eff_rate(supply_effects))
+    plain = _card_demand(sheet, with_temp=False)
+    w.put(
+        fit_rate(plain, view.deck_numbers),
+        eff_rate(view.deck_effects),
+        fit_rate(plain, view.reshuffled_numbers),
+        eff_rate(view.reshuffled_effects),
+    )
+    temp = _card_demand(sheet, with_temp=True)
+    w.put(fit_rate(temp, view.deck_numbers), fit_rate(temp, view.reshuffled_numbers))
 
 
-def _writable_values(sheet: Sheet) -> list[bool]:
-    """Per value 0..17, whether it has any legal box -- one scan per sheet.
+def _miss_masks_from(writable: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Over printed numbers 1..15: 1 where a card has NO legal write.
 
-    ``bool(sheet.available_locations(v))`` exactly, precomputed because §8 asks
-    it ~200 times per sheet.
+    ``writable`` is a :meth:`Sheet.writable_mask`.  Returns ``(non-TEMP effect,
+    TEMP effect)`` -- TEMP is the only effect that changes which values a card
+    can be written as, so these two cover every stack.
     """
-    return [bool(sheet.available_locations(v)) for v in range(NUM_NUMBER_VALUES)]
+    non_temp = tuple(0 if writable >> n & 1 else 1 for n in CARD_NUMBERS)
+    temp = tuple(
+        0 if any(writable >> v & 1 for v in _numbers_for(n, Effect.TEMP)) else 1
+        for n in CARD_NUMBERS
+    )
+    return non_temp, temp
 
 
-def _playable_sets(
-    state: GameState, sheet: Sheet, view: _DeckView
-) -> tuple[list[np.ndarray], np.ndarray]:
-    """Per stack, which printed numbers would give it a legal write next turn.
+def _future_roundabout_masks(state: GameState, sheet: Sheet) -> list[int]:
+    """Writable masks after every roundabout a FUTURE turn could open.
 
-    Returns ``(per-stack masks, printed-only mask)``.  Each mask is over
-    :data:`CARD_NUMBERS` and holds 1.0 where the number is **unplayable**, which
-    is the form §8's probabilities contract against.
+    Legal at a fresh turn start when the variant has roundabouts, one is left
+    and a box is free -- the guard ``legal_actions`` applies before a write.
     """
-    writable = _writable_values(sheet)
-    miss: list[np.ndarray] = []
-    for effect in view.next_effects:
-        m = np.ones(_NUM_NUMBERS, dtype=np.float64)
-        if effect is not None:
-            for i, n in enumerate(CARD_NUMBERS):
-                for v in state.numbers_for(n, effect):
-                    if writable[v]:
-                        m[i] = 0.0
-                        break
-        miss.append(m)
-
-    printed = np.ones(_NUM_NUMBERS, dtype=np.float64)
-    for i, n in enumerate(CARD_NUMBERS):
-        if writable[n]:
-            printed[i] = 0.0
-    return miss, printed
+    if not (
+        state.config.advanced and sheet.can_build_roundabout() and sheet.has_free_box()
+    ):
+        return []
+    return sheet.roundabout_writable_masks()
 
 
-def _joint_miss(view: _DeckView, masks: list[np.ndarray]) -> float:
-    """P(every stack's number falls in its own miss set), over the ordered draw."""
-    return view.draw_probability(masks)
+def _roundabout_legal_now(
+    state: GameState, viewer: int, seat: int, sheet: Sheet
+) -> bool:
+    """Is ``ROUNDABOUT_OPEN`` (or its placement) legal for this seat THIS turn?
 
-
-def _best_roundabout_sheet(state: GameState, sheet: Sheet) -> Optional[Sheet]:
-    """The sheet after the "best" single roundabout, or ``None`` if none is legal.
-
-    ⚠ **SPEC GAP 3.**  §8 says "given the best legal roundabout placement" and
-    does not say best *for what*.  Choosing the placement that minimises the
-    refusal probability itself would be an optimisation over ~33 sites, each
-    costing a full joint contraction, on every sheet of every encoded state.
-    Resolved as: **the placement maximising total placement capacity, tie-broken
-    by lowest ``(street, box)``** -- the same quantity
-    :meth:`Sheet.capacity_if_roundabout` already maximises, so the refusal block
-    and the ``roundabout_repair`` scalars agree about which roundabout they are
-    talking about.
+    For the viewer who is acting, from their own turn context -- after a write,
+    a placed roundabout or a declined one, it is not.  Every other seat is read
+    as a hypothetical start of turn on the sheet this viewer may see: their
+    mid-turn context is private, and a start-of-turn reading is symmetric.
     """
-    if not (state.config.advanced and sheet.can_build_roundabout()):
-        return None
-    if not sheet.has_free_box():
-        return None
-    best: Optional[Sheet] = None
-    best_key = -1
-    for x, size in enumerate(STREET_SIZES):
-        for y in range(size):
-            if sheet.numbers[x][y] is not None:
-                continue
-            candidate = sheet.copy()
-            candidate.build_roundabout((x, y), turn=0)
-            total = sum(candidate.placement_capacity())
-            if total > best_key:
-                best, best_key = candidate, total
-    return best
+    if not (
+        state.config.advanced and sheet.can_build_roundabout() and sheet.has_free_box()
+    ):
+        return False
+    if seat == viewer == state.actor:
+        if state.phase is Phase.ROUNDABOUT_PLACE:
+            return True
+        return (
+            state.phase is Phase.CHOOSE_CARDS
+            and state.ctx.last_house is None
+            and not state.ctx.roundabout_declined
+        )
+    return True
+
+
+def _rescue_this_turn(state: GameState, viewer: int, seat: int, sheet: Sheet) -> bool:
+    """§8 ``roundabout_rescue_available``: would a legal roundabout, now, give an
+    offer that has no legal write one?  Existential over placements."""
+    if not _roundabout_legal_now(state, viewer, seat, sheet):
+        return False
+    writable = sheet.writable_mask()
+    blocked = [
+        (n, e)
+        for n, e in state.visible_cards(viewer)
+        if n is not None
+        and e is not None
+        and not any(writable >> v & 1 for v in _numbers_for(n, e))
+    ]
+    if not blocked:
+        return False
+    for after in sheet.roundabout_writable_masks():
+        if any(any(after >> v & 1 for v in _numbers_for(n, e)) for n, e in blocked):
+            return True
+    return False
 
 
 def _refusal_block(
-    state: GameState, sheet: Sheet, view: _DeckView, w: _Writer
+    state: GameState,
+    viewer: int,
+    seat: int,
+    sheet: Sheet,
+    view: _DeckView,
+    w: _Writer,
 ) -> None:
     """§8's 5 floats.  A refusal is a CHOICE, so these are its factual inputs.
 
-    The first three are exact for next turn, because next turn's effects are
-    printed and known; beyond that the steady-state term uses §9.3's rate.  Not
-    derivable from planes 14/15: those are per-gap, these are a **union across
-    gaps with overlapping number ranges**, needing inclusion-exclusion -- which
-    is what the ordered joint supplies.
+    1. ``p_no_slot_playable`` -- next turn, no stack has a legal write.
+    2. ``p_no_slot_playable_after_roundabout`` -- the same after the BEST
+       roundabout decision, declining included.  SPEC GAP 3 as resolved by
+       review: "best" is lowest refusal probability over every legal placement.
+    3. ``p_printed_unplaceable`` -- some stack's printed number has nowhere to go.
+    4. ``roundabout_rescue_available`` -- THIS turn (§3.2 as resolved): a legal
+       ``ROUNDABOUT_OPEN`` would make a currently unplayable offer playable.
+    5. ``p_forced_refusal_steady`` -- (2) at a typical future turn.
+
+    1-3 follow the viewer's own reshuffle vote (review F3).  5 pairs each
+    stack's number with a DIFFERENT card's effect, as the game does (review
+    F6), via :func:`dk.two_triple_probability` -- a stated approximation.
+
+    Placements are deduplicated by the miss masks they produce, and visited in
+    sorted mask order, so the minimum is order-free and Rust can match it.
     """
-    miss, printed_miss = _playable_sets(state, sheet, view)
-    w.put(_joint_miss(view, miss))
+    non_temp, temp = _miss_masks_from(sheet.writable_mask())
+    candidate_masks = sorted(
+        {_miss_masks_from(m) for m in set(_future_roundabout_masks(state, sheet))}
+    )
 
-    after = _best_roundabout_sheet(state, sheet)
-    if after is None:
-        p_after = _joint_miss(view, miss)
-        rescue = 0.0
-    else:
-        miss_after, _ = _playable_sets(state, after, view)
-        p_after = _joint_miss(view, miss_after)
-        # "would change playable_slots()": some stack that had no legal write
-        # now has one.
-        rescue = float(
-            any(
-                bool((a < b).any())
-                for a, b in zip(miss_after, miss)
-            )
-        )
-    w.put(p_after)
+    p_now = view.next_stacks_all_in(non_temp, temp)
+    p_after = p_now
+    for masks in candidate_masks:
+        p_after = min(p_after, view.next_stacks_all_in(masks[0], masks[1]))
+    w.put(p_now, p_after)
 
-    # P(at least one stack's PRINTED number has nowhere to go) -- what opens the
-    # voluntary refusal.  The printed number carries no temp widening.
-    all_placeable = _joint_miss(view, [1.0 - printed_miss] * 3)
-    w.put(min(1.0, max(0.0, 1.0 - all_placeable)))
+    placeable = [1 - m for m in non_temp]
+    w.put(min(1.0, max(0.0, 1.0 - view.next_numbers_all_in(placeable))))
 
-    w.put(rescue)
+    w.put(1.0 if _rescue_this_turn(state, viewer, seat, sheet) else 0.0)
 
-    # p_forced_refusal_steady: the post-roundabout refusal at the steady-state
-    # deck, where next turn's effects are NOT known.  Each of the three cards is
-    # then an ordinary draw carrying its own printed effect, so "all three
-    # unplayable" is a hypergeometric over the set of unplayable CARDS -- exact
-    # without replacement, and not the banned `1 - (1-p)**3`.
-    steady_sheet = after if after is not None else sheet
-    matrix = view.deck_matrix
-    total = float(matrix.sum())
-    if total < 3.0:
-        matrix = view.reshuffled_matrix
-        total = float(matrix.sum())
-    steady_writable = _writable_values(steady_sheet)
-    unplayable = 0.0
-    for i, n in enumerate(CARD_NUMBERS):
-        for effect in DECK_EFFECT_ORDER:
-            count = float(matrix[i, _EFFECT_INDEX[effect]])
-            if count <= 0.0:
-                continue
-            if not any(steady_writable[v] for v in state.numbers_for(n, effect)):
-                unplayable += count
-    if total < 3.0:
+    # Steady state: the current deck if it can supply a whole turn's six
+    # cards, else the pool it will reform from.
+    population = view.deck_matrix
+    if float(population.sum()) < 6.0:
+        population = view.reshuffled_matrix
+    if float(population.sum()) < 3.0:
         w.put(0.0)
-    else:
-        num = unplayable * max(unplayable - 1.0, 0.0) * max(unplayable - 2.0, 0.0)
-        den = total * (total - 1.0) * (total - 2.0)
-        w.put(_ratio(num, den))
+        return
+    steady = dk.two_triple_probability(population, non_temp, temp)
+    for masks in candidate_masks:
+        steady = min(steady, dk.two_triple_probability(population, masks[0], masks[1]))
+    w.put(steady)
 
 
 def _selected_estates(plan: Plan, sheet: Sheet) -> Optional[list[tuple[int, int]]]:
@@ -1210,7 +1190,7 @@ def _plan_conflict_seat(
 def _sheet_scalars(
     state: GameState, viewer: int, seat: int, view: _DeckView
 ) -> np.ndarray:
-    """One seat's 196 flat features, by the same function for every seat.
+    """One seat's 194 flat features, by the same function for every seat.
 
     Every read goes through a viewer-safe accessor -- ``sheet_for``,
     ``score_breakdown(..., viewer=)``, ``plan_turns_for`` -- so this is symmetric
@@ -1278,11 +1258,11 @@ def _sheet_scalars(
     effect_demand = _effect_demand(state, sheet, viewer, seat)
     w.put_array(effect_demand)
 
-    # reshuffle contraction (8) -- §7.3
+    # reshuffle contraction (6) -- §7.3
     _reshuffle_contraction(sheet, effect_demand, view, w)
 
     # refusal and blocking (5) -- §8
-    _refusal_block(state, sheet, view, w)
+    _refusal_block(state, viewer, seat, sheet, view, w)
 
     # houses this turn (2) -- §8
     w.put(
@@ -1365,8 +1345,14 @@ def _global_scalars(state: GameState, viewer: int, view: _DeckView) -> np.ndarra
         1.0 if state.reshuffle_vote_for(viewer) else 0.0,
     )
 
-    # NEXT TURN'S EFFECTS: known now, one-hot per stack
-    w.put_array(dk.known_next_effects(state, viewer))
+    # NEXT TURN'S EFFECTS: known now, one-hot per stack -- unless the viewer's
+    # own yes vote has queued a reshuffle, which redraws them (review F3).  The
+    # rows are then all-zero: "unknown", with `reshuffle_race`'s vote flag as
+    # the reason.
+    if view.viewer_voted:
+        w.skip(3 * _NUM_EFFECTS)
+    else:
+        w.put_array(dk.known_next_effects(state, viewer))
 
     # WHAT IS COMING: the deck is exact bookkeeping, not an estimate
     deck = view.deck_matrix

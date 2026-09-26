@@ -267,17 +267,7 @@
       " turns left";
     box.appendChild(foot);
 
-    // Heads this checkpoint never trained come back as an exact 0.5. Saying so
-    // is the difference between a diagnostic and a mirage.
-    if (f.untrained_heads && f.untrained_heads.length) {
-      const stale = document.createElement("div");
-      stale.className = "wto-adv-fc-stale";
-      stale.textContent =
-        "untrained in this checkpoint: " + f.untrained_heads.join(", ");
-      box.appendChild(stale);
-    } else {
-      box.appendChild(planStrip(pub, f));
-    }
+    box.appendChild(planStrip(pub, f));
   }
 
   function stacksStrip(pub) {

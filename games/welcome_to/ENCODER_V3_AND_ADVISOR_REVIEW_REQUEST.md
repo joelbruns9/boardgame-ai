@@ -284,4 +284,66 @@ Full suite at `13ea612`: **691 passed, 3 skipped** (10 min; the one warning is t
 
 ## 8. Response
 
-*(for the reviewer's findings and their disposition)*
+Review completed at `f362584` on 2026-09-25. See
+[`reviews/welcome-to-v3-advisor-f362584.md`](../../reviews/welcome-to-v3-advisor-f362584.md)
+for the findings, all requested sign-offs, throughput measurements, and modeling
+recommendations. Findings remain open; this was a review, with no production
+fixes applied. The report recommends correcting the encoder findings before
+step 8 generates data.
+
+### 8.1 Disposition (2026-09-25)
+
+**Every finding verified, none disputed on substance.** The reviewer's probes
+(`reviews/welcome_to_v3_review_probes.py`) reproduce all ten at `f362584`, plus
+an eleventh the written review does not list: **`LOST_VIEWER_VOTE`** — the
+advisor rebuilds a state whose viewer voted for a reshuffle as not having
+voted. Independent checks: BGA's `notif_scorePlan` only stamps the DOM (F7);
+`Houses::getOfPlayer` filters current-turn marks for *other* players only
+(F8); `ConstructionCards` sets `$autoreshuffle` with no listener, so a natural
+reform sends the client nothing (F10); and the engine's `_reveal_step` →
+`_reshuffle_decks` draws three cards that become the asides, then
+`_draw_step` draws three more — two distinct triples (F3, F6).
+
+| finding | disposition |
+|---|---|
+| F1 EXTREMITIES false death | **accept** — the death clause lacks "no roundabout left"; the spec had it, the code dropped it |
+| F2 temp fit on an empty gap | **accept** — widening is valid only when `(low, high)` holds an integer; emit 0 otherwise, for both temp fit and plane 18 |
+| F3 queued reshuffle | **accept**, including the population change for `p_printed_unplaceable` and the `next_effects` one-hots. ⚠ **Partial pushback on exactness** — see below |
+| F4 dead-street demand erased | **accept** — contradicts the invariant §3.7 claimed; populate per street, gate only `street_serves` |
+| F5 houses-this-turn ignores phase | **accept** — viewer: legal remaining-turn ceiling from their context; opponents: full-turn potential on the public snapshot |
+| F6 steady refusal pairing | **accept** — number and effect come from different cards |
+| F7–F10, lost vote | **accept**; advisor-only, so they do not block step 8 and are scheduled after the encoder fixes |
+| sign-offs | accept all: §3.2 this turn; SPEC GAP 3 → minimise refusal + existential rescue; delete the threat code, `turn_reach.py` and both legacy migrations; bump the ABI after the corrections rather than silently reusing ABI 2 |
+| throughput #1 (integer inclusion–exclusion) | **accept, do first** — it also makes SPEC GAP 3's minimisation affordable |
+| throughput #2–#4, modelling 1–6 | recorded as backlog; measured after the corrected encoder, not folded into this fix |
+
+**Pushback — exact two-triple marginalisation (F3/F6).** With depletion
+*between* the effect triple and the number triple, the number draw must be
+conditioned on which numbers the effect cards carried: ~216 effect triples ×
+15³ removed-number triples per sheet, before any sheet work. That is
+affordable in Rust only for the rare vote branch, and not at all in the Python
+oracle §10.6 needs. Proposed instead, for both the vote fallback and the
+steady term: a without-replacement effect triple and a without-replacement
+number triple, **independent of each other**, named as that approximation and
+not "exact". Its error is measured against brute-force enumeration on small
+decks in a test, and the field documents the bound. If the error proves
+material, the exact form goes into the vote branch only.
+
+### 8.2 Outcome (2026-09-25)
+
+**All findings fixed**, including the unlisted lost vote and every accepted
+sign-off; each has a permanent regression (`tests/test_review_2026_09_25.py`,
+`tests/test_bga_extract.py`), and a re-run of the reviewer's own probes now
+fails every defect-confirming assertion. The corrections ship as
+`ENCODER_ABI_VERSION` 3 / `TRAINING_SHARD_VERSION` 4, and ENCODER_V3_SPEC.md
+§21 lists every definition that changed.
+
+The F3/F6 pushback held up under measurement: the independent-triples
+approximation is off by at most 0.020 on 8-10 card pools and 0.0007-0.0055 at
+realistic sizes, so the exact form was not added.
+
+Throughput items #1 (integer inclusion-exclusion) and #3 (street-local
+roundabout effects) were taken; standalone Rust encode is 79 µs median against
+108 µs before the review. Items #2, #4, #5 and the six modelling suggestions
+stay in the backlog.
+

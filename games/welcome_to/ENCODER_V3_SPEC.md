@@ -1,6 +1,6 @@
 # Welcome To… — encoder v3 specification
 
-**Status: BUILT through §12 step 6 (2026-09-25). ⚠ §6.4 is DEMOTED -- not encoded; see §19. Final shape 22 planes / 196 per-sheet / 367 global.**
+**Status: BUILT through §12 step 7 and corrected after external review (2026-09-25). ⚠ §6.4 is DEMOTED and deleted (§19, §21). Final shape 22 planes / 194 per-sheet / 367 global, ENCODER_ABI_VERSION 3. §21 lists every definition the review changed -- read it before trusting any older section.**
 
 Round 1 raised nine findings, all valid. Four were outright errors in the draft
 (§6.1, §6.2, §6.4, §7.2) and five were underspecification (§6.4 scope, §9.3,
@@ -97,7 +97,7 @@ The user's call: **v3 is built for the 2–4 player standard game only.** Solo (
 | | v2 shipped | v2 spec | **v3** |
 |---|---:|---:|---:|
 | planes per seat | 12 | 17 | **22** |
-| scalars per seat | 45 | 127 | **196** (202 before §19) |
+| scalars per seat | 45 | 127 | **194** (202 before §19, 196 before §21) |
 | global scalars | 358 | 380 ⚠ | **367** |
 | viewer plane | 1 | 1 | 1 |
 
@@ -108,7 +108,7 @@ global block beyond v2's list (`turns_to_reform`, §7.4).
 
 ```
 sheet_planes    (4, 22, 3, 12)   one block per seat, identical function
-sheet_scalars   (4, 196)         one block per seat, identical function
+sheet_scalars   (4, 194)         one block per seat, identical function
 viewer_plane    (1, 3, 12)       phase scratch, viewer only
 global_scalars  (367,)           game-wide and viewer-relative
 ```
@@ -259,7 +259,8 @@ which is the worked case v2 §6.3 raises and then does not encode.
 "would create a needed size". That is a search, not a feature; it is expensive
 per box, and it embeds a behavioural assumption — the exact category-2 line v2 §8
 draws. Estate direction is carried by `estate_shortfall`, and the exact question
-is answered by `can_complete_this_turn` (§6.4).
+was answered by `can_complete_this_turn` (§6.4) -- ⚠ **no longer**: §6.4 was
+demoted and deleted (§19, §21), so nothing in the encoder answers it exactly.
 
 ### 3.4 The resulting plan block — 3 slots × 34 (was 36; §19)
 
@@ -837,7 +838,7 @@ City Plan from *reusing* an estate; they do not remove its real-estate points. S
 
 Both vectors are in `tracks` for exactly this reason.
 
-### 7.3 Reshuffle contraction (8)
+### 7.3 Reshuffle contraction (6 -- was 8, see §21)
 
 ⚠ **Demand and supply live in different spaces and must be projected before they
 can be contracted.** `number_demand` is indexed by writable value `0..17`; deck
@@ -1082,10 +1083,10 @@ decomposition:
 | feature | definition |
 |---|---|
 | `p_no_slot_playable` | P(no offered combination has any legal write, **temp included**) |
-| `p_no_slot_playable_after_roundabout` | the same, given the best legal roundabout placement |
+| `p_no_slot_playable_after_roundabout` | the same after the BEST roundabout decision -- minimum over every legal placement **and declining** (§21, SPEC GAP 3) |
 | `p_printed_unplaceable` | P(a stack's **printed** number has nowhere to go) — what *opens* the voluntary refusal |
-| `roundabout_rescue_available` | 1.0 when `ROUNDABOUT_OPEN` is legal and would change `playable_slots()` |
-| `p_forced_refusal_steady` | `p_no_slot_playable_after_roundabout` at the steady-state deck |
+| `roundabout_rescue_available` | 1.0 when `ROUNDABOUT_OPEN` is legal **this turn** and some placement would make an unplayable offer playable -- the acting viewer from their own context, every other seat as a start of turn (§21) |
+| `p_forced_refusal_steady` | `p_no_slot_playable_after_roundabout` at the steady-state deck, with each stack's number and effect from **different** cards -- a stated approximation (§21) |
 
 The first three are exact for next turn, because next turn's effects are printed.
 Beyond that they use §9.3's steady-state rate. Not derivable from planes 14/15:
@@ -1101,7 +1102,7 @@ the write, a roundabout counts as a built house and returns to `CHOOSE_CARDS`, s
 
 | feature | definition |
 |---|---|
-| `max_houses_this_turn` | 0–3, the most houses the **currently legal** sequences could place, ÷3 |
+| `max_houses_this_turn` | 0–3, the most houses the **currently legal** sequences could still place, ÷3 -- the REMAINING turn for the acting viewer, a start of turn for every other seat (§21) |
 | `bis_usable` | 1.0 when a written house has an empty neighbour, so a bis write would be legal |
 
 How many are actually placed is behavioural. The feature states the ceiling.
@@ -1141,7 +1142,7 @@ How many are actually placed is behavioural. The feature states the ceiling.
 12. Keep the `P_*` constants public in both languages so tests cannot drift, and
 never refer to a plane by literal index outside those constants.
 
-### 9.2 Per-sheet scalars (196)
+### 9.2 Per-sheet scalars (194)
 
 | block | size | § |
 |---|---|---|
@@ -1152,14 +1153,14 @@ never refer to a plane by literal index outside those constants.
 | `total_span` | 1 | v2 §6 |
 | `plans` | 102 | 3 slots × 34 (§3.4, §19) |
 | `demand` | 24 | §7.2 |
-| `reshuffle_contraction` | 8 | §7.3 |
+| `reshuffle_contraction` | 6 | §7.3, §21 |
 | `refusal` | 5 | §8 |
 | `houses_this_turn` | 2 | §8 |
 | `plan_conflict_seat` | 9 | §9.2a — R2, widened R4 |
 | `free_boxes` | 1 | shipped |
 | `is_viewer` | 1 | shipped |
 | `seat_valid` | 1 | shipped |
-| | **196** | |
+| | **194** | |
 
 ### 9.2a `plan_conflict_seat` (9) — where the real conflict lives
 
@@ -1612,7 +1613,7 @@ back-compatibility, no legacy head zero-fill (§0.4).
 | 7 | network shapes (auto-derived from `encoder` constants), regenerate WTS shards | `network.py`, `self_play.py`, `samples.rs` |
 | 8 | re-run S0 from scratch; gate per §11.2 | `train.py`, `datagen.py` |
 
-**Build status (2026-09-25):** steps 1–7 DONE (§19, §20); step 8 (S0 from scratch) next.
+**Build status (2026-09-25):** steps 1–7 DONE (§19, §20) and corrected after external review (§21, ABI 3); step 8 (S0 from scratch) next.
 
 **Build status (2026-09-14):** steps 1–3 DONE. Step 3 shipped `number_prefix_sums`, `count_in_open_interval`, `boundary_pool_composition` (`discard + aside`), `ordered_draw_distribution` (the one boundary-draw helper §6.4/§7.5/§9.3 share) and `effect_supply_rate`, plus `EPS` in `constants.py`.
 
@@ -1884,3 +1885,51 @@ is also ~3x the standalone 108 µs for the same reason. **Open for step 8:**
 accept −37% generation, or make the encoder cheaper still. The remaining cost
 is spread across the §8 refusal block, the per-plan requirement fields and
 the fit planes; there is no single hot spot left like the threat pair was.
+
+## 21. External review corrections — 2026-09-25 (ABI 2 → 3)
+
+Review: `reviews/welcome-to-v3-advisor-f362584.md`, requested by
+`ENCODER_V3_AND_ADVISOR_REVIEW_REQUEST.md` (disposition in its §8.1). Every
+finding was verified against the code first; all are fixed, each with a
+permanent regression in `tests/test_review_2026_09_25.py` (encoder) or
+`tests/test_bga_extract.py` (advisor). ABI 2 was never trained on, so the
+corrections ship as **ABI 3 / shard version 4** rather than silently changing
+ABI 2's meaning.
+
+**Encoder definitions that changed:**
+
+| | before | now |
+|---|---|---|
+| §6.1 `EXTREMITIES` death (F1) | empty extremity with no span and no bis | also requires **no roundabout left** -- a roundabout can fill the extremity box itself |
+| §3.2/§3.4 requirement vectors (F4) | demand zeroed on a dead street | each street's remaining work stated regardless of aliveness; only `street_serves` carries the verdict |
+| plane 15 and §7.5 plane 18 (F2) | temp-widened even on a gap holding no integer | **0** when `(low, high)` contains no integer |
+| §7.5, §8 floats 1-3, `next_effects` (F3) | next turn's effects taken as printed even after the viewer's own yes vote | on the viewer's vote: numbers from the reshuffled pool; effects marginalised; `next_effects` one-hots all-zero |
+| §7.3 (SPEC GAP 2) | 8 floats, two exact duplicates | 6 floats |
+| §8 float 2 (SPEC GAP 3) | after the capacity-maximising roundabout | minimum refusal probability over every legal placement and declining |
+| §8 float 4 (§3.2) | next turn's stacks | **this** turn: `ROUNDABOUT_OPEN` legal now and some placement makes a blocked offer playable |
+| §8 float 5 (F6) | a card's number paired with its OWN effect | number and effect from different cards, as the game pairs them |
+| §8 `max_houses_this_turn` (F5) | always a fresh turn | the acting viewer's REMAINING turn from their phase and context |
+
+**The two-triple approximation (F3, F6).** When a stack's effect is not known,
+the offer pairs an effect from one triple of cards with a number from another.
+`deck_knowledge.two_triple_probability` draws each triple without replacement
+but treats the two as independent -- it ignores the three effect cards'
+depletion of the number pool. Exact conditioning costs ~216 x 15^3 terms per
+sheet and the Python oracle cannot afford it. **Measured error:** at most 0.020
+over pools of 8-10 cards (the worst case), 0.0007-0.0055 at 15-81 cards, and
+0.77 against the exact 0.75 on the reviewer's own example (the old same-card
+model said 0.50).
+
+**Throughput, also from the review.** Every masked draw probability is now
+integer inclusion-exclusion (`masked_draw_numerator`) instead of a sum over
+the 3,375-entry joint. The two-triple sum needs three per-mask sums for all
+eight effect sequences. A roundabout's effect on writability is computed
+street-locally, with bitmasks, instead of copying a sheet per placement. All
+three are exact and have equivalence tests. Standalone Rust encode is **79 µs
+median**: 108 before the review, and 181 with the corrections before these
+savings.
+
+**Deleted, as the review signed off:** the §6.4 threat code (`game.py`,
+`test_plan_threat.py`, `turn_reach.py`); the shard target upgrade and the
+checkpoint head-row expansion. A matching ABI now means current shapes.
+

@@ -484,7 +484,7 @@ def load(path: str | Path, device: str = "cpu") -> nw.WelcomeToNet:
     blob = torch.load(Path(path), map_location=device, weights_only=False)
     nw.require_encoder_abi(blob, path)
     net = nw.WelcomeToNet(nw.NetConfig(**blob["net_config"]))
-    nw.load_state_dict_compatible(net, blob["state_dict"])
+    nw.load_state_dict_strict(net, blob["state_dict"])
     return net.to(device)
 
 

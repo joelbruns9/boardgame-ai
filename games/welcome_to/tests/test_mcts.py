@@ -469,18 +469,34 @@ def _drive(search, seats=2, seed=9, seat=0, max_steps=20000):
     return events
 
 
+def _retaining_play(search, rng_seed: int, turns=range(8, 24)):
+    """A position where the chosen macro keeps the root on turn, and that play.
+
+    Retention is a PRECONDITION of the tests below, not their subject: it needs
+    the chosen macro to lead to a within-turn successor, and which macro an
+    untrained net picks moves whenever its input does.  Pinning one position
+    broke twice -- when M0-B moved the deal to the portable RNG, and when the
+    encoder went to ABI 3 (review 2026-09-25) and the seeded net's weights
+    changed shape.  So search a band of turns for a retaining position instead.
+    """
+    for turn in turns:
+        state = _position(players=2, turn=turn, root=0)
+        rng = random.Random(rng_seed)
+        search.reset()
+        choice = search.play(state, root=0, rng=rng)
+        if search._retained is not None:
+            return state, choice, rng
+    pytest.fail(f"no position in turns {turns} retained a subtree")
+
+
 def test_a_retained_subtree_keeps_its_statistics_and_its_budget():
     """The exactness claim, at the level the brief allows: the retained node is
     the same object with the same numbers, and the second search tops it up to
     ``simulations`` rather than paying for the shared work twice."""
     torch.manual_seed(0)
     search, _ = _search(simulations=64)
-    state = _position(players=2, turn=8, root=0)
-    rng = random.Random(11)
-
-    choice = search.play(state, root=0, rng=rng)
+    state, choice, rng = _retaining_play(search, 11)
     retained = search._retained
-    assert retained is not None, "nothing was retained inside a turn"
     kept_visits = retained.node.visits.copy()
     kept_total = retained.node.total.copy()
     assert kept_visits.sum() > 0, "an unvisited child was retained"
@@ -504,9 +520,7 @@ def test_a_position_that_is_not_the_predicted_successor_is_not_re_rooted():
     change to a seat the search does not even look at still refuses the reuse."""
     torch.manual_seed(0)
     search, _ = _search(simulations=32)
-    state = _position(players=2, turn=8, root=0)
-    choice = search.play(state, root=0, rng=random.Random(11))
-    assert search._retained is not None
+    state, choice, _rng = _retaining_play(search, 11)
 
     tampered = state.copy()
     mc.apply_macro(tampered, choice)
@@ -539,11 +553,8 @@ def test_the_tree_is_discarded_across_a_turn_boundary():
 def test_re_rooting_never_noises_the_same_node_twice():
     torch.manual_seed(0)
     search, _ = _search(simulations=32, dirichlet_alpha=1.0)
-    state = _position(players=2, turn=8, root=0)
-    rng = random.Random(3)
-    search.play(state, root=0, rng=rng)
+    _state, _choice, rng = _retaining_play(search, 3)
     retained = search._retained
-    assert retained is not None
     assert not retained.node.noised, "a child was noised before it became a root"
 
     search._apply_root_noise(retained.node, rng)
@@ -616,12 +627,7 @@ def test_a_newly_noised_root_always_gets_fresh_simulations():
     # not change, the fixture's deal did.  The visit counts are overwritten
     # below anyway, so the budget only has to be big enough to expand the child.
     search, evaluator = _search(simulations=32, dirichlet_alpha=1.0)
-    state = _position(players=2, turn=8, root=0)
-    rng = random.Random(3)
-
-    choice = search.play(state, root=0, rng=rng)
-    retained = search._retained
-    assert retained is not None, "nothing was retained inside a turn"
+    state, choice, rng = _retaining_play(search, 3)
 
     successor = mc.step_macro(state, choice)
     while len(mc.search_legal_macros(successor)) == 1:
@@ -650,10 +656,7 @@ def test_an_un_noised_root_keeps_the_whole_re_rooting_saving():
     torch.manual_seed(0)
     search, _ = _search(simulations=64)
     assert search.config.dirichlet_alpha is None
-    state = _position(players=2, turn=8, root=0)
-    rng = random.Random(11)
-
-    choice = search.play(state, root=0, rng=rng)
+    state, choice, rng = _retaining_play(search, 11)
     successor = mc.step_macro(state, choice)
     while len(mc.search_legal_macros(successor)) == 1:
         mc.apply_macro(successor, mc.search_legal_macros(successor)[0])

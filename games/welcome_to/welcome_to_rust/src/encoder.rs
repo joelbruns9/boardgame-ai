@@ -32,11 +32,11 @@ use crate::plans::{
 };
 use crate::sheet::{Pos, Sheet};
 
-pub const ENCODER_ABI_VERSION: usize = 2;
+pub const ENCODER_ABI_VERSION: usize = 3;
 pub const MAX_SEATS: usize = 4;
 pub const MAX_PLAYERS: usize = 6;
 pub const SHEET_PLANES: usize = 22;
-pub const NUM_SHEET_SCALAR: usize = 196;
+pub const NUM_SHEET_SCALAR: usize = 194;
 pub const NUM_GLOBAL_SCALAR: usize = 367;
 #[allow(dead_code)] // mirrors encoder.PLAN_SLOT_WIDTH; asserted in tests
 pub const PLAN_SLOT_WIDTH: usize = 34;
@@ -83,15 +83,6 @@ const P_FIT_ROUNDABOUT: usize = 17;
 const P_FIT_NEXT_TURN: usize = 18;
 const P_PLAN_TARGET: [usize; 3] = [19, 20, 21];
 
-/// `DECK_EFFECT_ORDER`, i.e. the effect of each `effect_index`.
-const EFFECT_ORDER: [Effect; NUM_EFFECTS] = [
-    Effect::Surveyor,
-    Effect::Pool,
-    Effect::Temp,
-    Effect::Bis,
-    Effect::Park,
-    Effect::Estate,
-];
 const E_SURVEYOR: usize = 0;
 const E_POOL: usize = 1;
 const E_TEMP: usize = 2;
@@ -303,106 +294,137 @@ fn normalize(values: &[f32], uniform_if_empty: bool) -> Vec<f32> {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// The literal boundary draw (deck_knowledge.ordered_draw_counts)
+// Masked draw probabilities — integer inclusion-exclusion
+// (`deck_knowledge.masked_draw_numerator` and friends, review 2026-09-25
+// throughput #1). Exact integers, one division at the end, so the result is
+// bit-identical to Python in any summation order.
 // ──────────────────────────────────────────────────────────────────────────
 
-/// Ordered draws as exact integer numerators over one denominator. `num` is
-/// flattened `K^3`, indexed `(a * K + b) * K + c`.
-struct DrawCounts {
-    k: usize,
-    num: Vec<f64>,
-    den: f64,
-}
-
-/// Numerators of `n` ordered draws without replacement, flattened `K^n`,
-/// and the falling-factorial denominator.
-fn without_replacement(counts: &[f64], n: usize) -> (Vec<f64>, f64) {
-    let k = counts.len();
-    let eye = |i: usize, j: usize| if i == j { 1.0 } else { 0.0 };
-    let num: Vec<f64> = match n {
-        0 => vec![1.0],
-        1 => counts.to_vec(),
-        2 => {
-            let mut out = Vec::with_capacity(k * k);
-            for a in 0..k {
-                for b in 0..k {
-                    out.push(counts[a] * (counts[b] - eye(a, b)));
-                }
-            }
-            out
-        }
-        3 => {
-            let mut out = Vec::with_capacity(k * k * k);
-            for a in 0..k {
-                for b in 0..k {
-                    for c in 0..k {
-                        out.push(
-                            counts[a]
-                                * (counts[b] - eye(a, b))
-                                * (counts[c] - eye(a, c) - eye(b, c)),
-                        );
-                    }
-                }
-            }
-            out
-        }
-        _ => panic!("a boundary draws at most three cards, not {n}"),
-    };
-    let total: f64 = counts.iter().sum();
-    let mut den = 1.0f64;
+/// `total * (total - 1) * ...` over `n` terms.
+fn falling(total: i64, n: usize) -> i64 {
+    let mut out = 1i64;
     for i in 0..n {
-        den *= total - i as f64;
-    }
-    (num.into_iter().map(|v| v.max(0.0)).collect(), den)
-}
-
-fn ordered_draw_counts(deck: &[f64], pool: &[f64]) -> DrawCounts {
-    let k = deck.len();
-    let deck_total: f64 = deck.iter().sum();
-    let from_deck = (deck_total.round() as usize).min(3);
-    let (num_deck, den_deck) = without_replacement(deck, from_deck);
-    let (num_pool, den_pool) = without_replacement(pool, 3 - from_deck);
-    let mut num = Vec::with_capacity(k * k * k);
-    for &d in &num_deck {
-        for &p in &num_pool {
-            num.push(d * p);
-        }
-    }
-    debug_assert_eq!(num.len(), k * k * k);
-    DrawCounts { k, num, den: den_deck * den_pool }
-}
-
-impl DrawCounts {
-    /// `deck_knowledge.draw_probability`: P(draw i lands in `masks[i]`, all i).
-    fn probability(&self, masks: [&[f64]; 3]) -> f64 {
-        let k = self.k;
-        let mut hits = 0.0f64;
-        for a in 0..k {
-            if masks[0][a] == 0.0 {
-                continue;
-            }
-            for b in 0..k {
-                if masks[1][b] == 0.0 {
-                    continue;
-                }
-                let base = (a * k + b) * k;
-                for c in 0..k {
-                    if masks[2][c] != 0.0 {
-                        hits += self.num[base + c];
-                    }
-                }
-            }
-        }
-        (hits / self.den.max(EPS)).max(0.0).min(1.0)
-    }
-}
-
-fn to_f64<const N: usize>(values: &[f32; N]) -> [f64; N] {
-    let mut out = [0.0f64; N];
-    for i in 0..N {
-        out[i] = values[i] as f64;
+        out *= total - i as i64;
     }
     out
+}
+
+/// Ordered draws without replacement, draw `i` landing in `masks[i]`, as exact
+/// `(numerator, denominator)`. Masks are 0/1.
+fn masked_draw_numerator(counts: &[i64], masks: &[&[i64]]) -> (i64, i64) {
+    let n = masks.len();
+    let den = falling(counts.iter().sum(), n);
+    if n == 0 {
+        return (1, den);
+    }
+    let s: Vec<i64> = masks
+        .iter()
+        .map(|m| counts.iter().zip(m.iter()).map(|(c, x)| c * x).sum())
+        .collect();
+    if n == 1 {
+        return (s[0], den);
+    }
+    let pair = |a: usize, b: usize| -> i64 {
+        (0..counts.len()).map(|k| counts[k] * masks[a][k] * masks[b][k]).sum()
+    };
+    if n == 2 {
+        return (s[0] * s[1] - pair(0, 1), den);
+    }
+    assert!(n == 3, "a boundary draws at most three cards, not {n}");
+    let triple: i64 = (0..counts.len())
+        .map(|k| counts[k] * masks[0][k] * masks[1][k] * masks[2][k])
+        .sum();
+    (
+        s[0] * s[1] * s[2] - pair(0, 1) * s[2] - pair(0, 2) * s[1] - pair(1, 2) * s[0]
+            + 2 * triple,
+        den,
+    )
+}
+
+/// `deck_knowledge._probability`.
+fn probability(num: i64, den: i64) -> f64 {
+    (num as f64 / (den as f64).max(EPS)).max(0.0).min(1.0)
+}
+
+/// `deck_knowledge.next_draw_probability`: the literal boundary draw, the
+/// first `min(D, 3)` off the deck and the rest off the reform pool.
+fn next_draw_probability(deck: &[i64], pool: &[i64], masks: [&[i64]; 3]) -> f64 {
+    let split = (deck.iter().sum::<i64>() as usize).min(3);
+    let (a, da) = masked_draw_numerator(deck, &masks[..split]);
+    let (b, db) = masked_draw_numerator(pool, &masks[split..]);
+    probability(a * b, da * db)
+}
+
+/// `deck_knowledge.two_triple_probability`: effects from one triple of cards,
+/// numbers from another. ⚠ A stated approximation — the two triples are
+/// independent of each other (see the Python docstring and its error test).
+fn two_triple_probability(matrix: &Matrix, mask_non_temp: &[i64], mask_temp: &[i64]) -> f64 {
+    let rows = counts_of(&row_sums(matrix));
+    let cols = counts_of(&column_sums(matrix));
+    let total: i64 = rows.iter().sum();
+    let temp = cols[E_TEMP];
+    let classes = [total - temp, temp];
+    // Three sums give all eight sequences' numerators (see the Python).
+    let single = [
+        (0..NUM_NUMBERS).map(|k| rows[k] * mask_non_temp[k]).sum::<i64>(),
+        (0..NUM_NUMBERS).map(|k| rows[k] * mask_temp[k]).sum::<i64>(),
+    ];
+    let both: i64 = (0..NUM_NUMBERS)
+        .map(|k| rows[k] * mask_non_temp[k] * mask_temp[k])
+        .sum();
+    let pair = |a: usize, b: usize| if a == b { single[a] } else { both };
+    let mut num = 0i64;
+    for t0 in 0..2usize {
+        for t1 in 0..2usize {
+            for t2 in 0..2usize {
+                let seq = [t0, t1, t2];
+                let mut effect_num = 1i64;
+                let mut used = [0i64; 2];
+                for &t in &seq {
+                    effect_num *= classes[t] - used[t];
+                    used[t] += 1;
+                }
+                if effect_num <= 0 {
+                    continue;
+                }
+                let all = if t0 == t1 && t1 == t2 { single[t0] } else { both };
+                let number_num = single[t0] * single[t1] * single[t2]
+                    - pair(t0, t1) * single[t2]
+                    - pair(t0, t2) * single[t1]
+                    - pair(t1, t2) * single[t0]
+                    + 2 * all;
+                num += effect_num * number_num;
+            }
+        }
+    }
+    probability(num, falling(total, 3) * falling(total, 3))
+}
+
+/// `deck_knowledge._as_counts`: whole-number `f32` counts as integers.
+fn counts_of<const N: usize>(values: &[f32; N]) -> [i64; N] {
+    let mut out = [0i64; N];
+    for i in 0..N {
+        out[i] = (values[i] as f64).round_ties_even() as i64;
+    }
+    out
+}
+
+/// `encoder.py::_interval_miss`: over printed 1..15, 1 where `n` is NOT in
+/// `(low, high)`.
+fn interval_miss(low: i32, high: i32) -> [i64; NUM_NUMBERS] {
+    let mut out = [1i64; NUM_NUMBERS];
+    for i in 0..NUM_NUMBERS {
+        let n = i as i32 + 1;
+        if low < n && n < high {
+            out[i] = 0;
+        }
+    }
+    out
+}
+
+/// `encoder.py::_gap_is_empty` — review F2: no integer strictly inside.
+fn gap_is_empty(low: i32, high: i32) -> bool {
+    high - low <= 1
 }
 
 /// `np.cumsum(np.rint(counts))` with a leading zero.
@@ -464,10 +486,15 @@ struct DeckView {
     deck_effects: [f32; NUM_EFFECTS],
     reshuffled_numbers: [f32; NUM_NUMBERS],
     reshuffled_effects: [f32; NUM_EFFECTS],
+    deck_counts: [i64; NUM_NUMBERS],
+    reform_counts: [i64; NUM_NUMBERS],
+    reshuffled_counts: [i64; NUM_NUMBERS],
     effect_rate: [f64; NUM_EFFECTS],
     next_effects: [Option<Effect>; 3],
     next_is_temp: [bool; 3],
-    joint: DrawCounts,
+    /// ⚠ Review F3: the viewer's OWN yes vote queues a reshuffle — only that
+    /// vote is readable, never the table-wide aggregate.
+    viewer_voted: bool,
 }
 
 impl DeckView {
@@ -488,20 +515,20 @@ impl DeckView {
         let reshuffled_prefix = prefix(&deck_plus_pool);
 
         // §9.3 effect_supply_rate, branching on the viewer's OWN vote.
-        let (rate_deck, rate_pool) = if game.reshuffle_vote_for(viewer) {
-            (to_f64(&column_sums(&reshuffled_matrix)), [0.0f64; NUM_EFFECTS])
+        let viewer_voted = game.reshuffle_vote_for(viewer);
+        let (rate_deck, rate_pool) = if viewer_voted {
+            (counts_of(&column_sums(&reshuffled_matrix)), [0i64; NUM_EFFECTS])
         } else {
             (
-                to_f64(&column_sums(&deck_matrix)),
-                to_f64(&column_sums(&pool_matrix)),
+                counts_of(&column_sums(&deck_matrix)),
+                counts_of(&column_sums(&pool_matrix)),
             )
         };
-        let effect_joint = ordered_draw_counts(&rate_deck, &rate_pool);
         let mut effect_rate = [0.0f64; NUM_EFFECTS];
         for e in 0..NUM_EFFECTS {
-            let mut miss = [1.0f64; NUM_EFFECTS];
-            miss[e] = 0.0;
-            let p = effect_joint.probability([&miss, &miss, &miss]);
+            let mut miss = [1i64; NUM_EFFECTS];
+            miss[e] = 0;
+            let p = next_draw_probability(&rate_deck, &rate_pool, [&miss, &miss, &miss]);
             effect_rate[e] = (1.0 - p).max(0.0).min(1.0);
         }
 
@@ -511,7 +538,6 @@ impl DeckView {
             next_effects[1] == Some(Effect::Temp),
             next_effects[2] == Some(Effect::Temp),
         ];
-        let joint = ordered_draw_counts(&to_f64(&deck_numbers), &to_f64(&reform_numbers));
 
         DeckView {
             deck_total: deck_prefix[NUM_NUMBERS] as f64,
@@ -520,6 +546,9 @@ impl DeckView {
             reshuffled_prefix,
             deck_effects: column_sums(&deck_matrix),
             reshuffled_effects: column_sums(&reshuffled_matrix),
+            deck_counts: counts_of(&deck_numbers),
+            reform_counts: counts_of(&reform_numbers),
+            reshuffled_counts: counts_of(&reshuffled_numbers),
             deck_matrix,
             reshuffled_matrix,
             deck_numbers,
@@ -527,16 +556,48 @@ impl DeckView {
             effect_rate,
             next_effects,
             next_is_temp,
-            joint,
+            viewer_voted,
         }
     }
 
-    fn deck_count(&self, low: i32, high: i32) -> i64 {
-        count_in_open_interval(&self.deck_prefix, low, high)
+    /// P(all three of next turn's NUMBERS land in `mask`) — effects unused.
+    fn next_numbers_all_in(&self, mask: &[i64; NUM_NUMBERS]) -> f64 {
+        if self.viewer_voted {
+            return next_draw_probability(
+                &self.reshuffled_counts,
+                &[0i64; NUM_NUMBERS],
+                [mask, mask, mask],
+            );
+        }
+        next_draw_probability(&self.deck_counts, &self.reform_counts, [mask, mask, mask])
+    }
+
+    /// P(every stack lands in its mask), the mask depending on its effect.
+    fn next_stacks_all_in(
+        &self,
+        mask_non_temp: &[i64; NUM_NUMBERS],
+        mask_temp: &[i64; NUM_NUMBERS],
+    ) -> f64 {
+        if self.viewer_voted {
+            return two_triple_probability(&self.reshuffled_matrix, mask_non_temp, mask_temp);
+        }
+        let pick = |temp: bool| -> &[i64] { if temp { mask_temp } else { mask_non_temp } };
+        next_draw_probability(
+            &self.deck_counts,
+            &self.reform_counts,
+            [
+                pick(self.next_is_temp[0]),
+                pick(self.next_is_temp[1]),
+                pick(self.next_is_temp[2]),
+            ],
+        )
     }
 
     fn fit_deck(&self, low: i32, high: i32) -> f64 {
-        ratio(self.deck_count(low, high) as f64, self.deck_total)
+        ratio(
+            count_in_open_interval(&self.deck_prefix, low, high) as f64,
+            self.deck_total,
+        )
     }
 
     fn fit_reshuffled(&self, low: i32, high: i32) -> f64 {
@@ -545,49 +606,16 @@ impl DeckView {
             self.reshuffled_total,
         )
     }
-
-    fn draw_probability(&self, masks: [&[f64]; 3]) -> f64 {
-        self.joint.probability(masks)
-    }
 }
 
-/// §7.5: P(some stack next turn reveals a number fitting this gap).
+/// §7.5: P(some stack next turn reveals a number fitting this gap). An empty
+/// gap is 0 (review F2); the viewer's vote switches pool and effects (F3).
 fn p_fit_next_turn(view: &DeckView, low: i32, high: i32) -> f64 {
-    let fit_notemp = view.deck_count(low, high) as f64;
-    let fit_temp = view.deck_count(low - 2, high + 2) as f64;
-    let fits: Vec<f64> = view
-        .next_is_temp
-        .iter()
-        .map(|&temp| if temp { fit_temp } else { fit_notemp })
-        .collect();
-
-    let total = view.deck_total;
-    if total >= 3.0 {
-        let misses = [total - fits[0], total - fits[1], total - fits[2]];
-        let p12 = total - fits[0].max(fits[1]);
-        let p13 = total - fits[0].max(fits[2]);
-        let p23 = total - fits[1].max(fits[2]);
-        let r = total - fits[0].max(fits[1]).max(fits[2]);
-        let none = misses[0] * misses[1] * misses[2] - p12 * misses[2] - p13 * misses[1]
-            - p23 * misses[0]
-            + 2.0 * r;
-        let denom = total * (total - 1.0) * (total - 2.0);
-        return (1.0 - none / denom.max(EPS)).max(0.0).min(1.0);
+    if gap_is_empty(low, high) {
+        return 0.0;
     }
-
-    // D < 3: the draw reforms mid-way, so enumerate it literally.
-    let mut masks = [[1.0f64; NUM_NUMBERS]; 3];
-    for (i, &temp) in view.next_is_temp.iter().enumerate() {
-        let (lo, hi) = if temp { (low - 2, high + 2) } else { (low, high) };
-        for (j, n) in (1..=NUM_NUMBERS as i32).enumerate() {
-            if lo < n && n < hi {
-                masks[i][j] = 0.0;
-            }
-        }
-    }
-    (1.0 - view.draw_probability([&masks[0], &masks[1], &masks[2]]))
-        .max(0.0)
-        .min(1.0)
+    let miss = view.next_stacks_all_in(&interval_miss(low, high), &interval_miss(low - 2, high + 2));
+    (1.0 - miss).max(0.0).min(1.0)
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -711,7 +739,12 @@ fn write_sheet_planes(
 
             let (_first, _last, low, high) = sheet.gap_bounds(x, y).expect("empty box");
             set(P_FIT_DECK, x, y, view.fit_deck(low, high) as f32);
-            set(P_FIT_TEMP, x, y, view.fit_deck(low - 2, high + 2) as f32);
+            let fit_temp = if gap_is_empty(low, high) {
+                0.0
+            } else {
+                view.fit_deck(low - 2, high + 2)
+            };
+            set(P_FIT_TEMP, x, y, fit_temp as f32);
             set(P_FIT_RESHUFFLE, x, y, view.fit_reshuffled(low, high) as f32);
             set(P_FIT_NEXT_TURN, x, y, p_fit_next_turn(view, low, high) as f32);
 
@@ -1052,155 +1085,177 @@ fn reshuffle_contraction(
         let supply_total: f32 = supply.iter().sum();
         ratio(weighted, supply_total as f64 * demand_total)
     };
-    for with_temp in [false, true] {
-        let demand = card_demand(sheet, with_temp);
-        for (numbers, effects) in [
-            (&view.deck_numbers, &view.deck_effects),
-            (&view.reshuffled_numbers, &view.reshuffled_effects),
-        ] {
-            w.put_f64(fit_rate(&demand, numbers));
-            w.put_f64(eff_rate(effects));
-        }
-    }
+    // SPEC GAP 2 as resolved by review: 6 floats, the two duplicates dropped.
+    let plain = card_demand(sheet, false);
+    w.put_f64(fit_rate(&plain, &view.deck_numbers));
+    w.put_f64(eff_rate(&view.deck_effects));
+    w.put_f64(fit_rate(&plain, &view.reshuffled_numbers));
+    w.put_f64(eff_rate(&view.reshuffled_effects));
+    let temp = card_demand(sheet, true);
+    w.put_f64(fit_rate(&temp, &view.deck_numbers));
+    w.put_f64(fit_rate(&temp, &view.reshuffled_numbers));
 }
 
-/// `encoder.py::_writable_values`: per value 0..17, any legal box at all.
-fn writable_values(sheet: &Sheet) -> [bool; NUM_NUMBER_VALUES] {
-    let mut out = [false; NUM_NUMBER_VALUES];
-    for v in 0..NUM_NUMBER_VALUES {
-        out[v] = !sheet.available_locations(Some(v as i32)).is_empty();
-    }
-    out
-}
-
-fn any_writable(writable: &[bool; NUM_NUMBER_VALUES], number: i32, effect: Effect) -> bool {
+fn any_writable(writable: u32, number: i32, effect: Effect) -> bool {
     numbers_for(number, effect)
         .into_iter()
-        .any(|v| writable[v as usize])
+        .any(|v| writable >> v & 1 == 1)
 }
 
-/// Per stack, the printed numbers with NO legal write next turn (1.0 = miss),
-/// and the same for the printed number alone.
-fn playable_sets(sheet: &Sheet, view: &DeckView) -> ([[f64; NUM_NUMBERS]; 3], [f64; NUM_NUMBERS]) {
-    let writable = writable_values(sheet);
-    let mut miss = [[1.0f64; NUM_NUMBERS]; 3];
-    for (k, effect) in view.next_effects.iter().enumerate() {
-        if let Some(effect) = effect {
-            for i in 0..NUM_NUMBERS {
-                if any_writable(&writable, i as i32 + 1, *effect) {
-                    miss[k][i] = 0.0;
-                }
-            }
-        }
-    }
-    let mut printed = [1.0f64; NUM_NUMBERS];
+type MissMasks = ([i64; NUM_NUMBERS], [i64; NUM_NUMBERS]);
+
+/// `encoder.py::_miss_masks_from`: over printed 1..15, 1 where a card has NO
+/// legal write — `(non-TEMP effect, TEMP effect)`.
+fn miss_masks_from(writable: u32) -> MissMasks {
+    let mut non_temp = [1i64; NUM_NUMBERS];
+    let mut temp = [1i64; NUM_NUMBERS];
     for i in 0..NUM_NUMBERS {
-        if writable[i + 1] {
-            printed[i] = 0.0;
+        let n = i as i32 + 1;
+        if writable >> n & 1 == 1 {
+            non_temp[i] = 0;
+        }
+        if any_writable(writable, n, Effect::Temp) {
+            temp[i] = 0;
         }
     }
-    (miss, printed)
+    (non_temp, temp)
 }
 
-fn joint_miss(view: &DeckView, masks: &[[f64; NUM_NUMBERS]; 3]) -> f64 {
-    view.draw_probability([&masks[0], &masks[1], &masks[2]])
-}
-
-/// ⚠ SPEC GAP 3: the roundabout maximising total placement capacity,
-/// tie-broken by lowest `(street, box)`.
-fn best_roundabout_sheet(game: &Game, sheet: &Sheet) -> Option<Sheet> {
-    if !(game.config.advanced && sheet.can_build_roundabout()) || !sheet.has_free_box() {
-        return None;
+/// `encoder.py::_future_roundabout_masks`.
+fn future_roundabout_masks(game: &Game, sheet: &Sheet) -> Vec<u32> {
+    if !(game.config.advanced && sheet.can_build_roundabout() && sheet.has_free_box()) {
+        return Vec::new();
     }
-    let mut best: Option<Sheet> = None;
-    let mut best_key = -1i32;
-    for x in 0..NUM_STREETS {
-        for y in 0..STREET_SIZES[x] {
-            if sheet.numbers[x][y] != EMPTY {
-                continue;
-            }
-            let mut candidate = sheet.clone();
-            candidate.build_roundabout((x, y), 0);
-            let total: i32 = candidate.placement_capacity().iter().sum();
-            if total > best_key {
-                best_key = total;
-                best = Some(candidate);
-            }
-        }
-    }
-    best
+    sheet.roundabout_writable_masks()
 }
 
-/// §8's 5 floats.
-fn refusal_block(game: &Game, sheet: &Sheet, view: &DeckView, w: &mut Writer) {
-    let (miss, printed_miss) = playable_sets(sheet, view);
-    w.put_f64(joint_miss(view, &miss));
-
-    let after = best_roundabout_sheet(game, sheet);
-    let (p_after, rescue) = match &after {
-        None => (joint_miss(view, &miss), 0.0),
-        Some(after) => {
-            let (miss_after, _) = playable_sets(after, view);
-            let rescued = (0..3).any(|k| (0..NUM_NUMBERS).any(|i| miss_after[k][i] < miss[k][i]));
-            (joint_miss(view, &miss_after), rescued as u8 as f64)
+/// `encoder.py::_roundabout_legal_now`: THIS turn, for this seat.
+fn roundabout_legal_now(game: &Game, viewer: usize, seat: usize, sheet: &Sheet) -> bool {
+    if !(game.config.advanced && sheet.can_build_roundabout() && sheet.has_free_box()) {
+        return false;
+    }
+    if seat == viewer && viewer == game.actor {
+        if game.phase == Phase::RoundaboutPlace {
+            return true;
         }
-    };
+        return game.phase == Phase::ChooseCards
+            && game.ctx.last_house.is_none()
+            && !game.ctx.roundabout_declined;
+    }
+    true
+}
+
+/// `encoder.py::_rescue_this_turn` — existential over placements.
+fn rescue_this_turn(game: &Game, viewer: usize, seat: usize, sheet: &Sheet) -> bool {
+    if !roundabout_legal_now(game, viewer, seat, sheet) {
+        return false;
+    }
+    let writable = sheet.writable_mask();
+    let blocked: Vec<(i32, Effect)> = offers(game, viewer)
+        .into_iter()
+        .filter(|&(n, e)| !any_writable(writable, n, e))
+        .collect();
+    if blocked.is_empty() {
+        return false;
+    }
+    sheet
+        .roundabout_writable_masks()
+        .into_iter()
+        .any(|after| blocked.iter().any(|&(n, e)| any_writable(after, n, e)))
+}
+
+/// §8's 5 floats — see `encoder.py::_refusal_block` for each definition.
+/// Minima over placements are order-free, so the deduplicating set needs no
+/// particular order to match Python.
+fn refusal_block(
+    game: &Game,
+    viewer: usize,
+    seat: usize,
+    sheet: &Sheet,
+    view: &DeckView,
+    w: &mut Writer,
+) {
+    let (non_temp, temp) = miss_masks_from(sheet.writable_mask());
+    let candidates: BTreeSet<MissMasks> = future_roundabout_masks(game, sheet)
+        .into_iter()
+        .collect::<BTreeSet<u32>>()
+        .into_iter()
+        .map(miss_masks_from)
+        .collect();
+
+    let p_now = view.next_stacks_all_in(&non_temp, &temp);
+    let mut p_after = p_now;
+    for (a, b) in &candidates {
+        p_after = p_after.min(view.next_stacks_all_in(a, b));
+    }
+    w.put_f64(p_now);
     w.put_f64(p_after);
 
-    let mut placeable = [0.0f64; NUM_NUMBERS];
+    let mut placeable = [0i64; NUM_NUMBERS];
     for i in 0..NUM_NUMBERS {
-        placeable[i] = 1.0 - printed_miss[i];
+        placeable[i] = 1 - non_temp[i];
     }
-    let all_placeable = joint_miss(view, &[placeable, placeable, placeable]);
-    w.put_f64((1.0 - all_placeable).max(0.0).min(1.0));
+    w.put_f64((1.0 - view.next_numbers_all_in(&placeable)).max(0.0).min(1.0));
 
-    w.put_f64(rescue);
+    w.put(if rescue_this_turn(game, viewer, seat, sheet) { 1.0 } else { 0.0 });
 
-    // p_forced_refusal_steady: hypergeometric over the unplayable CARDS.
-    let steady_sheet = after.as_ref().unwrap_or(sheet);
-    let mut matrix = &view.deck_matrix;
-    let mut total = matrix.iter().flatten().sum::<f32>() as f64;
-    if total < 3.0 {
-        matrix = &view.reshuffled_matrix;
-        total = matrix.iter().flatten().sum::<f32>() as f64;
+    let mut population = &view.deck_matrix;
+    if population.iter().flatten().sum::<f32>() < 6.0 {
+        population = &view.reshuffled_matrix;
     }
-    let steady_writable = writable_values(steady_sheet);
-    let mut unplayable = 0.0f64;
-    for i in 0..NUM_NUMBERS {
-        for (e, &effect) in EFFECT_ORDER.iter().enumerate() {
-            let count = matrix[i][e] as f64;
-            if count <= 0.0 {
-                continue;
-            }
-            if !any_writable(&steady_writable, i as i32 + 1, effect) {
-                unplayable += count;
-            }
-        }
-    }
-    if total < 3.0 {
+    if population.iter().flatten().sum::<f32>() < 3.0 {
         w.put(0.0);
-    } else {
-        let num = unplayable * (unplayable - 1.0).max(0.0) * (unplayable - 2.0).max(0.0);
-        let den = total * (total - 1.0) * (total - 2.0);
-        w.put_f64(ratio(num, den));
+        return;
     }
+    let mut steady = two_triple_probability(population, &non_temp, &temp);
+    for (a, b) in &candidates {
+        steady = steady.min(two_triple_probability(population, a, b));
+    }
+    w.put_f64(steady);
 }
 
-/// `game.py::max_houses_this_turn` — 0-3, maximised over legal sequences.
+/// `game.py::max_houses_this_turn` — 0-3, the REMAINING turn for the acting
+/// viewer (review F5), a hypothetical full turn for everyone else.
 pub fn max_houses_this_turn(game: &Game, viewer: usize, seat: usize) -> i32 {
     let sheet = game.sheet_for(viewer, seat);
-    let offers = offers(game, viewer);
+    let mut offers = offers(game, viewer);
+    let mut roundabout_ok =
+        game.config.advanced && sheet.can_build_roundabout() && sheet.has_free_box();
+    if seat == viewer && viewer == game.actor {
+        match game.phase {
+            Phase::ChooseCards => {
+                roundabout_ok = roundabout_ok
+                    && game.ctx.last_house.is_none()
+                    && !game.ctx.roundabout_declined;
+            }
+            Phase::RoundaboutPlace => {}
+            Phase::WriteNumber => {
+                let (Some(number), Some(effect)) = (game.ctx.number, game.ctx.effect) else {
+                    return 0;
+                };
+                offers = vec![(number, effect)];
+                roundabout_ok = false;
+            }
+            Phase::ActionBis => {
+                return if sheet.bis_candidates().is_empty() { 0 } else { 1 };
+            }
+            _ => return 0,
+        }
+    }
+    max_houses_from(sheet, &offers, roundabout_ok)
+}
+
+/// `game.py::_max_houses_from`: optional roundabout, write, bis.
+fn max_houses_from(sheet: &Sheet, offers: &[(i32, Effect)], roundabout_ok: bool) -> i32 {
     let mut starts: Vec<(Sheet, i32)> = vec![(sheet.clone(), 0)];
-    if game.config.advanced && sheet.can_build_roundabout() && sheet.has_free_box() {
+    if roundabout_ok {
         for pos in sheet.available_locations(None) {
             let mut opened = sheet.clone();
             opened.build_roundabout(pos, 0);
             starts.push((opened, 1));
         }
     }
-    // Exact shortcuts, mirrored in game.py: a non-BIS write scores `placed + 1`
-    // wherever it lands, so it needs one legal box and no copy; and a start
-    // whose ceiling `placed + 1 + any BIS offer` cannot beat `best` is skipped.
+    // Exact shortcuts, mirrored in game.py.
     let bis_offered = offers.iter().any(|&(_, effect)| effect == Effect::Bis);
     let mut best = 0i32;
     for (start, placed) in &starts {
@@ -1208,7 +1263,7 @@ pub fn max_houses_this_turn(game: &Game, viewer: usize, seat: usize) -> i32 {
         if best >= placed + 1 + bis_offered as i32 {
             continue;
         }
-        for &(number, effect) in &offers {
+        for &(number, effect) in offers {
             for value in numbers_for(number, effect) {
                 let locations = start.available_locations(Some(value));
                 if effect != Effect::Bis {
@@ -1381,7 +1436,7 @@ fn sheet_scalars(
     reshuffle_contraction(sheet, &demand, view, &mut w);
 
     // refusal (5)
-    refusal_block(game, sheet, view, &mut w);
+    refusal_block(game, viewer, seat, sheet, view, &mut w);
 
     // houses this turn (2)
     w.put_f64(max_houses_this_turn(game, viewer, seat) as f64 / 3.0);
@@ -1459,12 +1514,17 @@ fn global_scalars(game: &Game, viewer: usize, view: &DeckView) -> EngineResult<V
     w.put(game.may_ask_reshuffle() as u8 as f32);
     w.put(game.reshuffle_vote_for(viewer) as u8 as f32);
 
-    for effect in view.next_effects {
-        let mut row = [0.0f32; NUM_EFFECTS];
-        if let Some(index) = effect.and_then(effect_index) {
-            row[index] = 1.0;
+    // Blank after the viewer's own yes vote: the effects are redrawn (F3).
+    if view.viewer_voted {
+        w.skip(3 * NUM_EFFECTS);
+    } else {
+        for effect in view.next_effects {
+            let mut row = [0.0f32; NUM_EFFECTS];
+            if let Some(index) = effect.and_then(effect_index) {
+                row[index] = 1.0;
+            }
+            w.put_array(&row);
         }
-        w.put_array(&row);
     }
 
     let discard = discard_composition(game);
@@ -1583,7 +1643,7 @@ mod tests {
     #[test]
     fn encoder_layout_is_the_v3_shape() {
         assert_eq!(SHEET_PLANES_LEN, 4 * 22 * 36);
-        assert_eq!(SHEET_SCALARS_LEN, 4 * 196);
+        assert_eq!(SHEET_SCALARS_LEN, 4 * 194);
         assert_eq!(VIEWER_PLANE_LEN, 36);
         assert_eq!(NUM_GLOBAL_SCALAR, 367);
         assert_eq!(NUM_DEALT_PLANS, 28);

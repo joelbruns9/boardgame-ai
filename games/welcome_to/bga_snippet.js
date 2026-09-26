@@ -302,25 +302,38 @@
     return { cards: {}, cardsLeft: null };
   }
 
-  // `cardsLeft` is the reshuffle detector, and it has to be one: the first player
-  // to finish a City Plan may shuffle the discard back into the deck, after which
-  // a card in the ledger is no longer "gone" -- it is back in the draw pile, and
-  // may be dealt a second time under the same id. Nothing else in the capture says
-  // that happened, but the deck count going UP says it unambiguously.
+  // `cardsLeft` is the reform detector, and it has to be one: a chosen reshuffle
+  // (first City Plan) or an exhausted deck puts the discard back into the draw
+  // pile, after which a card in the ledger is no longer "gone" -- it may be dealt
+  // a second time under the same id. The deck count going UP says so.
   //
-  // The reset keeps only what is on the table, which is what the ledger would hold
-  // if the game had just started. That undercounts the discard by the pair the
-  // reshuffle itself pushed there (ConstructionCards::reshuffle draws, then
-  // discards), and Python turns that into a stated warning rather than a silent
-  // three-card lie.
-  function mergeLedger(w, cardsLeft) {
+  // ⚠ Review F10: the reset must NOT rescan the DOM. An explicit reshuffle clears
+  // the stack holders, but a NATURAL reform (`Pieces::reformDeckFromDiscard`,
+  // automatic, no client notification) leaves every old holder in place -- after
+  // one pass through the deck all 81 are there, and a rescan marked the whole
+  // new deck as already seen. So on a reform every holder present is stamped as
+  // belonging to the previous epoch and skipped from then on; only the six cards
+  // on the table (from the fresh table patch) and holders created AFTER the
+  // reform count. BGA replaces a redrawn card's holder with a new node, so a
+  // card dealt again in the new epoch is picked up. Cards drawn between the
+  // reform and this capture are missed, and Python states that shortfall.
+  function mergeLedger(w, cardsLeft, tableCards) {
     const doc = w.document;
     const blob = _readLedger(w);
     if (blob.cardsLeft !== null && cardsLeft > blob.cardsLeft) {
       blob.cards = {};
+      for (let stack = 0; stack < 3; stack++) {
+        for (const node of _cardsIn(doc, stack)) {
+          node.setAttribute("data-wto-stale-epoch", "1");
+        }
+      }
+      for (const card of tableCards || []) {
+        blob.cards[card.id] = [card.number, card.action];
+      }
     }
     for (let stack = 0; stack < 3; stack++) {
       for (const node of _cardsIn(doc, stack)) {
+        if (node.getAttribute("data-wto-stale-epoch")) continue;
         const card = _cardRow(node);
         blob.cards[card.id] = [card.number, card.action];
       }
@@ -339,14 +352,86 @@
   // ---------------------------------------------------------------------------
   function captureForAdvisor() {
     const w = findGameWindow();
+    installVoteRecorder(w);
     const gamedatas = captureGamedatas(w);
     const patch = captureTablePatch(w);
     Object.assign(gamedatas, patch);
+    const dom = captureTurnMarks(w, String(gamedatas.me_id), gamedatas.turn);
+    dom.plan_stamps = capturePlanStamps(w);
+    dom.reshuffle_vote = readVote(w, gamedatas.turn);
     return {
       bga: gamedatas,
-      dom: captureTurnMarks(w, String(gamedatas.me_id), gamedatas.turn),
-      seen: mergeLedger(w, patch.cardsLeft),
+      dom,
+      seen: mergeLedger(w, patch.cardsLeft, [].concat(...patch.constructionCards)),
     };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Plans you validated THIS turn (review F7)
+  // ---------------------------------------------------------------------------
+  // `notif_scorePlan` only stamps the plan card (`validateCurrentPlayerPlan`,
+  // wtoPlanCards.js:105: an svg `#scribble-plan-<planId>` with `data-turn`); it
+  // never writes `gamedatas.planValidations`, which catches up at the turn
+  // boundary. So the stamp is the evidence, and Python reconciles it with the
+  // (possibly stale) validations array.
+  function capturePlanStamps(w) {
+    const doc = (w || findGameWindow()).document;
+    const out = [];
+    for (const node of doc.querySelectorAll('[id^="scribble-plan-"][data-turn]')) {
+      const plan = parseInt(node.id.replace("scribble-plan-", ""), 10);
+      const turn = parseInt(node.getAttribute("data-turn"), 10);
+      if (isFinite(plan) && isFinite(turn)) out.push({ plan, turn });
+    }
+    return out;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Your reshuffle vote (review: LOST_VIEWER_VOTE)
+  // ---------------------------------------------------------------------------
+  // BGA stores the vote server-side (`AbstractPlan::askForReshuffle` updates
+  // `plan_validation.reshuffle`) and tells no client, so the only evidence a
+  // page has is your own click at `askReshuffle`: `#btnReshuffle` is yes,
+  // `#buttonPassAction` is no (PlanValidationTrait.js:33-35). Recorded per table
+  // and turn; a later answer in the same turn (after a restart) overwrites it.
+  const WTO_VOTE_PREFIX = "wto_advisor_vote_";
+
+  function _voteKey(w) {
+    const match = /[?&]table=(\d+)/.exec(String(w.location.href));
+    return WTO_VOTE_PREFIX + (match ? match[1] : "unknown");
+  }
+
+  function installVoteRecorder(w) {
+    if (w.__wtoVoteRecorder) return;
+    w.__wtoVoteRecorder = true;
+    w.document.addEventListener(
+      "click",
+      (event) => {
+        try {
+          const g = w.gameui && w.gameui.gamedatas;
+          if (!g || ((g.gamestate || {}).name) !== "askReshuffle") return;
+          const target = event.target;
+          let vote = null;
+          if (target.closest && target.closest("#btnReshuffle")) vote = true;
+          if (target.closest && target.closest("#buttonPassAction")) vote = false;
+          if (vote === null) return;
+          const turn = _required(w.document, "#game_play_area").getAttribute("data-turn");
+          w.localStorage.setItem(_voteKey(w), JSON.stringify({ turn: String(turn), vote }));
+        } catch (e) {
+          /* a lost vote record only costs the advisor one reshuffle read */
+        }
+      },
+      true
+    );
+  }
+
+  function readVote(w, turn) {
+    try {
+      const blob = JSON.parse(w.localStorage.getItem(_voteKey(w)) || "null");
+      if (blob && String(blob.turn) === String(turn)) return !!blob.vote;
+    } catch (e) {
+      /* unreadable storage: unknown */
+    }
+    return null;
   }
 
   // ---------------------------------------------------------------------------
@@ -423,6 +508,7 @@
   // runs on a timer and must not walk the whole sheet.
   function turnSignature(w) {
     try {
+      installVoteRecorder(w || findGameWindow());
       const g = (w || findGameWindow()).gameui.gamedatas;
       const state = String((g.gamestate || {}).name || "");
       const doc = (w || findGameWindow()).document;
@@ -445,6 +531,9 @@
     captureTablePatch,
     captureTurnMarks,
     mergeLedger,
+    capturePlanStamps,
+    installVoteRecorder,
+    readVote,
     captureForAdvisor,
     turnSignature,
   };

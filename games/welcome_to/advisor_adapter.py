@@ -353,7 +353,7 @@ class WelcomeToAdvisor:
         self._injected = (
             None
             if net is None
-            else LoadedNet(net=net, path="<injected>", legacy_heads=False, source="injected")
+            else LoadedNet(net=net, path="<injected>", source="injected")
         )
         self._default_checkpoint = default_checkpoint
         self._device = device
@@ -395,16 +395,7 @@ class WelcomeToAdvisor:
 
     def warnings(self) -> list[str]:
         """Advisor-level warnings the host surfaces with every answer."""
-        try:
-            model = self._load(self._default_checkpoint, self._device)
-        except Exception:
-            return []
-        if not model.legacy_heads:
-            return []
-        return [
-            "this checkpoint predates the plan-outcome and end-trigger heads; "
-            "they are served as a neutral 0.5 and mean nothing"
-        ]
+        return []
 
     # -- state codec -------------------------------------------------------
     def state_from_wire(self, payload: dict[str, Any]) -> _Position:
@@ -687,10 +678,6 @@ class WelcomeToAdvisor:
                 )
             },
             "seats": [_seat(seat) for seat in range(seats)],
-            # Heads this checkpoint never trained. They come back as an exact
-            # 0.5, which is indistinguishable from a real coin flip unless it is
-            # said out loud, so the panel greys them instead of reading them.
-            "untrained_heads": list(UNTRAINED_IN_LEGACY) if model.legacy_heads else [],
             "checkpoint": {"path": model.path, "format": model.source},
         }
 
@@ -719,7 +706,6 @@ class WelcomeToAdvisor:
             checkpoint = {
                 "path": model.path,
                 "format": model.source,
-                "legacy_heads": model.legacy_heads,
             }
         except Exception as exc:  # /health must answer even with no checkpoint
             checkpoint = {"error": str(exc)}
@@ -749,29 +735,12 @@ def _digest(prefix: str, payload: Any) -> str:
     return "%s:%s" % (prefix, hashlib.sha256(blob).hexdigest()[:16])
 
 
-#: Per-seat heads that exist in the current network but not in checkpoints
-#: written before the dense plan-outcome heads landed.  ``load_state_dict_compatible``
-#: fills them with a **neutral zero logit**, which reads as a confident-looking
-#: 0.5 -- so they have to be labelled rather than shown.
-UNTRAINED_IN_LEGACY: tuple[str, ...] = tuple(
-    name
-    for name in nw.PER_SEAT_HEAD_TARGETS
-    if name not in nw.LEGACY_PER_SEAT_HEAD_TARGETS
-)
-
-
 @dataclass(frozen=True, slots=True)
 class LoadedNet:
-    """A served checkpoint and what is known about it.
-
-    ``legacy_heads`` is not a detail: the newer binary heads come back as an
-    exact 0.5 on such a checkpoint, and an untagged 0.5 is indistinguishable
-    from a genuine coin flip.
-    """
+    """A served checkpoint and where it came from."""
 
     net: Any
     path: str
-    legacy_heads: bool
     source: str
 
 
@@ -792,15 +761,10 @@ def load_net(path: str, device: str = "cpu") -> LoadedNet:
     source = "s0"
     if blob.get("format") == s2_train.CHECKPOINT_FORMAT:
         version = int(blob.get("version", -1))
-        if version not in (
-            s2_train.LEGACY_CHECKPOINT_VERSION,
-            s2_train.CHECKPOINT_VERSION,
-        ):
+        if version != s2_train.CHECKPOINT_VERSION:
             raise ValueError("unsupported S2 checkpoint version %r" % (version,))
         source = "s2 v%d" % (version,)
     nw.require_encoder_abi(blob, path)
     net = nw.WelcomeToNet(nw.NetConfig(**blob["net_config"]))
-    legacy = nw.load_state_dict_compatible(net, blob["state_dict"])
-    return LoadedNet(
-        net=net.to(device), path=str(path), legacy_heads=bool(legacy), source=source
-    )
+    nw.load_state_dict_strict(net, blob["state_dict"])
+    return LoadedNet(net=net.to(device), path=str(path), source=source)

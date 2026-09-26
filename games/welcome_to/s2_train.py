@@ -35,7 +35,6 @@ from games.welcome_to import training
 
 CHECKPOINT_FORMAT = "welcome_to_s2"
 CHECKPOINT_VERSION = 2
-LEGACY_CHECKPOINT_VERSION = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,14 +182,17 @@ def _masked_rank(out: Mapping[str, torch.Tensor], batch: Mapping[str, torch.Tens
     return mask, target, log_policy
 
 
-def _load_optimizer_state_compatible(
+def _load_optimizer_state_checked(
     optimizer: torch.optim.Optimizer,
     saved: dict[str, Any],
     net: nw.WelcomeToNet,
     saved_parameter_names: Optional[Sequence[str]] = None,
 ) -> None:
-    """Expand legacy Adam moments for the appended per-seat output rows."""
-    current = optimizer.state_dict()
+    """Load optimizer state after checking it belongs to this network.
+
+    The legacy Adam-moment expansion for appended head rows is gone (review
+    2026-09-25): a checkpoint needing it is refused by its encoder ABI first.
+    """
     saved_ids = [item for group in saved["param_groups"] for item in group["params"]]
     current_parameters = [
         parameter for group in optimizer.param_groups for parameter in group["params"]
@@ -205,41 +207,14 @@ def _load_optimizer_state_compatible(
         raise ValueError(
             "checkpoint optimizer parameter names/order do not match the network"
         )
-    migrated = {
-        "state": {key: dict(value) for key, value in saved["state"].items()},
-        "param_groups": [dict(group) for group in saved["param_groups"]],
-    }
-    final_index = max(
-        index
-        for index, module in enumerate(net.per_seat_head)
-        if isinstance(module, torch.nn.Linear)
-    )
-    expandable = {
-        f"per_seat_head.{final_index}.weight",
-        f"per_seat_head.{final_index}.bias",
-    }
-    old_rows = len(nw.LEGACY_PER_SEAT_HEAD_TARGETS)
-    new_rows = len(nw.PER_SEAT_HEAD_TARGETS)
     for saved_id, parameter in zip(saved_ids, current_parameters):
-        state = migrated["state"].get(saved_id, {})
-        for key, value in list(state.items()):
-            if not torch.is_tensor(value) or value.ndim == 0 or value.shape == parameter.shape:
-                continue
-            name = names[id(parameter)]
-            if (
-                name not in expandable
-                or value.shape[0] != old_rows
-                or parameter.shape[0] != new_rows
-                or value.shape[1:] != parameter.shape[1:]
-            ):
+        for key, value in saved["state"].get(saved_id, {}).items():
+            if torch.is_tensor(value) and value.ndim and value.shape != parameter.shape:
                 raise ValueError(
-                    f"checkpoint optimizer tensor {name}.{key} has shape "
+                    f"checkpoint optimizer tensor {names[id(parameter)]}.{key} has shape "
                     f"{tuple(value.shape)}, expected {tuple(parameter.shape)}"
                 )
-            expanded = value.new_zeros(parameter.shape)
-            expanded[:old_rows].copy_(value)
-            state[key] = expanded
-    optimizer.load_state_dict(migrated)
+    optimizer.load_state_dict(saved)
 
 
 @torch.no_grad()
@@ -474,7 +449,7 @@ def fit(
         net.parameters(), lr=config.lr, weight_decay=config.weight_decay
     )
     if optimizer_state is not None:
-        _load_optimizer_state_compatible(
+        _load_optimizer_state_checked(
             optimizer,
             optimizer_state,
             net,
@@ -713,13 +688,13 @@ def load_training_checkpoint(
     if payload.get("format") != CHECKPOINT_FORMAT:
         raise ValueError(f"{path} is not an S2 training checkpoint")
     version = int(payload.get("version", -1))
-    if version not in (LEGACY_CHECKPOINT_VERSION, CHECKPOINT_VERSION):
+    if version != CHECKPOINT_VERSION:
         raise ValueError(
             f"unsupported S2 checkpoint version {payload.get('version')}"
         )
     nw.require_encoder_abi(payload, path)
     net = nw.WelcomeToNet(nw.NetConfig(**payload["net_config"]))
-    nw.load_state_dict_compatible(net, payload["state_dict"])
+    nw.load_state_dict_strict(net, payload["state_dict"])
     return net.to(device), payload
 
 

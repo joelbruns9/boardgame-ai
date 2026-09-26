@@ -24,9 +24,10 @@ use crate::rng::Rng;
 use crate::tables;
 use crate::{to_py, RustGameState};
 
-/// 3: encoder v3 rows (ENCODER_ABI_VERSION 2). Versions 1 and 2 hold ABI-1
-/// rows of a different width and are refused, never read (spec §0.4).
-pub const TRAINING_SHARD_VERSION: u16 = 3;
+/// 4: encoder v3 rows after review 2026-09-25 (ENCODER_ABI_VERSION 3).
+/// Versions 1-3 hold rows of an earlier encoder and are refused, never read
+/// (spec §0.4). 3 was ABI 2, whose features the review corrected.
+pub const TRAINING_SHARD_VERSION: u16 = 4;
 pub const GLOBAL_TARGET_NAMES: [&str; 9] = [
     "turns_left",
     "rank_p_0",
@@ -72,34 +73,6 @@ pub const PER_SEAT_TARGET_NAMES: [&str; 32] = [
     "end_trigger_max_permit",
     "seat_valid",
 ];
-pub const LEGACY_PER_SEAT_TARGET_NAMES: [&str; 20] = [
-    "score",
-    "permits",
-    "houses",
-    "capacity_left",
-    "plans_completed",
-    "score_parks",
-    "score_pools",
-    "score_estates",
-    "score_plans",
-    "score_temp",
-    "score_bis",
-    "score_permits",
-    "score_roundabouts",
-    "turns_to_plan_0",
-    "turns_to_plan_0_mask",
-    "turns_to_plan_1",
-    "turns_to_plan_1_mask",
-    "turns_to_plan_2",
-    "turns_to_plan_2_mask",
-    "seat_valid",
-];
-const LEGACY_PER_SEAT_TARGET_COUNT: usize = LEGACY_PER_SEAT_TARGET_NAMES.len();
-const LEGACY_PERMITS: usize = 1;
-const LEGACY_HOUSES: usize = 2;
-const LEGACY_PLANS_COMPLETED: usize = 4;
-const LEGACY_PLAN_MASKS: [usize; 3] = [14, 16, 18];
-const LEGACY_SEAT_VALID: usize = 19;
 pub const GLOBAL_TARGET_COUNT: usize = GLOBAL_TARGET_NAMES.len();
 pub const PER_SEAT_TARGET_COUNT: usize = PER_SEAT_TARGET_NAMES.len();
 pub const TARGET_FLOAT_COUNT: usize =
@@ -603,7 +576,7 @@ fn read_shard_header(reader: &mut impl Read) -> Result<(usize, usize), String> {
     let signature = read_u64(reader)?;
     if &magic == MAGIC && version < TRAINING_SHARD_VERSION {
         return Err(format!(
-            "training shard version {version} holds encoder ABI 1 rows; this build              reads version {TRAINING_SHARD_VERSION} (encoder ABI {}) only",
+            "training shard version {version} holds rows of an earlier encoder ABI; this build reads version {TRAINING_SHARD_VERSION} (encoder ABI {}) only",
             encoder::ENCODER_ABI_VERSION
         ));
     }
@@ -765,41 +738,13 @@ fn append_training_targets(
     out: &mut Vec<u8>,
     per_seat_target_count: usize,
 ) -> Result<(), String> {
-    if per_seat_target_count == PER_SEAT_TARGET_COUNT {
-        return append_exact(reader, out, TARGET_FLOAT_COUNT * size_of::<f32>());
-    }
-    if per_seat_target_count != LEGACY_PER_SEAT_TARGET_COUNT {
+    // ⚠ The pre-plan-head target schema (shard version 1) was upgraded here
+    // until review 2026-09-25: every such shard holds encoder-ABI-1 rows and is
+    // refused at the header, so the upgrade was unreachable.  Deleted (§0.4).
+    if per_seat_target_count != PER_SEAT_TARGET_COUNT {
         return Err("training shard has an unknown target schema".into());
     }
-    let legacy_count = GLOBAL_TARGET_COUNT + encoder::MAX_SEATS * LEGACY_PER_SEAT_TARGET_COUNT;
-    let mut raw = vec![0u8; legacy_count * size_of::<f32>()];
-    reader.read_exact(&mut raw).map_err(|e| e.to_string())?;
-    let legacy: Vec<f32> = raw
-        .chunks_exact(4)
-        .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte chunk")))
-        .collect();
-    let mut current = vec![0.0f32; TARGET_FLOAT_COUNT];
-    current[..GLOBAL_TARGET_COUNT].copy_from_slice(&legacy[..GLOBAL_TARGET_COUNT]);
-    for seat in 0..encoder::MAX_SEATS {
-        let old = GLOBAL_TARGET_COUNT + seat * LEGACY_PER_SEAT_TARGET_COUNT;
-        let new = GLOBAL_TARGET_COUNT + seat * PER_SEAT_TARGET_COUNT;
-        current[new..new + LEGACY_SEAT_VALID]
-            .copy_from_slice(&legacy[old..old + LEGACY_SEAT_VALID]);
-        for slot in 0..3 {
-            current[new + 19 + slot] = legacy[old + LEGACY_PLAN_MASKS[slot]];
-            current[new + 22 + slot * 2] = -1.0;
-            current[new + 23 + slot * 2] = 0.0;
-        }
-        current[new + 28] = (legacy[old + LEGACY_HOUSES] >= 1.0) as u8 as f32;
-        current[new + 29] =
-            (legacy[old + LEGACY_PLANS_COMPLETED] >= 1.0) as u8 as f32;
-        current[new + 30] = (legacy[old + LEGACY_PERMITS] >= 1.0) as u8 as f32;
-        current[new + 31] = legacy[old + LEGACY_SEAT_VALID];
-    }
-    for value in current {
-        out.extend_from_slice(&value.to_le_bytes());
-    }
-    Ok(())
+    append_exact(reader, out, TARGET_FLOAT_COUNT * size_of::<f32>())
 }
 
 /// Bulk decoder for production `.wts` shards.
@@ -1290,33 +1235,3 @@ impl Drop for RustSampleShardWriter {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn legacy_upgrade_offsets_are_pinned_to_exported_names() {
-        assert_eq!(LEGACY_PER_SEAT_TARGET_NAMES[LEGACY_PERMITS], "permits");
-        assert_eq!(LEGACY_PER_SEAT_TARGET_NAMES[LEGACY_HOUSES], "houses");
-        assert_eq!(
-            LEGACY_PER_SEAT_TARGET_NAMES[LEGACY_PLANS_COMPLETED],
-            "plans_completed"
-        );
-        assert_eq!(
-            LEGACY_PLAN_MASKS.map(|index| LEGACY_PER_SEAT_TARGET_NAMES[index]),
-            [
-                "turns_to_plan_0_mask",
-                "turns_to_plan_1_mask",
-                "turns_to_plan_2_mask",
-            ]
-        );
-        assert_eq!(
-            LEGACY_PER_SEAT_TARGET_NAMES[LEGACY_SEAT_VALID],
-            "seat_valid"
-        );
-        assert_eq!(
-            &PER_SEAT_TARGET_NAMES[..LEGACY_SEAT_VALID],
-            &LEGACY_PER_SEAT_TARGET_NAMES[..LEGACY_SEAT_VALID]
-        );
-    }
-}

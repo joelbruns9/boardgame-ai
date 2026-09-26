@@ -115,8 +115,7 @@ def test_panel_shows_the_diagnostics_the_host_sends():
 
     Each of these is something a "best move" overlay would drop, and each was
     added to answer a specific question: what did the net believe before search,
-    what does it think the game ends at, and which of its heads are meaningless
-    in this checkpoint.
+    and what does it think the game ends at.
     """
     content = _code_only((_EXTENSION / "content.js").read_text(encoding="utf-8"))
     assert "r.prior" in content, "the raw policy is half the diagnosis"
@@ -124,7 +123,6 @@ def test_panel_shows_the_diagnostics_the_host_sends():
     assert "final_score" in content
     assert "seat.components" in content
     assert "will_complete_plan" in content
-    assert "untrained_heads" in content
     assert "pub.warnings" in content
     assert "next_effect" in content, "the known next effect is public information"
 

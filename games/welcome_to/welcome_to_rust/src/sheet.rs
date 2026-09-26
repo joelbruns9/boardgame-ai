@@ -41,6 +41,35 @@ impl SheetScore {
     }
 }
 
+/// Bit `v` set when value `v` has a legal box in this street's `row`
+/// (`sheet.py::street_writable_mask`).
+pub fn street_writable_mask(row: &[i32; MAX_STREET_LEN], size: usize) -> u32 {
+    let mut mask = 0u32;
+    let mut y = 0usize;
+    while y < size {
+        if row[y] != EMPTY {
+            y += 1;
+            continue;
+        }
+        let start = y;
+        while y < size && row[y] == EMPTY {
+            y += 1;
+        }
+        let mut low = MIN_NUMBER - 1;
+        if start > 0 && row[start - 1] != EMPTY && row[start - 1] != ROUNDABOUT {
+            low = row[start - 1];
+        }
+        let mut high = MAX_NUMBER + 1;
+        if y < size && row[y] != EMPTY && row[y] != ROUNDABOUT {
+            high = row[y];
+        }
+        for v in (low + 1).max(MIN_NUMBER)..=(high - 1).min(MAX_NUMBER) {
+            mask |= 1 << (v - MIN_NUMBER);
+        }
+    }
+    mask
+}
+
 /// The most houses that could still be written in one street's `row`.
 /// Shared by `placement_capacity` and `capacity_if_roundabout` so the
 /// hypothetical is evaluated by the identical rule (`sheet.py::_row_capacity`).
@@ -318,6 +347,33 @@ impl Sheet {
             high = row[last + 1];
         }
         Some((first, last, low, high))
+    }
+
+    /// `writable_values` as a bitmask, bit `v` for value `v`.
+    pub fn writable_mask(&self) -> u32 {
+        (0..NUM_STREETS).fold(0u32, |m, x| m | street_writable_mask(&self.numbers[x], STREET_SIZES[x]))
+    }
+
+    /// `writable_mask` after one roundabout, per empty box, box order — only
+    /// the roundabout's street is rescanned (review throughput #3).
+    pub fn roundabout_writable_masks(&self) -> Vec<u32> {
+        let streets: [u32; NUM_STREETS] =
+            std::array::from_fn(|x| street_writable_mask(&self.numbers[x], STREET_SIZES[x]));
+        let mut out = Vec::new();
+        for x in 0..NUM_STREETS {
+            let others = (0..NUM_STREETS)
+                .filter(|&o| o != x)
+                .fold(0u32, |m, o| m | streets[o]);
+            for y in 0..STREET_SIZES[x] {
+                if self.numbers[x][y] != EMPTY {
+                    continue;
+                }
+                let mut hypothetical = self.numbers[x];
+                hypothetical[y] = ROUNDABOUT;
+                out.push(others | street_writable_mask(&hypothetical, STREET_SIZES[x]));
+            }
+        }
+        out
     }
 
     /// Negated distance from `number`'s ideal position; `0.0` is perfect.
@@ -671,5 +727,35 @@ mod tests {
         // The chain resets, so a low number is legal again on the right.
         let spots = sheet.available_locations(Some(1));
         assert!(spots.contains(&(1, 6)));
+    }
+}
+
+#[cfg(test)]
+mod writable_mask_tests {
+    use super::*;
+
+    #[test]
+    fn writable_mask_matches_available_locations() {
+        let mut sheet = Sheet::new();
+        sheet.write(7, (0, 0), 1, false);
+        sheet.write(8, (0, 2), 1, false);
+        sheet.write(3, (1, 5), 1, false);
+        sheet.build_roundabout((2, 4), 1);
+        sheet.write(16, (2, 5), 1, false);
+        let mask = sheet.writable_mask();
+        for v in 0..18 {
+            let direct = !sheet.available_locations(Some(v)).is_empty();
+            assert_eq!(mask >> v & 1 == 1, direct, "value {v}");
+        }
+        let literal: Vec<u32> = sheet
+            .available_locations(None)
+            .into_iter()
+            .map(|pos| {
+                let mut copy = sheet.clone();
+                copy.build_roundabout(pos, 0);
+                copy.writable_mask()
+            })
+            .collect();
+        assert_eq!(sheet.roundabout_writable_masks(), literal);
     }
 }

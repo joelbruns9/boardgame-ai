@@ -69,6 +69,7 @@ from games.welcome_to.constants import (
     EFFECT_INDEX,
     EPS,
     NUMBER_INDEX,
+    Effect,
 )
 from games.welcome_to.game import GameState
 
@@ -385,6 +386,152 @@ def _without_replacement(counts: np.ndarray, n: int) -> tuple[np.ndarray, float]
     return np.clip(num, 0.0, None), den
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Masked draw probabilities -- integer inclusion-exclusion
+#
+# The production form of every "P(each draw lands in its own set)" question.
+# ``ordered_draw_counts`` materialises the whole K^3 joint; this computes the
+# masked numerator directly from per-mask sums (review 2026-09-25, throughput
+# #1), in exact integers, so Python and Rust agree bit for bit and the order of
+# summation is irrelevant.  ``ordered_draw_counts`` stays as the literal oracle
+# the tests compare against.
+# ──────────────────────────────────────────────────────────────────────────
+def _as_counts(values) -> list[int]:
+    return [int(round(float(v))) for v in values]
+
+
+def falling(total: int, n: int) -> int:
+    """``total * (total - 1) * ... `` over ``n`` terms (1 at ``n = 0``)."""
+    out = 1
+    for i in range(n):
+        out *= total - i
+    return out
+
+
+def masked_draw_numerator(counts: list[int], masks) -> tuple[int, int]:
+    """Ordered draws without replacement, draw ``i`` landing in ``masks[i]``.
+
+    Returns ``(numerator, denominator)`` as exact integers, ``len(masks) <= 3``.
+    With ``S_i = sum c m_i``, ``P_ij = sum c m_i m_j``, ``T = sum c m_0 m_1 m_2``::
+
+        1 draw:  S_0
+        2 draws: S_0 S_1 - P_01
+        3 draws: S_0 S_1 S_2 - P_01 S_2 - P_02 S_1 - P_12 S_0 + 2 T
+
+    inclusion-exclusion over "two draws took the same card".  Masks are 0/1.
+    """
+    n = len(masks)
+    den = falling(sum(counts), n)
+    if n == 0:
+        return 1, den
+    s = [sum(c * m for c, m in zip(counts, mask)) for mask in masks]
+    if n == 1:
+        return s[0], den
+
+    def pair(a, b) -> int:
+        return sum(c * x * y for c, x, y in zip(counts, masks[a], masks[b]))
+
+    if n == 2:
+        return s[0] * s[1] - pair(0, 1), den
+    if n != 3:
+        raise ValueError(f"a boundary draws at most three cards, not {n}")
+    triple = sum(
+        c * x * y * z for c, x, y, z in zip(counts, masks[0], masks[1], masks[2])
+    )
+    return (
+        s[0] * s[1] * s[2]
+        - pair(0, 1) * s[2]
+        - pair(0, 2) * s[1]
+        - pair(1, 2) * s[0]
+        + 2 * triple
+    ), den
+
+
+def _probability(num: int, den: int) -> float:
+    return min(1.0, max(0.0, float(num) / max(float(den), EPS)))
+
+
+def next_draw_probability(deck, pool, masks) -> float:
+    """P(each of the next three draws lands in its own mask), reform-aware.
+
+    The literal boundary draw of §7.5: the first ``min(D, 3)`` come off the
+    deck, the rest off ``pool`` (``boundary_pool_composition``).  Equal to
+    ``draw_probability(*ordered_draw_counts(deck, pool), masks)`` exactly.
+    """
+    deck_c = _as_counts(deck)
+    pool_c = _as_counts(pool)
+    split = min(sum(deck_c), 3)
+    a, da = masked_draw_numerator(deck_c, [_as_counts(m) for m in masks[:split]])
+    b, db = masked_draw_numerator(pool_c, [_as_counts(m) for m in masks[split:]])
+    return _probability(a * b, da * db)
+
+
+#: Effect index of TEMP -- the only effect that changes which numbers a card can
+#: be written as, so the only effect distinction a playability mask can see.
+_TEMP = EFFECT_INDEX[Effect.TEMP]
+
+
+def two_triple_probability(matrix, mask_non_temp, mask_temp) -> float:
+    """P(all three stacks miss) when effects and numbers come from DIFFERENT cards.
+
+    A stack offers the number of one card and the effect of another: after a
+    queued reshuffle the engine draws three cards that become the asides
+    (effects), then three more that become the tops (numbers), all six distinct
+    and from the same pool.  ``matrix`` is that pool as ``(15, 6)`` counts; stack
+    ``i``'s number misses ``mask_temp`` if its effect is TEMP, else
+    ``mask_non_temp``.
+
+    ⚠ **An approximation, not exact:** the effect triple and the number triple
+    are each drawn without replacement, but *independently of each other* --
+    the depletion of the number pool by the three effect cards is ignored.
+    Exact conditioning costs ~216 x 15^3 terms per sheet, which the Python
+    oracle cannot afford.  ``tests/test_deck_knowledge.py`` measures the error
+    against brute-force six-card enumeration.
+
+    Exact integers throughout: one shared denominator, so the sum over the eight
+    effect-class sequences is order-free.
+    """
+    rows = _as_counts(np.asarray(matrix, dtype=np.float64).sum(axis=1))
+    cols = _as_counts(np.asarray(matrix, dtype=np.float64).sum(axis=0))
+    total = sum(rows)
+    temp = cols[_TEMP]
+    classes = (total - temp, temp)
+    masks = (_as_counts(mask_non_temp), _as_counts(mask_temp))
+    # With 0/1 masks every term of `masked_draw_numerator` for any sequence
+    # drawn from these two masks is one of three sums: S_x = sum c m_x, and
+    # sum c m_non m_temp for any product mixing the two (m * m = m).  So all
+    # eight sequences come from three sums -- the same integers, far fewer
+    # passes.  `masked_draw_numerator` stays the definition; the equivalence
+    # is tested.
+    single = [sum(c * m for c, m in zip(rows, mask)) for mask in masks]
+    both = sum(c * x * y for c, x, y in zip(rows, masks[0], masks[1]))
+
+    def overlap(*ts: int) -> int:
+        return single[ts[0]] if len(set(ts)) == 1 else both
+
+    num = 0
+    for t0 in (0, 1):
+        for t1 in (0, 1):
+            for t2 in (0, 1):
+                seq = (t0, t1, t2)
+                effect_num = 1
+                used = [0, 0]
+                for t in seq:
+                    effect_num *= classes[t] - used[t]
+                    used[t] += 1
+                if effect_num <= 0:
+                    continue
+                number_num = (
+                    single[t0] * single[t1] * single[t2]
+                    - overlap(t0, t1) * single[t2]
+                    - overlap(t0, t2) * single[t1]
+                    - overlap(t1, t2) * single[t0]
+                    + 2 * overlap(t0, t1, t2)
+                )
+                num += effect_num * number_num
+    return _probability(num, falling(total, 3) * falling(total, 3))
+
+
 def effect_supply_rate(state: GameState, player: int) -> np.ndarray:
     """``(6,)`` float64 -- P(effect *e* is among the three effects offered on turn+2).
 
@@ -413,11 +560,10 @@ def effect_supply_rate(state: GameState, player: int) -> np.ndarray:
     else:
         deck = deck_composition(state, player).sum(axis=0)
         pool = boundary_pool_composition(state, player).sum(axis=0)
-    num, den = ordered_draw_counts(deck, pool)
     rate = np.empty(NUM_EFFECTS, dtype=np.float64)
     for e in range(NUM_EFFECTS):
-        miss = (np.arange(NUM_EFFECTS) != e).astype(np.float64)
-        rate[e] = 1.0 - draw_probability(num, den, (miss, miss, miss))
+        miss = [0 if k == e else 1 for k in range(NUM_EFFECTS)]
+        rate[e] = 1.0 - next_draw_probability(deck, pool, (miss, miss, miss))
     return np.clip(rate, 0.0, 1.0)
 
 

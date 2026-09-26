@@ -8,12 +8,14 @@ mapper loudly instead of silently producing a plausible-but-wrong board.
 WHAT BGA GIVES US, AND WHAT IT WITHHOLDS
 ----------------------------------------
 ``gamedatas.players[pid].scoreSheet`` is **the sheet as it stood at the start of
-the current turn**, for everyone including yourself.  ``notif_updatePlayersData``
-is the only thing that rewrites it and it fires at ``stApplyTurn``; everything a
-player scribbles mid-turn goes to the DOM only (``notif_addScribble``,
-``addHouseNumber``).  That is not a defect to work around -- it is exactly
-:attr:`GameState.public_sheets`, so the scrape lands on the engine's own
-information-set boundary with nothing to hide by hand.
+the current turn** for every OTHER player: ``Houses::getOfPlayer`` and
+``Scribbles::getOfPlayer`` filter current-turn marks for everyone but the
+requesting player.  For YOU it depends on when the page loaded: a payload cached
+before your turn is turn-start, but a reload DURING your turn already holds your
+live marks (review F8).  So the viewer's sheet is always cut back to turn start
+here (``up_to_turn``) and their marks replayed from the DOM, which shows them
+either way.  ``notif_updatePlayersData`` rewrites the array at ``stApplyTurn``;
+mid-turn scribbles otherwise go to the DOM only.
 
 Your *own* current-turn progress is then read back off the DOM (``dom`` in the
 payload) and **replayed as engine actions** rather than poked into a
@@ -61,7 +63,7 @@ from games.welcome_to.constants import (
     TEMP_DELTAS,
 )
 from games.welcome_to.game import GameConfig, GameState, IllegalAction, Phase, TurnCtx
-from games.welcome_to.plans import PLANS
+from games.welcome_to.plans import PLANS, estates_matching_size
 from games.welcome_to.sheet import Sheet
 
 
@@ -353,10 +355,36 @@ def wire_from_bga_payload(payload: dict[str, Any]) -> dict[str, Any]:
         # their conditions ARE their required sizes, so this identifies which of
         # the three is being validated -- see `_TurnMarks._validating_slot`.
         "current_plan_conditions": _plan_conditions(args),
-        "validated_plan_slots": [
-            slot for slot in range(3) if plan_turns[slot].get(my_seat) == turn
-        ],
+        "validated_plan_slots": _validated_this_turn(
+            plan_ids, plan_turns, dom.get("plan_stamps") or [], my_seat, turn
+        ),
+        # Review LOST_VIEWER_VOTE: BGA never tells the client how you voted,
+        # so the extension records your own click (None = not recorded).
+        "my_reshuffle_vote": dom.get("reshuffle_vote"),
     }
+
+
+def _validated_this_turn(
+    plan_ids: list[int],
+    plan_turns: list[dict[str, int]],
+    stamps: list[dict],
+    my_seat: str,
+    turn: int,
+) -> list[int]:
+    """Plan slots the viewer has validated THIS turn (review F7).
+
+    ``planValidations`` carries a current-turn row only after a page reload
+    (``getValidations`` keeps the requesting player's own); otherwise it is
+    stale until the boundary, and the only evidence is the DOM stamp
+    ``notif_scorePlan`` draws, ``#scribble-plan-<id>`` with ``data-turn``.
+    Either source suffices.
+    """
+    stamped = {int(s["plan"]) for s in stamps if int(s.get("turn", -1)) == turn}
+    return [
+        slot
+        for slot in range(3)
+        if plan_turns[slot].get(my_seat) == turn or plan_ids[slot] in stamped
+    ]
 
 
 def _sheet_wire(score_sheet: dict) -> dict[str, Any]:
@@ -445,7 +473,12 @@ def state_from_observation(
     # -- sheets ------------------------------------------------------------
     # Every seat is at its turn-start sheet, the viewer included: their own
     # current-turn marks are replayed as actions below, not written in here.
-    sheets = [_sheet_from_wire(seat["sheet"]) for seat in obs["seats"]]
+    # ⚠ Review F8: after a reload during the viewer's turn, BGA's payload
+    # already holds their live marks, so their sheet is cut at this turn.
+    sheets = [
+        _sheet_from_wire(seat["sheet"], up_to_turn=turn if index == 0 else None)
+        for index, seat in enumerate(obs["seats"])
+    ]
 
     # -- the table ---------------------------------------------------------
     pool = _CardPool()
@@ -554,9 +587,19 @@ def _deck_from_ledger(
             % (shortfall,)
         )
     elif shortfall < 0:
+        # The ledger claims more cards gone than BGA does -- a reform it did not
+        # see (review F10).  Which of them are back in the deck is unknown, so
+        # return that many at random: the deck SIZE must match `cardsLeft`, and
+        # a warning does not excuse a state that contradicts it.
+        excess = -shortfall
+        rng.shuffle(discard)
+        undrawn.extend(discard[:excess])
+        discard = discard[excess:]
+        rng.shuffle(undrawn)
         warning = (
-            "card ledger holds %d more discard(s) than BGA's deck count allows; "
-            "the deck is short by that much" % (-shortfall,)
+            "card ledger holds %d more discard(s) than BGA's deck count allows "
+            "(a deck reform the capture missed); that many were returned to the "
+            "deck at random, so number forecasts are approximate" % (excess,)
         )
 
     return discard, undrawn, warning
@@ -642,6 +685,7 @@ class _TurnMarks:
             self.by_type.setdefault(str(scribble["type"]), []).append(scribble)
         self.validated_slots: list[int] = list(obs.get("validated_plan_slots") or [])
         self.plan_conditions = obs.get("current_plan_conditions")
+        self.reshuffle_vote = bool(obs.get("my_reshuffle_vote"))
         self.top_fences = self.by_type.get("top-fence", [])
 
     # -- helpers -----------------------------------------------------------
@@ -758,9 +802,10 @@ class _TurnMarks:
             return self._validate_action(state)
 
         if phase is Phase.ASK_RESHUFFLE:
-            # Which way the vote went is private to the player and BGA does not
-            # publish it; "no" is the reading that leaves the deck as observed.
-            return codec.A_RESHUFFLE_NO
+            # BGA does not publish the vote; the extension records the viewer's
+            # own click.  Unrecorded reads as "no", which leaves the deck as
+            # observed.
+            return codec.A_RESHUFFLE_YES if self.reshuffle_vote else codec.A_RESHUFFLE_NO
 
         raise StaleGamedata("nothing to replay at phase %s" % (phase.name,))
 
@@ -807,42 +852,30 @@ class _TurnMarks:
         """Which estate was handed to the plan being validated.
 
         The estates are not in the capture; the houses they consumed are, as
-        this turn's ``top-fence`` marks.  Group those into runs and hand over the
-        one whose length is the size the engine is currently asking for.
+        this turn's ``top-fence`` marks.  Hand over the free estate of the
+        requested size that lies wholly inside those consumed houses.
+
+        ⚠ Review F9: grouping the marks into contiguous runs was wrong -- two
+        adjacent estates separated only by an estate fence become one run.  The
+        sheet's own estate boundaries (``estates_matching_size``) are the truth.
         """
         size = state.ctx.pending_sizes[0]
-        runs = _contiguous_runs(self.top_fences)
-        for index, (x, start, length) in enumerate(runs):
-            if length == size:
+        consumed = {(int(f["x"]), int(f["y"])) for f in self.top_fences}
+        for x, start, length in estates_matching_size(
+            state.sheets[state.actor], size, tuple(state.ctx.chosen_estates)
+        ):
+            boxes = {(x, start + k) for k in range(length)}
+            if boxes <= consumed:
                 self.top_fences = [
                     f
                     for f in self.top_fences
-                    if not (int(f["x"]) == x and start <= int(f["y"]) < start + length)
+                    if (int(f["x"]), int(f["y"])) not in boxes
                 ]
                 return codec.validate_estate(x, start)
         raise StaleGamedata(
-            "no run of %d consumed houses this turn to satisfy the plan being "
-            "validated" % (size,)
+            "no free estate of %d houses lies inside this turn's consumed houses "
+            "to satisfy the plan being validated" % (size,)
         )
-
-
-def _contiguous_runs(top_fences: list[dict]) -> list[tuple[int, int, int]]:
-    """``(street, first box, length)`` for each run of consumed houses."""
-    by_street: dict[int, list[int]] = {}
-    for fence in top_fences:
-        by_street.setdefault(int(fence["x"]), []).append(int(fence["y"]))
-    runs: list[tuple[int, int, int]] = []
-    for x, ys in sorted(by_street.items()):
-        ys = sorted(ys)
-        start = prev = ys[0]
-        for y in ys[1:]:
-            if y == prev + 1:
-                prev = y
-                continue
-            runs.append((x, start, prev - start + 1))
-            start = prev = y
-        runs.append((x, start, prev - start + 1))
-    return runs
 
 
 # ---------------------------------------------------------------------------

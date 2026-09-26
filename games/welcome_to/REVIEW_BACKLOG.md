@@ -22,14 +22,13 @@ of a later implementation.
 | Dense plan/end signal and schema migrations | `PLAN_SIGNAL_REVIEW_REQUEST.md` §9; Q1–Q3 applied, Q4 reporting improved and weight ablation deferred | reviewed and remediated |
 | Rust port direction and M0 contracts | `RUST_PORT_PLAN.md` §0; review fixes in `5cb716f`; M0 sign-off in `68c0c48` | plan reviewed before implementation |
 | Rust M1/M2 implementation | `RUST_PORT_PLAN.md` M1/M2; post-implementation omissions corrected in `03ae7cf` and the 8,000-game gate rerun | reviewed and signed off |
+| Encoder v3 steps 1–7 and the BGA advisor (`4e65beb`…`13ea612`) | `ENCODER_V3_AND_ADVISOR_REVIEW_REQUEST.md` §8.1; review `reviews/welcome-to-v3-advisor-f362584.md`; F1–F10 + the unlisted lost-vote finding all fixed, spec §21 | reviewed and remediated |
 
 ## Review requests now outstanding
 
-**2026-09-25:** `ENCODER_V3_AND_ADVISOR_REVIEW_REQUEST.md` covers every commit
-after `26696f6` (`4e65beb` … `13ea612`): encoder v3 steps 1–7 and the BGA
-advisor. It supersedes the unanswered `ENCODER_V3_BUILD_REVIEW_REQUEST.md`. It
-discloses one spec deviation found while writing it (§3.1: plane 18 and §8 ignore
-the viewer's reshuffle vote), which is proposed to be fixed before step 8.
+None.  **2026-09-25:** the encoder v3 + advisor review
+(`ENCODER_V3_AND_ADVISOR_REVIEW_REQUEST.md`) was answered and every finding
+fixed the same day -- see the table above and spec §21.
 
 *The 2026-08-28 state, kept for history:* none for the then working-tree scope.
 

@@ -400,9 +400,9 @@ def test_s2_rust_training_loader_batches_match_the_row_oracle(captured_generatio
     assert np.array_equal(random_first, random_second)
 
 
-@pytest.mark.parametrize("version", [1, 2])
-def test_pre_v3_shards_are_refused_as_encoder_abi_one(tmp_path, version):
-    """Shard versions 1-2 hold encoder-ABI-1 rows of another width (spec §0.4).
+@pytest.mark.parametrize("version", [1, 2, 3])
+def test_shards_from_an_earlier_encoder_are_refused(tmp_path, version):
+    """Shard versions 1-3 hold rows of an earlier encoder ABI (spec §0.4).
 
     Before the refusal they failed only by accident ("ended inside a sample"),
     and a short enough shard could have lined up and been misread.
@@ -419,35 +419,10 @@ def test_pre_v3_shards_are_refused_as_encoder_abi_one(tmp_path, version):
             0,
         )
     )
-    with pytest.raises(ValueError, match="encoder ABI 1"):
+    with pytest.raises(ValueError, match="earlier encoder"):
         self_play._read_training_shard(path)
-    with pytest.raises(Exception, match="encoder ABI 1"):
+    with pytest.raises(Exception, match="earlier encoder"):
         self_play.wr.RustTrainingBatchLoader([str(path)], [0], 1)
-
-
-def test_legacy_wts_targets_upgrade_without_inventing_plan_race_order():
-    assert tuple(self_play.wr.LEGACY_TRAINING_PER_SEAT_TARGET_NAMES) == (
-        training.LEGACY_PER_SEAT_TARGETS
-    )
-    global_count = len(training.GLOBAL_TARGETS)
-    per_count = len(training.LEGACY_PER_SEAT_TARGETS)
-    flat = np.zeros(global_count + training.MAX_SEATS * per_count, dtype=np.float32)
-    seats = flat[global_count:].reshape(training.MAX_SEATS, per_count)
-    old = {name: index for index, name in enumerate(training.LEGACY_PER_SEAT_TARGETS)}
-    seats[0, old["seat_valid"]] = 1.0
-    seats[0, old["turns_to_plan_1_mask"]] = 1.0
-    seats[0, old["houses"]] = 1.0
-    seats[0, old["plans_completed"]] = 1.0
-    seats[0, old["permits"]] = 1.0
-    targets = self_play._decode_wts_targets(
-        flat, training.GLOBAL_TARGETS, training.LEGACY_PER_SEAT_TARGETS
-    )
-    assert targets["will_complete_plan_1"][0] == 1.0
-    assert targets["plan_1_first"][0] == float(training.NEVER)
-    assert targets["plan_1_first_mask"][0] == 0.0
-    assert targets["end_trigger_full_sheet"][0] == 1.0
-    assert targets["end_trigger_all_plans"][0] == 1.0
-    assert targets["end_trigger_max_permit"][0] == 1.0
 
 
 def test_s2_rust_sample_writer_restarts_and_rejects_truncation(

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import math
 import random
 from dataclasses import asdict
@@ -198,7 +197,7 @@ def test_s2_random_start_trains_and_checkpoint_resumes(trajectories, tmp_path):
     swapped_names = list(payload["optimizer_parameter_names"])
     swapped_names[:2] = reversed(swapped_names[:2])
     with pytest.raises(ValueError, match="names/order"):
-        s2_train._load_optimizer_state_compatible(
+        s2_train._load_optimizer_state_checked(
             rejected_optimizer,
             payload["optimizer_state"],
             loaded,
@@ -222,129 +221,46 @@ def test_s2_random_start_trains_and_checkpoint_resumes(trajectories, tmp_path):
     assert resumed_metrics["training_runs_completed"] == 2.0
 
 
-def test_version_one_checkpoint_expands_appended_plan_heads_deterministically(tmp_path):
+def test_an_unstamped_version_one_checkpoint_is_refused(tmp_path):
+    """Every version-1 checkpoint predates the ABI stamp: refused, never expanded.
+
+    The head-row expansion that used to rescue these was deleted after review
+    (2026-09-25, §0.4) -- a matching ABI must mean current shapes.
+    """
     net = _net(61)
-    legacy = {name: value.clone() for name, value in net.state_dict().items()}
-    output_keys = [
-        name
-        for name, value in legacy.items()
-        if name.startswith("per_seat_head.")
-        and value.ndim >= 1
-        and value.shape[0] == len(nw.PER_SEAT_HEAD_TARGETS)
-    ]
-    assert len(output_keys) == 2
-    old_rows = len(nw.LEGACY_PER_SEAT_HEAD_TARGETS)
-    for name in output_keys:
-        legacy[name] = legacy[name][:old_rows].clone()
     path = tmp_path / "legacy.pt"
     torch.save(
         {
             "format": s2_train.CHECKPOINT_FORMAT,
-            "version": s2_train.LEGACY_CHECKPOINT_VERSION,
-            "state_dict": legacy,
+            "version": 1,
+            "state_dict": net.state_dict(),
             "net_config": asdict(net.config),
         },
         path,
     )
-    # Every real version-1 checkpoint predates the ABI stamp and was trained on
-    # encoder ABI 1 inputs, so both loaders refuse it outright (spec §0.4)...
     for loader in (s2_train.load_training_checkpoint, s0_train.load):
-        with pytest.raises(ValueError, match="encoder ABI 1"):
+        with pytest.raises(ValueError):
             loader(path)
 
-    # ...while the head expansion itself stays deterministic for a stamped blob.
-    blob = torch.load(path, weights_only=False)
-    blob["encoder_abi"] = enc.ENCODER_ABI_VERSION
-    torch.save(blob, path)
-    loaded, _ = s2_train.load_training_checkpoint(path)
-    generic = s0_train.load(path)
-    for name in output_keys:
-        assert torch.equal(loaded.state_dict()[name][:old_rows], legacy[name])
-        assert torch.count_nonzero(loaded.state_dict()[name][old_rows:]) == 0
-        assert torch.equal(loaded.state_dict()[name], generic.state_dict()[name])
 
-
-def test_version_one_adam_state_expands_only_final_head_and_can_step(trajectories):
+def test_a_stamped_checkpoint_with_wrong_head_rows_is_refused(tmp_path):
     net = _net(62)
-    optimizer = torch.optim.AdamW(net.parameters(), lr=1e-3)
-    raw = next(
-        self_play.iter_batches(trajectories, 8, random.Random(9), shuffle_buffer=16)
-    )
-    batch = nw.to_tensors(raw)
-    loss, _ = nw.losses(net(
-        batch["sheet_planes"],
-        batch["sheet_scalars"],
-        batch["viewer_plane"],
-        batch["global_scalars"],
-    ), batch)
-    loss.backward()
-    optimizer.step()
-
-    names = [name for name, _parameter in net.named_parameters()]
-    final_index = max(
-        index
-        for index, module in enumerate(net.per_seat_head)
+    state = {name: value.clone() for name, value in net.state_dict().items()}
+    final = max(
+        index for index, module in enumerate(net.per_seat_head)
         if isinstance(module, torch.nn.Linear)
     )
-    widened = {
-        f"per_seat_head.{final_index}.weight",
-        f"per_seat_head.{final_index}.bias",
-    }
-    old_rows = len(nw.LEGACY_PER_SEAT_HEAD_TARGETS)
-
-    legacy_model = {name: value.clone() for name, value in net.state_dict().items()}
-    for name in widened:
-        legacy_model[name] = legacy_model[name][:old_rows].clone()
-    legacy_optimizer = copy.deepcopy(optimizer.state_dict())
-    saved_ids = [
-        item for group in legacy_optimizer["param_groups"] for item in group["params"]
-    ]
-    expected_moments = {}
-    for saved_id, name in zip(saved_ids, names):
-        if name not in widened:
-            continue
-        state = legacy_optimizer["state"][saved_id]
-        for moment in ("exp_avg", "exp_avg_sq"):
-            state[moment] = state[moment][:old_rows].clone()
-        expected_moments[name] = {
-            key: value.clone() if torch.is_tensor(value) else value
-            for key, value in state.items()
-        }
-
-    resumed = _net(63)
-    nw.load_state_dict_compatible(resumed, legacy_model)
-    resumed_optimizer = torch.optim.AdamW(resumed.parameters(), lr=1e-3)
-    s2_train._load_optimizer_state_compatible(
-        resumed_optimizer,
-        legacy_optimizer,
-        resumed,
-        names,
+    state[f"per_seat_head.{final}.bias"] = state[f"per_seat_head.{final}.bias"][:-3]
+    path = tmp_path / "short.pt"
+    torch.save(
+        {
+            "encoder_abi": enc.ENCODER_ABI_VERSION,
+            "state_dict": state,
+            "net_config": asdict(net.config),
+        },
+        path,
     )
+    with pytest.raises(RuntimeError, match="incompatible tensor shapes"):
+        s0_train.load(path)
 
-    resumed_parameters = dict(resumed.named_parameters())
-    for name in widened:
-        assert torch.equal(
-            resumed.state_dict()[name][:old_rows], legacy_model[name]
-        )
-        assert torch.count_nonzero(resumed.state_dict()[name][old_rows:]) == 0
-        state = resumed_optimizer.state[resumed_parameters[name]]
-        for moment in ("exp_avg", "exp_avg_sq"):
-            assert torch.equal(
-                state[moment][:old_rows], expected_moments[name][moment]
-            )
-            assert torch.count_nonzero(state[moment][old_rows:]) == 0
-        assert torch.equal(state["step"], expected_moments[name]["step"])
 
-    resumed_optimizer.zero_grad(set_to_none=True)
-    resumed_loss, _ = nw.losses(resumed(
-        batch["sheet_planes"],
-        batch["sheet_scalars"],
-        batch["viewer_plane"],
-        batch["global_scalars"],
-    ), batch)
-    resumed_loss.backward()
-    resumed_optimizer.step()
-    assert torch.isfinite(resumed_loss)
-    assert all(
-        torch.isfinite(parameter).all() for parameter in resumed.parameters()
-    )

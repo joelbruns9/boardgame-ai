@@ -47,14 +47,6 @@ try:
 except ImportError:  # pragma: no cover - source checkouts need no Rust toolchain
     wr = None
 
-if wr is not None and tuple(
-    getattr(wr, "LEGACY_TRAINING_PER_SEAT_TARGET_NAMES", ())
-) != training.LEGACY_PER_SEAT_TARGETS:
-    raise ImportError(
-        "welcome_to_rust legacy training-target order does not match Python"
-    )
-
-
 FORMAT_VERSION = 1
 LEARNER_SEAT = 0
 SEAT_MIX: tuple[tuple[int, float], ...] = ((2, 0.60), (3, 0.30), (4, 0.10))
@@ -554,7 +546,7 @@ def _decode_wts_targets(
     global_names: tuple[str, ...],
     per_seat_names: tuple[str, ...],
 ) -> dict[str, float | tuple[float, ...]]:
-    """Decode current targets or losslessly derive what legacy rows contain."""
+    """Decode a row's targets.  Only the current schema exists (§0.4)."""
     targets: dict[str, float | tuple[float, ...]] = {
         name: float(flat[index]) for index, name in enumerate(global_names)
     }
@@ -563,35 +555,7 @@ def _decode_wts_targets(
         for index, name in enumerate(per_seat_names):
             targets[name] = tuple(float(value) for value in seats[:, index])
         return targets
-    if per_seat_names != training.LEGACY_PER_SEAT_TARGETS:
-        raise ValueError("training shard has an unknown target schema")
-
-    legacy = {name: seats[:, index] for index, name in enumerate(per_seat_names)}
-    upgraded: dict[str, np.ndarray] = {
-        name: legacy[name]
-        for name in training.LEGACY_PER_SEAT_TARGETS
-        if name != "seat_valid"
-    }
-    for slot in range(3):
-        completed = legacy[f"turns_to_plan_{slot}_mask"]
-        upgraded[f"will_complete_plan_{slot}"] = completed
-        upgraded[f"plan_{slot}_first"] = np.full(
-            training.MAX_SEATS, float(training.NEVER), dtype=np.float32
-        )
-        upgraded[f"plan_{slot}_first_mask"] = np.zeros(
-            training.MAX_SEATS, dtype=np.float32
-        )
-    upgraded["end_trigger_full_sheet"] = (legacy["houses"] >= 1.0).astype(np.float32)
-    upgraded["end_trigger_all_plans"] = (
-        legacy["plans_completed"] >= 1.0
-    ).astype(np.float32)
-    upgraded["end_trigger_max_permit"] = (
-        legacy["permits"] >= 1.0
-    ).astype(np.float32)
-    upgraded["seat_valid"] = legacy["seat_valid"]
-    for name in training.PER_SEAT_TARGETS:
-        targets[name] = tuple(float(value) for value in upgraded[name])
-    return targets
+    raise ValueError("training shard has an unknown target schema")
 
 
 def _read_training_shard(path: Path) -> list[SelfPlayTrajectory]:
@@ -613,29 +577,24 @@ def _read_training_shard(path: Path) -> list[SelfPlayTrajectory]:
             and tuple(wr.TRAINING_GLOBAL_TARGET_NAMES) == training.GLOBAL_TARGETS
             and tuple(wr.TRAINING_PER_SEAT_TARGET_NAMES) == training.PER_SEAT_TARGETS
         )
-        # Versions 1 and 2 hold encoder-ABI-1 rows of a different width.  §0.4:
-        # refused, never read -- the legacy TARGET upgrade below is unreachable
-        # from a shard and survives only for its own unit test.
-        legacy_schema = False
+        # Earlier versions hold rows of an earlier encoder ABI.  §0.4: refused,
+        # never read or upgraded.
         if magic == b"WTSHRD01" and version < int(wr.TRAINING_SHARD_VERSION):
             raise ValueError(
-                f"training shard {path} is version {version} (encoder ABI 1 rows); "
+                f"training shard {path} is version {version} (an earlier encoder "
+                f"ABI's rows); "
                 f"this build reads version {int(wr.TRAINING_SHARD_VERSION)} "
                 f"(encoder ABI {enc.ENCODER_ABI_VERSION}) only"
             )
         if (
             magic != b"WTSHRD01"
-            or not (current_schema or legacy_schema)
+            or not current_schema
             or max_seats != training.MAX_SEATS
             or signature != int(wr.table_signature())
         ):
             raise ValueError(f"training shard {path} has an incompatible ABI")
         global_names = training.GLOBAL_TARGETS
-        per_seat_names = (
-            training.PER_SEAT_TARGETS
-            if current_schema
-            else training.LEGACY_PER_SEAT_TARGETS
-        )
+        per_seat_names = training.PER_SEAT_TARGETS
         target_bytes = (globals_ + training.MAX_SEATS * per_seat) * 4
         for _ in range(games):
             raw_length = handle.read(_WTS_RECORD.size)

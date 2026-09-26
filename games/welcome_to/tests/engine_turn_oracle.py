@@ -1,7 +1,9 @@
 """Test-only differential oracle: one turn, driven through the REAL engine.
 
-`game.one_turn_sheets` is a hand-written model of what a single turn can do, and
-`can_complete_this_turn` is asserted against it.  That assertion proves
+The reference for what a single turn can do.  It was written to check the hand-
+written `game.one_turn_sheets` model (deleted with the §6.4 threat predicates,
+review 2026-09-25) and now backs `tests/test_turn_bounds.py`.  A model checked
+only against itself proves
 *consistency*, not correctness: if the model omits a legal turn shape, or admits
 an illegal one, both sides of the test agree on the wrong answer and it passes.
 

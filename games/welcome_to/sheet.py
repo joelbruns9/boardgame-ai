@@ -46,6 +46,33 @@ from games.welcome_to.constants import (
     STREET_SIZES,
 )
 
+def street_writable_mask(row: list[Optional[int]], size: int) -> int:
+    """Bit ``v`` set when value ``v`` has a legal box in this street's ``row``.
+
+    Per gap, exactly the values strictly inside its bounds -- the rule
+    ``available_locations`` applies box by box.  A roundabout or the street end
+    removes a bound.
+    """
+    mask = 0
+    y = 0
+    while y < size:
+        if row[y] is not None:
+            y += 1
+            continue
+        start = y
+        while y < size and row[y] is None:
+            y += 1
+        low = MIN_NUMBER - 1
+        if start > 0 and row[start - 1] is not None and row[start - 1] != ROUNDABOUT:
+            low = row[start - 1]
+        high = MAX_NUMBER + 1
+        if y < size and row[y] is not None and row[y] != ROUNDABOUT:
+            high = row[y]
+        for v in range(max(low + 1, MIN_NUMBER), min(high - 1, MAX_NUMBER) + 1):
+            mask |= 1 << (v - MIN_NUMBER)
+    return mask
+
+
 def _row_capacity(row: list[Optional[int]], size: int) -> int:
     """The most houses that could still be written in one street's ``row``.
 
@@ -413,6 +440,62 @@ class Sheet:
         if last < size - 1 and row[last + 1] is not None and row[last + 1] != ROUNDABOUT:
             high = row[last + 1]
         return first, last, low, high
+
+    def writable_mask(self) -> int:
+        """:meth:`writable_values` as a bitmask, bit ``v`` for value ``v``."""
+        mask = 0
+        for x, size in enumerate(STREET_SIZES):
+            mask |= street_writable_mask(self.numbers[x], size)
+        return mask
+
+    def roundabout_writable_masks(self) -> list[int]:
+        """:meth:`writable_mask` after one roundabout, per empty box, box order.
+
+        Exact without copying a sheet: a roundabout changes only its own
+        street's numbers, so the other streets' masks are reused and only the
+        one street is rescanned (review 2026-09-25, throughput #3).
+        """
+        streets = [
+            street_writable_mask(self.numbers[x], size)
+            for x, size in enumerate(STREET_SIZES)
+        ]
+        out: list[int] = []
+        for x, size in enumerate(STREET_SIZES):
+            others = 0
+            for other, mask in enumerate(streets):
+                if other != x:
+                    others |= mask
+            row = self.numbers[x]
+            for y in range(size):
+                if row[y] is not None:
+                    continue
+                hypothetical = list(row)
+                hypothetical[y] = ROUNDABOUT
+                out.append(others | street_writable_mask(hypothetical, size))
+        return out
+
+    def writable_values(self) -> list[bool]:
+        """Per value 0..17, whether ``available_locations(value)`` is non-empty.
+
+        One pass over the gaps instead of eighteen location scans: an empty box
+        accepts exactly the values strictly inside its gap's bounds, which is the
+        rule ``available_locations`` applies box by box.
+        """
+        out = [False] * (MAX_NUMBER - MIN_NUMBER + 1)
+        for x, size in enumerate(STREET_SIZES):
+            row = self.numbers[x]
+            y = 0
+            while y < size:
+                if row[y] is not None:
+                    y += 1
+                    continue
+                bounds = self.gap_bounds(x, y)
+                assert bounds is not None
+                _first, last, low, high = bounds
+                for v in range(max(low + 1, MIN_NUMBER), min(high - 1, MAX_NUMBER) + 1):
+                    out[v - MIN_NUMBER] = True
+                y = last + 1
+        return out
 
     def positional_fit(self, number: int, x: int, y: int) -> Optional[float]:
         """How well ``number`` belongs at ``(x, y)``: ``0.0`` is a perfect fit.

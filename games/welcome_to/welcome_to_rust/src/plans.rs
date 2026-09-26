@@ -460,7 +460,10 @@ pub fn feasible(plan: &Plan, sheet: &Sheet) -> bool {
             !(0..STREET_SIZES[x]).any(|y| sheet.top_fences[x][y])
         }
         PlanKind::Extremities => {
+            // ⚠ Review F1: dead only if no number, no bis AND no roundabout
+            // placed in the box itself can reach it.
             let spans = sheet.span_if_roundabout(true);
+            let roundabout_left = sheet.can_build_roundabout();
             for &(x, y) in EXTREMITY_POSITIONS.iter() {
                 if sheet.top_fences[x][y] {
                     return false;
@@ -468,7 +471,7 @@ pub fn feasible(plan: &Plan, sheet: &Sheet) -> bool {
                 if !sheet.is_empty(x, y) {
                     continue;
                 }
-                if spans[x][y] == 0 && !sheet.bis_reachable(x, y) {
+                if spans[x][y] == 0 && !sheet.bis_reachable(x, y) && !roundabout_left {
                     return false;
                 }
             }
@@ -562,9 +565,9 @@ pub fn requirements_given(plan: &Plan, sheet: &Sheet, alive: bool) -> Requiremen
             let reach = sheet.bis_reach();
             let counts = sheet.bis_count_per_street();
             for x in 0..NUM_STREETS {
+                r.bis_needed[x] = (5 - counts[x]).max(0);
                 if counts[x] + reach[x] >= 5 {
                     r.street_serves[x] = 1;
-                    r.bis_needed[x] = (5 - counts[x]).max(0);
                 }
             }
         }
@@ -573,6 +576,9 @@ pub fn requirements_given(plan: &Plan, sheet: &Sheet, alive: bool) -> Requiremen
         }
         PlanKind::CompleteStreet => {
             for x in 0..NUM_STREETS {
+                r.parks_needed[x] = PARK_BOXES[x] - sheet.parks[x];
+                r.pools_needed[x] = 3 - sheet.pools[x];
+                r.roundabout_needed[x] = if sheet.has_roundabout_in_street(x) { 0 } else { 1 };
                 if sheet.pools[x] + pool_boxes_alive(sheet, x) < 3 {
                     continue;
                 }
@@ -580,9 +586,6 @@ pub fn requirements_given(plan: &Plan, sheet: &Sheet, alive: bool) -> Requiremen
                     continue;
                 }
                 r.street_serves[x] = 1;
-                r.parks_needed[x] = PARK_BOXES[x] - sheet.parks[x];
-                r.pools_needed[x] = 3 - sheet.pools[x];
-                r.roundabout_needed[x] = if sheet.has_roundabout_in_street(x) { 0 } else { 1 };
             }
         }
         PlanKind::Decorative => {
@@ -595,16 +598,16 @@ pub fn requirements_given(plan: &Plan, sheet: &Sheet, alive: bool) -> Requiremen
                 (0..NUM_STREETS).collect()
             };
             for x in streets {
-                if wants_pool && sheet.pools[x] + pool_boxes_alive(sheet, x) < 3 {
-                    continue;
-                }
-                r.street_serves[x] = 1;
                 if wants_park {
                     r.parks_needed[x] = PARK_BOXES[x] - sheet.parks[x];
                 }
                 if wants_pool {
                     r.pools_needed[x] = 3 - sheet.pools[x];
                 }
+                if wants_pool && sheet.pools[x] + pool_boxes_alive(sheet, x) < 3 {
+                    continue;
+                }
+                r.street_serves[x] = 1;
             }
         }
         PlanKind::Unsupported => {

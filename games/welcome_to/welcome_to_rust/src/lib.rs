@@ -918,10 +918,6 @@ fn welcome_to_rust(module: &Bound<'_, PyModule>) -> PyResult<()> {
         "TRAINING_PER_SEAT_TARGET_NAMES",
         samples::PER_SEAT_TARGET_NAMES.to_vec(),
     )?;
-    module.add(
-        "LEGACY_TRAINING_PER_SEAT_TARGET_NAMES",
-        samples::LEGACY_PER_SEAT_TARGET_NAMES.to_vec(),
-    )?;
     module.add("SEARCH_OUTCOME_LAYOUT_BYTES", search::outcome_layout_bytes())?;
     Ok(())
 }

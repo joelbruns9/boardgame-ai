@@ -358,29 +358,6 @@ PER_SEAT_TARGETS: tuple[str, ...] = tuple(_seat_targets(_PROBE, turn=1))
 
 #: Version-1 WTS shards ended at ``seat_valid`` and predate the dense plan
 #: outcome heads. Readers use this exact order to upgrade those immutable rows.
-LEGACY_PER_SEAT_TARGETS: tuple[str, ...] = (
-    "score",
-    "permits",
-    "houses",
-    "capacity_left",
-    "plans_completed",
-    "score_parks",
-    "score_pools",
-    "score_estates",
-    "score_plans",
-    "score_temp",
-    "score_bis",
-    "score_permits",
-    "score_roundabouts",
-    "turns_to_plan_0",
-    "turns_to_plan_0_mask",
-    "turns_to_plan_1",
-    "turns_to_plan_1_mask",
-    "turns_to_plan_2",
-    "turns_to_plan_2_mask",
-    "seat_valid",
-)
-assert set(LEGACY_PER_SEAT_TARGETS).issubset(PER_SEAT_TARGETS)
 
 #: An absent seat.  Every value zero **except** the plan sentinels, which stay
 #: :data:`NEVER` behind their zero mask, and ``seat_valid``, which is the flag

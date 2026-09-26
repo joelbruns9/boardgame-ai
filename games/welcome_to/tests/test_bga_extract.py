@@ -197,26 +197,42 @@ def _state_args(state: GameState) -> dict:
     return args
 
 
-def bga_payload(state: GameState, *, ledger: str = "complete") -> dict:
+def bga_payload(
+    state: GameState, *, ledger: str = "complete", reload: bool = False
+) -> dict:
     """Render ``state`` as the browser would capture it.
 
     ``ledger='short'`` drops the oldest half of the seen-card ledger, which is
     what a table joined or reloaded mid-game looks like.
+
+    ⚠ ``planValidations`` is rendered STALE, as BGA sends it (review F7):
+    ``notif_scorePlan`` only stamps the plan card in the DOM and the array
+    catches up at the turn boundary, so a plan the viewer validated this turn
+    appears only as a ``plan_stamps`` entry.  An earlier version inserted the
+    engine's live ``plan_turns`` and so could not see the bug.
+
+    ``reload=True`` is a page load DURING the viewer's turn (review F8):
+    ``getAllDatas`` then returns the viewer's live marks in their own
+    ``scoreSheet`` and their own current-turn validations, while the DOM still
+    shows those marks.
     """
 
     assert state.actor == 0, "a capture is always taken while the viewer acts"
     players = {}
+    delta = _delta(state.public_sheets[0], state.sheets[0], state.turn)
     for seat in range(state.config.players):
         start = state.public_sheets[seat]
+        houses = _houses(start)
+        scribbles = _scribbles(start, _PAST)
+        if reload and seat == 0:
+            houses = houses + [dict(h) for h in delta["houses"]]
+            scribbles = scribbles + [dict(m) for m in delta["scribbles"]]
         players[str(100 + seat)] = {
             "id": 100 + seat,
             "no": seat + 1,
             "name": "P%d" % seat,
             "score": 0,
-            "scoreSheet": {
-                "houses": _houses(start),
-                "scribbles": _scribbles(start, _PAST),
-            },
+            "scoreSheet": {"houses": houses, "scribbles": scribbles},
         }
 
     seen = [
@@ -227,13 +243,18 @@ def bga_payload(state: GameState, *, ledger: str = "complete") -> dict:
         seen = seen[len(seen) // 2 :]
 
     validations = []
+    stamps = []
     for slot in range(3):
         validations.append(
             {
                 str(100 + seat): {"rank": 0, "turn": turn}
                 for seat, turn in state.plan_turns[slot].items()
+                if turn < state.turn or (reload and seat == 0)
             }
         )
+        mine = state.plan_turns[slot].get(0)
+        if mine is not None:
+            stamps.append({"plan": state.plan_ids[slot], "turn": mine})
 
     return {
         "bga": {
@@ -256,7 +277,11 @@ def bga_payload(state: GameState, *, ledger: str = "complete") -> dict:
                 "args": _state_args(state),
             },
         },
-        "dom": _delta(state.public_sheets[0], state.sheets[0], state.turn),
+        "dom": dict(
+            delta,
+            plan_stamps=stamps,
+            reshuffle_vote=True if state.reshuffle_vote_for(0) else None,
+        ),
         "seen": seen,
     }
 
@@ -596,3 +621,124 @@ def test_the_write_state_is_backed_up_to_the_card_choice():
     # The combination the player took is still on the table and still legal, so
     # the advice covers what they actually did as well as the alternatives.
     assert obs["selected_stack"] in rebuilt.playable_slots()
+
+
+# ---------------------------------------------------------------------------
+# Review 2026-09-25: F7-F10 and the lost reshuffle vote
+# ---------------------------------------------------------------------------
+def _greedy_captures(phases, seeds=range(1, 12), players=2, advanced=False):
+    for seed in seeds:
+        bot = GreedyBot(rng=random.Random(seed))
+        for state in _capture_points(seed, players, advanced, limit=400, bot=bot):
+            if state.phase in phases:
+                yield state
+
+
+def test_f7_a_plan_validated_this_turn_is_read_from_its_dom_stamp():
+    """BGA's planValidations is stale until the boundary; the stamp is not."""
+    state = next(_greedy_captures({Phase.ASK_RESHUFFLE}))
+    payload = bga_payload(state)
+    mine = [slot for slot in range(3) if state.plan_turns[slot].get(0) == state.turn]
+    assert mine, "ASK_RESHUFFLE follows a validation this turn"
+    assert all("100" not in payload["bga"]["planValidations"][s] for s in mine)
+    rebuilt, _obs, _w = state_from_bga_payload(payload, rng=random.Random(0))
+    assert rebuilt.phase is Phase.ASK_RESHUFFLE
+    assert rebuilt.plan_turns == state.plan_turns
+
+    payload["dom"]["plan_stamps"] = []
+    with pytest.raises(StaleGamedata):
+        state_from_bga_payload(payload, rng=random.Random(0))
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_f8_a_reload_during_your_turn_round_trips(seed):
+    """getAllDatas returns YOUR live marks after a mid-turn reload."""
+    checked = 0
+    bot = GreedyBot(rng=random.Random(seed))
+    for original in _capture_points(seed, 2, True, limit=120, bot=bot):
+        if original.phase is Phase.WRITE_NUMBER:
+            continue
+        rebuilt, _obs, _w = state_from_bga_payload(
+            bga_payload(original, reload=True), rng=random.Random(0)
+        )
+        where = "%s turn %d" % (original.phase.name, original.turn)
+        assert rebuilt.phase is original.phase, where
+        assert rebuilt.plan_turns == original.plan_turns, where
+        _same_sheet(rebuilt.sheets[0], original.sheets[0])
+        _same_sheet(rebuilt.public_sheets[0], original.public_sheets[0])
+        checked += 1
+    assert checked > 20
+
+
+def test_f9_adjacent_estates_are_recovered_from_the_sheet():
+    """Three adjacent size-3 estates make one nine-house top-fence run."""
+    from games.welcome_to.bga_extract import _TurnMarks
+
+    state = GameState.new(seed=0, config=GameConfig(players=2))
+    for y in range(9):
+        state.sheets[0].write(y + 1, (0, y), turn=0)
+    for y in (2, 5, 8):
+        state.sheets[0].fences[0][y] = True
+    state.ctx.pending_sizes = [3, 3, 3]
+    top = [{"type": "top-fence", "x": 0, "y": y, "turn": 1} for y in range(9)]
+    obs = {"turn": 1, "my_turn_marks": {"houses": [], "scribbles": top}}
+    marks = _TurnMarks(obs, Phase.ASK_RESHUFFLE)
+    picked = []
+    for _ in range(3):
+        action = marks._validate_action(state)
+        picked.append(action)
+        chosen = next(
+            e for e in state.sheets[0].free_estates()
+            if codec.validate_estate(e[0], e[1]) == action
+        )
+        state.ctx.chosen_estates = tuple(state.ctx.chosen_estates) + (chosen,)
+        state.ctx.pending_sizes = list(state.ctx.pending_sizes)[1:]
+    assert sorted(picked) == sorted(codec.validate_estate(0, y) for y in (0, 3, 6))
+
+
+def test_f10_a_ledger_that_missed_a_reform_still_matches_the_deck_count():
+    """The deck size must equal cardsLeft, not merely be warned about."""
+    from games.welcome_to.bga_extract import _CardPool, _deck_from_ledger
+
+    state = GameState.new(seed=10, config=GameConfig(players=2))
+    state.discard = list(state.deck[state.deck_pos:])
+    state.deck = []
+    state.deck_pos = 0
+    state._begin_turn()
+    pool = _CardPool()
+    table = [tuple(map(int, CARD_TABLE[c])) for c in state.table_cards(0)]
+    for face in table:
+        pool.take(*face)
+    _discard, deck, warning = _deck_from_ledger(
+        pool,
+        seen=[tuple(map(int, c)) for c in CARD_TABLE[:81]],
+        table_faces=table,
+        cards_left=state.deck_remaining,
+        rng=random.Random(0),
+    )
+    assert len(deck) == state.deck_remaining == 75
+    assert warning and "returned to the deck" in warning
+
+
+def test_the_viewers_recorded_reshuffle_vote_is_replayed():
+    state = GameState.new(seed=0, config=GameConfig(players=2, advanced=True))
+    state.plan_ids = (21, 23, 14)
+    state.sheets[0].temps = 7
+    state.sheets[0].parks = [3, 4, 0]  # a second scorable plan keeps us on turn
+    state.public_sheets = [s.copy() for s in state.sheets]
+    state.apply(codec.choose_stack(state.playable_slots()[0]))
+    state.apply(state.legal_actions()[0])
+    while state.phase is not Phase.CHOOSE_PLAN:
+        state.apply(state.legal_actions()[-1])
+    state.apply(codec.choose_plan(0))
+    assert state.phase is Phase.ASK_RESHUFFLE
+    state.apply(codec.A_RESHUFFLE_YES)
+    assert state.phase is Phase.CHOOSE_PLAN and state.reshuffle_vote_for(0)
+
+    rebuilt, _obs, _w = state_from_bga_payload(bga_payload(state), rng=random.Random(0))
+    assert rebuilt.reshuffle_vote_for(0)
+
+    payload = bga_payload(state)
+    payload["dom"]["reshuffle_vote"] = None  # not recorded: read as "no"
+    rebuilt, _obs, _w = state_from_bga_payload(payload, rng=random.Random(0))
+    assert not rebuilt.reshuffle_vote_for(0)
