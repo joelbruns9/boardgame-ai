@@ -1611,7 +1611,7 @@ back-compatibility, no legacy head zero-fill (§0.4).
 | 5 | `encoder.py`: all planes and blocks, ABI → 2, block tables updated — §10.4, §10.5 | `encoder.py`, `tests/test_encoder.py` |
 | 6 | `encoder.rs`: port, then **§10.6 equivalence gate green before anything else runs** | `welcome_to_rust/src/encoder.rs`, `rust_encode_equiv.py` |
 | 7 | network shapes (auto-derived from `encoder` constants), regenerate WTS shards | `network.py`, `self_play.py`, `samples.rs` |
-| 8 | re-run S0 from scratch; gate per §11.2 | `train.py`, `datagen.py` |
+| 8 | ~~re-run S0 from scratch~~ **superseded 2026-09-14/26:** no behaviour cloning -- a short S2 run from random weights via `s2_run.py`, judged on the absolute trend of the §11.2 strength metrics (`progress.jsonl`) | `s2_run.py` |
 
 **Build status (2026-09-25):** steps 1–7 DONE (§19, §20) and corrected after external review (§21, ABI 3); step 8 (S0 from scratch) next.
 
@@ -1933,3 +1933,12 @@ savings.
 `test_plan_threat.py`, `turn_reach.py`); the shard target upgrade and the
 checkpoint head-row expansion. A matching ABI now means current shapes.
 
+
+**Generation throughput, idle machine (2026-09-26).** 500 games from an
+untrained 4.17M net at the production laptop config (inflight 256, 8 workers,
+200 simulations): **8,894 evaluator rows/s against the v1 encoder's 11,059
+(−20%)**; the pre-review v3 encoder was −37%. The evaluator's own cost per row
+matches v1 (71.8 vs 71.6 µs), so the remaining gap is encoding: 0.126 ms/row
+inside the scheduler, and the coordinator waits on workers for 27% of wall time
+against 13%. An earlier 6,067 rows/s reading was contaminated by a concurrent
+training run on the same GPU.
