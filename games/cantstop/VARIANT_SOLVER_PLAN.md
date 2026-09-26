@@ -423,10 +423,20 @@ vs the heuristic):
 - stop-bias recalibration: 0;
 - k=4 lookahead: 0.
 
-2p base looks close to saturated at one-turn search depth. The open
-questions -- one net across variants, and whether interaction-heavy
-variants reward more value accuracy or more search -- live in the other
-nine variants. The user's own table game is 3 players, 4 columns,
+~~2p base looks close to saturated at one-turn search depth.~~
+**Retracted (plan review, 2026-09-26): the TESTED TRAINING RECIPES
+plateaued; nothing establishes a strength ceiling.**
+- The definitive match (49.8%, [47.6, 52.0]) still allows about +/-2 pts.
+- The capacity tie is about imitating one frozen dataset.
+- k=4 tested one selective-refinement heuristic.
+- One-turn depth is not a ceiling in itself: with a perfect continuation
+  value, a complete current-turn solve is optimal in 2p. The limit is
+  evaluator quality, above all how accurately end-of-turn values RANK stop
+  against continue.
+
+The open questions -- one net across variants, and whether
+interaction-heavy variants reward more value accuracy or more search --
+still live in the other nine variants. The user's own table game is 3 players, 4 columns,
 blocking, which is also the Phase 5 target.
 
 *Staying on `train.py`, not `games/az_loop`:* the standalone loop already
@@ -506,8 +516,74 @@ plus <1 min training, plus arena every 5 iterations (~3-4 min). About 5-6
 min per iteration, so ~90-100 iterations per overnight run while sampled;
 about 5x slower after the switch to exact.
 
-**Code work before the first run** (each with tests, Python reference where
-it touches the pool):
+**Plan review (2026-09-26, `reviews/cantstop-phase4-plan-7f19f50.md` in the
+main checkout): all points accepted.** Changes:
+- **Three separate probes**, not one:
+  - the V-vs-search(V) residual is a *self-consistency* monitor only;
+  - add frozen-policy rollout calibration;
+  - add an action benchmark with independent labels;
+  - "bounded" gets a numeric threshold before the run.
+- **200-game matches are coarse monitors** (+/-6.9 pts near 50%):
+  - confirmation uses a preselected checkpoint and FRESH games;
+  - a predeclared equivalence margin (e.g. 1 pt);
+  - ~10k 2p games for +/-1 pt;
+  - complete seat cycles for 3-4p (201, not 200 games);
+  - repeated looks at ten variants invalidate the per-match intervals as
+    a stopping rule.
+- **`capacity_probe` must consume the actual Phase 4 data:** it hard-codes
+  2p and λ=0.7 (confirmed). Add dataset export/import with game, variant,
+  target mode and teacher metadata, and report per variant.
+- **Run a target-variant specialist earlier** (3p, 4 col, blocking): a
+  generalist tying the 2p specialist says little about the game the user
+  plays.
+- **Frozen references:** keep a permanent one alongside any iteration-40
+  reference.
+- **Sampled-to-exact** only as a controlled branch from the same
+  checkpoint, against a sampled control, at equal wall clock and equal
+  rows. Log the replay-window target mixture across the switch; no global
+  plateau trigger.
+- **True restart state and experiment identity:** optimizer, replay (or
+  reconstructible data), RNGs, cumulative iteration, rule mix, search
+  settings, checkpoint paths, commit. Today's `--init-checkpoint` is a warm
+  start. `eval_matches` JSON must record its checkpoints and search
+  settings.
+- **Reflection augmentation -- VERIFIED.** Columns c <-> 14 - c with dice
+  d -> 7 - d is an exact symmetry, yet the 2p net's mover value differs
+  under reflection by 1.09 pts mean, 12.4 max, >1 pt on 57/200 boards
+  (reviewer: 0.70 mean, 8.6 max on 120). Randomly reflect training rows;
+  test mirrored-prediction averaging separately, since it doubles inference
+  cost. Never permute seats: turn order matters.
+- **Forced-action benchmark:** actual stop/roll decision states, split
+  into strata (random, small margin, imminent threat, contested/blocking,
+  checkpoint disagreement). For each state, force *stop* vs *roll once*
+  (later decisions stay free), continue both to the end under a frozen,
+  identified controller with paired dice, and report the difference with
+  its confidence. Repeat a subset with a full-round lookahead and other
+  opponent styles. This measures decision quality directly. The pool can
+  already start mid-turn from AWAIT_DECISION.
+- **Later ideas, each as a separate controlled ablation:**
+  - counterfactual-leaf labels (training sees only the board actually
+    reached, while the solver scores thousands of rejected alternatives);
+  - control-variate (luck-adjusted) rollouts for evaluation;
+  - a solved late-game suite (cross-turn busts cycle, so it needs
+    fixed-point methods);
+  - features: next-turn-win auxiliary, distance-to-claim, opponent race.
+    The encoder's "the solver makes probability features redundant" was
+    too broad: the solver covers only the mover's turn.
+
+**Revised order of work:**
+1. Forced-action benchmark, experiment metadata, and the confirmation
+   harness, on the 2p specialist (`runs/td0_personas/iter_0120.pt`).
+2. Reflection augmentation against a matched continuation of the same
+   checkpoint.
+3. Alongside 1-2: the generalist's row balancing and per-variant logs.
+4. A modest generalist pilot **and** a 3p-4col-blocking specialist
+   baseline.
+5. Only then choose between stronger labels/search, more data or more
+   capacity -- by which test shows a gap.
+
+**Code work for the generalist run** (each with tests, Python reference
+where it touches the pool):
 1. `--rows-per-variant`: the adaptive per-variant game schedule, and the
    persona seating over the mixed schedule.
 2. Per-variant evaluation: heuristic and frozen-reference matches for
