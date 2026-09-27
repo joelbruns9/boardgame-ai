@@ -3,6 +3,9 @@
 **For:** a third-party reviewer, to brainstorm how the network could learn this
 rather than have search compensate for it.
 **Written:** 2026-09-27. **Branch:** `sevenwd-w9-prototype`.
+**Updated 2026-09-27 after a first review:** §8 decomposes the error and
+supersedes the diagnosis in §3.6 -- averaging is NOT the cause; it is an
+evaluation error in some moves and a discovery error in others.
 **Cross-reference:** `WORLD_CLASS_MODEL_EVOLUTION_PLAN.md` (below: "the plan") --
 its reference case, Workstreams 9-11, and *Correct confidently wrong priors
 deliberately*.
@@ -303,3 +306,95 @@ enumerate the hidden pool for the revealed slot, force each card there
 (`bga_replay._force_card`), apply the move, and search the result at
 `visits_move // n_branches` and at 3,200 simulations. Worth promoting to a tool if
 the reviewer wants the mirror and no-reveal measurements from §4.
+
+---
+
+## 8. Addendum after the first review: the error decomposed
+
+### 8.1 What the first review pointed out (verified against the code)
+
+* The "position value" measured throughout §3 is the search's root **mean**,
+  `root_value_sum / root_visits` (`advisor_adapter.py`, `_RustClosedHandle.advance`).
+  It averages every simulation through the node, including exploration of weaker
+  replies. So a shallow-vs-deep gap could come from three different errors:
+  **discovery** (the search did not find the opponent's best reply),
+  **evaluation** (it found it but valued its outcome wrongly), or
+  **averaging** (it found and valued it correctly, but the mean still carries
+  visits spent on weaker replies).
+* The training value target is 50% that same mean: `value_bootstrap = 0.5` blends
+  the outcome with `move.root_value` (`dataset.py::bootstrap_root_value`,
+  `train.py`). If averaging were the cause, training would be teaching it back.
+* The checkpoint has the W4 hierarchical value head but `value_source = 'flat'`:
+  search never reads it.
+* `bga_review.summarize` applied its 100-visit filter to the move-choice total
+  only. Fixed (`ea62f78`); the §3.1 totals predate the fix.
+
+### 8.2 The measurement
+
+For every reveal branch behind the three single-reveal moves of §3.5 (23
+branches, all ZeusAI to move), at the budget the tree actually gave each branch:
+
+* the shallow search's **mean** and the Q of its **most-visited reply**;
+* a **deep (3,200-sim) value of each reply** holding >= 5% of the shallow visits,
+  searched independently from the position after that reply;
+* the deep value of ZeusAI's **best** reply among those, and the deep root mean.
+
+Decomposition (the reviewer's), in the human's win probability, positive =
+optimistic for the human:
+
+* *allocation / averaging* = shallow-visit-weighted deep value of the replies
+  minus the deep value of the best reply;
+* *evaluation* = shallow-visit-weighted (shallow Q - deep Q) of the same replies.
+
+### 8.3 Results (means over each move's branches)
+
+| move | branches | shallow mean | shallow most-visited Q (share of visits) | deep value of that reply | deep value of the best reply | allocation | evaluation |
+|---|---|---|---|---|---|---|---|
+| G1 #61 `Build: Arena` | 5 | 0.20 | 0.20 (97-99%) | **0.02** | 0.02 | +0.00 | **+0.17** |
+| G2 #51 `Build: Port` | 10 | 0.27 | 0.25 (77-98%) | 0.21 | 0.19 | +0.01 | **+0.05** |
+| G2 #36 `Discard: Horse Breeders` | 8 | 0.89 | 0.86 (27-53%) | 0.87 | **0.73** | **+0.13** | +0.02 |
+
+Per-branch highlights:
+
+* **Arena:** in every branch the shallow search put 97-99% of its visits on the
+  reply the deep search also ranks best, and valued it 15-19 points too well
+  (e.g. reveal `Arsenal`: 0.20 vs 0.02).
+* **Horse Breeders:** in 6 of 8 branches the shallow favourite was
+  `Build: Brickyard` (deep: leaves the human 0.87-0.94). ZeusAI's actual best
+  leaves 0.71-0.77. In the two branches where the shallow search did favour it
+  (reveals `Brewery`, `School`), it was **`Wonder: The Temple of Artemis`** --
+  the same extra-turn Wonder as the plan's reference case (table `908370787`).
+* At 3,200 simulations the root mean and the best reply agree within ~0.02
+  everywhere: at depth, averaging is negligible.
+
+### 8.4 What this settles
+
+1. **Averaging is not the cause.** The shallow mean and its most-visited Q differ
+   by at most 0.06 in every branch. Backing up the best (or most-visited) reply
+   instead of the mean would barely change these values, and a max over replies
+   cannot find a reply the search never funded. The "+0.13 allocation" at Horse
+   Breeders is visits spent on the WRONG reply, i.e. discovery, not averaging
+   around the right one.
+2. **Two distinct failures, sometimes in the same game:**
+   * **Evaluation** (Arena, Port): the right reply is found and valued too
+     optimistically -- the value of positions a few plies ahead is too good for
+     the human until real depth arrives. Candidate direction §6.1 item 1 (deep
+     value targets) with the bootstrap target redefined.
+   * **Discovery** (Horse Breeders): ZeusAI's extra-turn Wonder reply is
+     under-funded -- the plan's low-prior loop again. Candidate direction §6.2
+     item 5 (targeted prior correction), for which the 267-episode corpus exists.
+3. This supports the reviewer's recommended first experiment -- control vs policy
+   correction vs value correction vs both -- and gives each arm a measured
+   target on real games: evaluation error at Arena/Port-type positions, discovery
+   of the Artemis-type reply at Horse-Breeders-type positions.
+
+### 8.5 Caveats
+
+* 23 branches, 3 moves, 2 games; selected for being overrated (prevalence
+  unknown).
+* Each reply's deep value uses one sampled card for any reveal that reply itself
+  causes.
+* 3,200 simulations is a deeper reference, not a solved value, and shares the
+  network and priors being judged.
+* Still unmeasured: the mirror seat, no-reveal positions, `leaf_batch` 1 vs 16,
+  and the hierarchical vs flat value head (panel rows 2-6).
