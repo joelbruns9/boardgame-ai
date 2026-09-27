@@ -35,7 +35,7 @@ want ideas on.
 | item | value |
 |---|---|
 | network | `run07_iter35.pt` -- run07 iteration 35 (W1 slots, W2 graph, W3 control, W4 hierarchical value, W5 action residual at alpha ~0.67), warm-started from `candidate_0085.pt` |
-| search | the advisor's Rust PUCT search, `leaf_batch` 16, laptop RTX 3070, bf16 off (CPU-precision evaluator path) |
+| search | the advisor's Rust PUCT search, `leaf_batch` 16, laptop RTX 3070 GPU, fp32 evaluator (the advisor's default precision) |
 | games | BGA tables `922514551` (loss) and `922535304` (loss), human vs ZeusAI, human = first player |
 | "truth" | a 3,200-simulation search. **Not solved values** -- a deeper reference, and where it matters we say so |
 | logs | `runs/seven_wonders_duel/bga_game_log/table_<id>.jsonl` (gitignored; local only) |
