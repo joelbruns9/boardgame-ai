@@ -65,18 +65,24 @@ class ReplayBuffer:
         self._chunks = deque()
         self._rows = 0
 
-    def add(self, features, slots):
+    def add(self, features, slots, meta=None):
+        """One iteration's rows. ``meta``: optional per-row arrays (e.g.
+        variant, source game, target mode) kept alongside, so the buffer
+        can be exported as a dataset and its target mixture logged."""
         if len(features) != len(slots):
             raise ValueError("features and labels disagree in length")
+        meta = dict(meta or {})
+        if any(len(v) != len(features) for v in meta.values()):
+            raise ValueError("meta arrays disagree in length")
         if not len(features):
             return
-        self._chunks.append((features, slots))
+        self._chunks.append((features, slots, meta))
         self._rows += len(features)
         while len(self._chunks) > 1 and (
                 (self.max_rows is not None and self._rows > self.max_rows)
                 or (self.window_iterations is not None
                     and len(self._chunks) > self.window_iterations)):
-            old_x, _ = self._chunks.popleft()
+            old_x = self._chunks.popleft()[0]
             self._rows -= len(old_x)
 
     @property
@@ -91,8 +97,31 @@ class ReplayBuffer:
         if not self._chunks:
             return (np.zeros((0, FEATURE_SIZE), dtype=np.float32),
                     np.zeros(0, dtype=np.int64))
-        return (np.concatenate([x for x, _ in self._chunks]),
-                np.concatenate([y for _, y in self._chunks]))
+        return (np.concatenate([c[0] for c in self._chunks]),
+                np.concatenate([c[1] for c in self._chunks]))
+
+    def meta(self, name):
+        """One metadata column over the whole buffer (None if any chunk
+        lacks it)."""
+        cols = [c[2].get(name) for c in self._chunks]
+        if not cols or any(c is None for c in cols):
+            return None
+        return np.concatenate(cols)
+
+    def state(self):
+        """Everything needed to rebuild the buffer exactly (resume)."""
+        return {"max_rows": self.max_rows,
+                "window_iterations": self.window_iterations,
+                "chunks": [(x, y, dict(m)) for x, y, m in self._chunks]}
+
+    @classmethod
+    def from_state(cls, state):
+        buf = cls(max_rows=state["max_rows"],
+                  window_iterations=state["window_iterations"])
+        for x, y, m in state["chunks"]:
+            buf._chunks.append((x, y, m))
+            buf._rows += len(x)
+        return buf
 
 
 def persona_seating(schedule, rng, search, conservative=0.0,
@@ -148,7 +177,11 @@ def generate(rule_sets, games_per_ruleset, evaluate, rng, backend="auto",
         backend = "rust" if rust_pool.rust_available() else "python"
     if backend not in ("rust", "python"):
         raise ValueError(f"unknown backend {backend!r}")
-    schedule = [r for r in rule_sets for _ in range(games_per_ruleset)]
+    # ``games_per_ruleset``: one count for every rule set, or a
+    # {rules: games} mapping (the Phase 4 row-balanced schedule).
+    counts = (games_per_ruleset if isinstance(games_per_ruleset, dict)
+              else {r: games_per_ruleset for r in rule_sets})
+    schedule = [r for r in rule_sets for _ in range(counts[r])]
     seeds = rust_pool.game_seeds(rng, len(schedule))
     seat_searches = persona_seating(schedule, rng, search, conservative,
                                     aggressive, persona_bias)

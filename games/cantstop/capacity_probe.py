@@ -46,8 +46,28 @@ def dataset(net_path, games, lam, seed):
     return xs, ys
 
 
+def dataset_from_state(path):
+    """The Phase 4 replay buffer as a dataset: rows grouped by SOURCE GAME
+    (for a split that cannot leak), with each game's variant. Returns
+    (xs, ys, variants, rule_names). Plan review: the probe must fit the
+    data the run actually trains on, not regenerate 2p games."""
+    st = torch.load(path, map_location="cpu", weights_only=False)
+    chunks = st["buffer"]["chunks"]
+    x = np.concatenate([c[0] for c in chunks])
+    y = np.concatenate([c[1] for c in chunks])
+    game = np.concatenate([c[2]["game"] for c in chunks])
+    variant = np.concatenate([c[2]["variant"] for c in chunks])
+    xs, ys, vs = [], [], []
+    for g in np.unique(game):
+        m = game == g
+        xs.append(x[m])
+        ys.append(y[m])
+        vs.append(int(variant[m][0]))
+    return xs, ys, vs, st["config"]["rule_sets"]
+
+
 def train_one(hidden, x_tr, y_tr, x_ho, y_ho, epochs, batch, lr, device,
-              seed):
+              seed, v_ho=None, names=None):
     torch.manual_seed(seed)
     net = CantStopNet(hidden=hidden).to(device)
     opt = torch.optim.Adam(net.parameters(), lr=lr)
@@ -82,14 +102,27 @@ def train_one(hidden, x_tr, y_tr, x_ho, y_ho, epochs, batch, lr, device,
     with torch.no_grad():
         t = y_ho.clamp_min(1e-12)
         h_ho = float(-(y_ho * torch.log(t)).sum(dim=-1).mean())
+        per_variant = {}
+        if v_ho is not None:
+            for v in torch.unique(v_ho).tolist():
+                m = v_ho == v
+                ce = float(masked_soft_cross_entropy(net(x_ho[m]), y_ho[m],
+                                                     m_ho[m]))
+                hv = float(-(y_ho[m] * torch.log(t[m])).sum(dim=-1).mean())
+                per_variant[names[v] if names else v] = {
+                    "rows": int(m.sum()), "ce": ce, "ce_minus_entropy": ce - hv}
     return {"params": params, "best_heldout": best, "final_train": curve[-1][0],
             "final_heldout": curve[-1][1], "heldout_target_entropy": h_ho,
-            "best_heldout_minus_entropy": best - h_ho, "curve": curve}
+            "best_heldout_minus_entropy": best - h_ho,
+            "per_variant_final": per_variant, "curve": curve}
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--net", required=True)
+    ap.add_argument("--net", default=None,
+                    help="generate a 2p dataset with this net (legacy mode)")
+    ap.add_argument("--data", default=None,
+                    help="a Phase 4 state.pt: use its replay buffer instead")
     ap.add_argument("--games", type=int, default=20_000)
     ap.add_argument("--lam", type=float, default=0.7)
     ap.add_argument("--epochs", type=int, default=20)
@@ -102,7 +135,13 @@ def main(argv=None):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     t = time.perf_counter()
-    xs, ys = dataset(args.net, args.games, args.lam, args.seed)
+    if args.data:
+        xs, ys, vs, names = dataset_from_state(args.data)
+    elif args.net:
+        xs, ys = dataset(args.net, args.games, args.lam, args.seed)
+        vs, names = [0] * len(xs), ["2p base (generated)"]
+    else:
+        raise SystemExit("give --data (Phase 4 state.pt) or --net")
     gen_seconds = time.perf_counter() - t
     # Split by GAME: rows of one game are correlated, so a row-level split
     # would leak and flatter the larger nets.
@@ -112,13 +151,15 @@ def main(argv=None):
     cat = lambda idx, arrs: torch.from_numpy(
         np.concatenate([arrs[i] for i in idx])).to(device)
     x_tr, y_tr, x_ho, y_ho = cat(tr, xs), cat(tr, ys), cat(ho, xs), cat(ho, ys)
+    v_ho = torch.from_numpy(np.concatenate(
+        [np.full(len(xs[i]), vs[i]) for i in ho])).to(device)
     report = {"games": len(xs), "train_rows": len(x_tr),
               "heldout_rows": len(x_ho), "gen_seconds": round(gen_seconds),
               "sizes": {}}
     for name, hidden in SIZES.items():
         t = time.perf_counter()
         r = train_one(hidden, x_tr, y_tr, x_ho, y_ho, args.epochs, args.batch,
-                      args.lr, device, args.seed)
+                      args.lr, device, args.seed, v_ho, names)
         r["seconds"] = round(time.perf_counter() - t)
         report["sizes"][name] = r
         print(f"{name:34} params {r['params']:>9,}  best held-out "
