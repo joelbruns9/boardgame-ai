@@ -43,6 +43,10 @@
   let lastSignature = null;
   let exactEnabled = null;
   let lastRenderedJob = null;
+  // The position the current search is for, and whether its final advice has
+  // been logged -- see logAdvice.
+  let searchState = null;
+  let adviceLogged = true;
   let lastRenderedWarnings = [];
 
   // -- injection ------------------------------------------------------------
@@ -448,6 +452,9 @@
   }
 
   async function stopCurrent() {
+    // The board changed (or a new search is starting): whatever the panel shows
+    // now is the advice the player acted on, so record it before it is gone.
+    logAdvice();
     if (pollTimer) {
       clearInterval(pollTimer);
       pollTimer = null;
@@ -545,8 +552,47 @@
     }
   }
 
+  // What the advisor actually showed, logged beside the decision so a post-game
+  // review compares the move against the advice as it was -- same network, same
+  // simulation count -- instead of re-searching after the fact with different
+  // settings. Once per search: when it finishes, or when the board moves on.
+  async function logAdvice() {
+    if (adviceLogged || !searchState || !lastRenderedJob) return;
+    adviceLogged = true;
+    const job = lastRenderedJob;
+    const snap = job.snapshot;
+    if (!snap) return;
+    const top = (snap.recommendations || []).slice(0, TOP_N).map((r) => ({
+      action_id: r.action_id,
+      label: r.label,
+      visits: r.visits,
+      visit_frac: r.visit_frac,
+      win: (r.q_value + 1) / 2,
+      prior: r.prior,
+    }));
+    try {
+      await post("/api/game_log", {
+        table_id: tableId(),
+        kind: "advice",
+        state: searchState,
+        extra: {
+          job_id: job.job_id,
+          status: job.status,
+          sims_done: job.sims_done || snap.sims_done || 0,
+          root_win: (snap.root_value + 1) / 2,
+          warnings: lastRenderedWarnings,
+          top,
+        },
+      });
+    } catch (err) {
+      /* best-effort, like every other log row */
+    }
+  }
+
   async function startSearch(state) {
     await stopCurrent();
+    searchState = state;
+    adviceLogged = false;
     lastRenderedJob = null;
     lastRenderedWarnings = [];
     setStatus("searching…");
@@ -625,6 +671,7 @@
       setStatus("thinking");
     }
     render(resp, warnings);
+    if (resp.status === "done") logAdvice();
   }
 
   // -- bridge ---------------------------------------------------------------
