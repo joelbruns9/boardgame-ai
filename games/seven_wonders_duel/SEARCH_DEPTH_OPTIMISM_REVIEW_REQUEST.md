@@ -3,9 +3,10 @@
 **For:** a third-party reviewer, to brainstorm how the network could learn this
 rather than have search compensate for it.
 **Written:** 2026-09-27. **Branch:** `sevenwd-w9-prototype`.
-**Updated 2026-09-27 after a first review:** §8 decomposes the error and
-supersedes the diagnosis in §3.6 -- averaging is NOT the cause; it is an
-evaluation error in some moves and a discovery error in others.
+**Updated 2026-09-27 after two review rounds:** §8 decomposes the error
+(averaging is NOT the cause); §9 records the second review and a divergence
+trace showing the Arena-type error is a pure value-head error on a position the
+exact solver proves lost. §8-§9 supersede the diagnosis in §3.6.
 **Cross-reference:** `WORLD_CLASS_MODEL_EVOLUTION_PLAN.md` (below: "the plan") --
 its reference case, Workstreams 9-11, and *Correct confidently wrong priors
 deliberately*.
@@ -398,3 +399,73 @@ Per-branch highlights:
   network and priors being judged.
 * Still unmeasured: the mirror seat, no-reveal positions, `leaf_batch` 1 vs 16,
   and the hierarchical vs flat value head (panel rows 2-6).
+
+---
+
+## 9. Second review round, and the divergence trace
+
+### 9.1 Accepted from the second review
+
+* Max/min backup is the *correct target* (max over the mover's choices, mean over
+  chance). The objection is only to estimating it from thin, selection-biased Q
+  values. Two different changes were conflated in §8: reporting the best child's
+  Q (argued against by §8) and **recursive max/min backup at every node** (not
+  tested; kept as a separate ablation).
+* Max backup cannot repair a SHARED evaluation error: max_b(Q(b) - d) = max_b Q(b) - d.
+* Keep average backup and the KataGo-style cheap/full generation split
+  (launcher: 100 / 1,600 sims, 25% full, ~475 sims per decision; the run logs
+  ~519). Chance reveals dilute the per-branch budget (e.g. 100 root sims x 60%
+  on a move / 10 reveals = ~6 visits per branch), an amplifier, not a cause.
+* §8's two measurement limits: a reply's deep value used ONE sampled card when
+  that reply itself reveals cards, and only replies with >= 5% of shallow visits
+  were deep-evaluated. Magnitudes and "best reply" labels are provisional.
+* **A discovery failure deeper down looks like an evaluation failure higher up**
+  -- tested below.
+
+### 9.2 Divergence trace: follow the deep main line, compare at every ply
+
+From the ACTUAL reveal branch, following the deep (3,200-sim) search's move at
+each ply; raw = the network alone; shallow = 340 sims; exact =
+`solve_endgame(value_only, star2)` where it finished within 50M nodes / 40 s.
+Human's win probability.
+
+G1 #61 `Build: Arena` (reveal Arsenal):
+
+| ply | to move | raw | shallow | deep | exact | shallow picks the deep move? |
+|---|---|---|---|---|---|---|
+| 0 | ZeusAI | **0.61** | 0.22 | 0.03 | **0.00** | yes |
+| 1 | human | 0.59 | 0.19 | 0.02 | 0.00 | yes |
+| 2 | ZeusAI | 0.50 | 0.06 | 0.01 | 0.00 | yes |
+| 3 | human | 0.48 | 0.02 | 0.00 | 0.00 | yes |
+| 4 | ZeusAI | 0.18 | 0.00 | 0.00 | 0.00 | yes |
+
+G2 #51 `Build: Port` (reveal Palace): raw 0.32 / shallow 0.22 / deep 0.14 at
+ply 0, converging by ply 3 (raw 0.17, deep 0.10); shallow and deep choose the
+same move at 8 of 10 plies, the exceptions being one equal-valued Wonder choice
+and the final ply (where, interestingly, the solver reads 0.25 against deep 0.09).
+
+### 9.3 What it settles
+
+* **Arena is a pure value-head error, not a hidden discovery failure.** Shallow
+  and deep agree on every move to the end; the solver proves the position lost
+  at every ply; the network alone reads **61%** five plies before a certain loss,
+  and 48% three plies before it. Search removes the error only by grinding
+  through it.
+* **Port is the same kind of error earlier in Age III**, shrinking as the game
+  nears its end.
+* The evaluation failure is therefore concentrated in **judging late-game
+  civilian outcomes** -- in effect score arithmetic over buildings, coins,
+  guilds and military -- which the exact endgame solver can label perfectly.
+
+### 9.4 Questions this raises (unanswered)
+
+* run07 already trains on endgame-solver labels (the heartbeat reports ~6,400
+  solves per iteration, `value_solver` replacing the outcome target where it
+  answered). Why does the network still read 61% on a proven loss? Either such
+  positions fall outside the solver's trigger in self-play, or solver labels are
+  too small a share of training to fix close civilian endgames, or human-vs-
+  ZeusAI endgames are off the self-play distribution. Worth measuring from the
+  run's replay data before designing a treatment.
+* Would a treatment aimed at late-game value (solver-labelled correction
+  positions, weighted) move the Arena/Port numbers, and does the gain reach
+  earlier-game positions where the solver cannot answer?
