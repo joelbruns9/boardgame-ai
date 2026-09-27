@@ -55,8 +55,11 @@ Tools (all committed, `019d38c` and earlier):
     possible reveals);
   * **reveal luck** -- the actual reveal's value minus the mean over 8
     alternative reveals.
-  Age-closing moves (whose "after" contains a guessed next deal) and moves with
-  under 100 visits are excluded from totals.
+  Age-closing moves (whose "after" contains a guessed next deal) are excluded
+  from all totals; moves with under 100 visits are excluded from the move-choice
+  and overrating totals (the two that read the move's tree value). The first
+  version applied the visit filter to move choice only -- corrected after review;
+  the §3.1 totals predate that correction.
 
 ---
 

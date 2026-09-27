@@ -179,7 +179,7 @@ def summarize(result: dict) -> str:
     rows = result["rows"]
     def tot(who, key):
         keep = lambda r: r[key] is not None and r[key] == r[key] and not r.get("age_end")
-        if key == "choice":  # a thinly-visited move's tree value is noise
+        if key in ("choice", "optimism"):  # both read the move's tree value, which is noise when thin
             keep = lambda r, k=keep: k(r) and r["visits_move"] >= 100
         return sum(r[key] for r in rows if r["who"] == who and keep(r))
     lines = [f"table {result['table']}: {len(rows)} decisions reviewed"]
