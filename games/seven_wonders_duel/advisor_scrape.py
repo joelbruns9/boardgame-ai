@@ -280,6 +280,19 @@ def _determinize_draft(state, obs, pool, rng: random.Random) -> None:
     state.wonder_round = picked // 4  # 0-indexed: 0 is the first group
     state.wonder_pick_index = picked % 4
     state.wonder_offer = list(obs.wonder_offer)
+    # Each round deals 4 and every pick removes one, so the offer size is fixed
+    # by the pick count. A capture taken while BGA is still drawing the offer
+    # shows fewer (seen live: 3 of 4 at the first pick). Accepting it builds a
+    # group of 3, the search drafts past the end of it, and the Rust tree
+    # reaches a non-terminal state with no legal moves ("zero-mass policy").
+    # Refuse it; the extension re-captures once the page has settled.
+    expected_offer = 4 - state.wonder_pick_index
+    if len(state.wonder_offer) != expected_offer:
+        raise ValueError(
+            f"incomplete wonder offer: {len(state.wonder_offer)} shown after "
+            f"{picked} pick(s), expected {expected_offer}; the page is probably "
+            "still drawing the draft"
+        )
 
     # `pick_wonder` asserts active_player == _draft_order(round)[pick_index], and
     # new_game(0, 0) leaves first_player = 0, so a draft state MUST set it or

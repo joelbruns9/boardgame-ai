@@ -246,3 +246,22 @@ def test_every_draft_position_survives_a_deep_search():
         finally:
             handle.close()
     assert seen == {(r, p) for r in (0, 1) for p in range(4)}, seen
+
+
+def test_partly_drawn_wonder_offer_is_refused():
+    """A capture taken while BGA was still drawing the offer (live, table
+    922514551): 3 of the 4 first-round wonders, at the first pick. Accepted, it
+    became a group of 3; the search drafted past its end and the Rust tree hit a
+    non-terminal state with no legal moves -- "zero-mass policy" again, from a
+    different transient than the between-rounds one above."""
+
+    import dataclasses
+
+    game = new_game(7, 0)
+    obs = game.observation(0)
+    partial = dataclasses.replace(obs, wonder_offer=tuple(obs.wonder_offer)[:3])
+    rebuilt = observation_from_wire(observation_to_wire(partial))
+    with pytest.raises(ValueError, match="incomplete wonder offer: 3 shown after 0"):
+        determinize_observation(rebuilt, random.Random(0))
+    # The complete capture of the same position still determinizes.
+    determinize_observation(observation_from_wire(observation_to_wire(obs)), random.Random(0))
