@@ -334,15 +334,10 @@ def test_a_chance_free_proof_becomes_a_one_hot_value_target():
     ]
 
 
-def test_an_expectimax_proof_supplies_no_value_target_at_all():
-    """A scalar expected utility does not determine a three-class distribution.
-
-    The solver returns ``P(win) - P(loss)``, and 7WD has real draws, so a 0.0
-    could be a certain draw, balanced wins and losses, or any mixture. Turning
-    it into ``(0.5, 0, 0.5)`` would be a fabricated proof, and most confidently
-    wrong exactly where the truth is most certain -- a position all of whose
-    chance outcomes draw. These rows keep the realised outcome instead.
-    """
+def test_an_expectimax_proof_becomes_a_win_loss_value_target():
+    """The scalar is P(win) - P(loss); with draws ~0.1% of games it maps to a
+    (win, 0, loss) split. The chance-free-only rule dropped 70% of proofs --
+    nearly all of them 6-12 plies from the end, where the value head is worst."""
 
     from .dataset import collate
 
@@ -350,9 +345,24 @@ def test_an_expectimax_proof_supplies_no_value_target_at_all():
         [
             _example(solver_value=0.0, solver_exact=False),
             _example(solver_value=0.5, solver_exact=False),
+            _example(solver_value=-1.0, solver_exact=False),
         ]
     )
-    assert batch["value_solver_valid"].tolist() == [False, False]
+    assert batch["value_solver_valid"].tolist() == [True, True, True]
+    assert batch["value_solver"].tolist() == [
+        [0.5, 0.0, 0.5],
+        [0.75, 0.0, 0.25],
+        [0.0, 0.0, 1.0],
+    ]
+
+
+def test_expectimax_value_labels_can_be_switched_off(monkeypatch):
+    from . import dataset
+    from .dataset import collate
+
+    monkeypatch.setattr(dataset, "SOLVER_EXPECTIMAX_VALUE_LABELS", False)
+    batch = collate([_example(solver_value=0.5, solver_exact=False)])
+    assert batch["value_solver_valid"].tolist() == [False]
     assert batch["value_solver"].sum() == 0.0
 
 
@@ -398,16 +408,20 @@ class _Move:
         self.i, self.solver_regime, self.solver_masked = i, regime, masked
 
 
-def test_only_chance_free_proofs_earn_value_weight():
-    """`exact_expectimax` rows keep the realised outcome, so upweighting them
-    would emphasise a certainty they do not have."""
+def test_every_proof_that_labels_value_earns_value_weight(monkeypatch):
+    """Value weight follows the value LABEL: expectimax proofs label value now
+    (SOLVER_EXPECTIMAX_VALUE_LABELS), so they share the per-game bonus; switched
+    off, only chance-free proofs do, as before."""
 
+    from . import dataset
     from .dataset import solver_row_weights
 
-    weights = solver_row_weights(
-        [_Move(0), _Move(1, "exact_expectimax"), _Move(2, "exact")]
-    )
+    moves = [_Move(0), _Move(1, "exact_expectimax"), _Move(2, "exact")]
+    weights = solver_row_weights(moves)
     assert 0 not in weights
+    assert weights[1][0] > 1.0 and weights[2][0] > 1.0
+    monkeypatch.setattr(dataset, "SOLVER_EXPECTIMAX_VALUE_LABELS", False)
+    weights = solver_row_weights(moves)
     assert weights[2][0] > 1.0
     assert 1 not in weights or weights[1][0] == 1.0
 

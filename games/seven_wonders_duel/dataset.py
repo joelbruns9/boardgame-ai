@@ -651,6 +651,21 @@ def is_fast_search_move(move) -> bool:
 #: value head alone, and as a per-game budget so a game with eight solved plies
 #: does not read as eight independent proofs.
 SOLVER_VALUE_BONUS = 1.0
+
+#: Train the value head on ``exact_expectimax`` proofs too, as a (win, 0, loss)
+#: split of their scalar P(win) - P(loss).
+#:
+#: The scalar genuinely cannot say how much of the non-win mass is a draw, which
+#: is why these proofs were dropped (see ``solver_value_distribution``). But
+#: dropping them was measured to cost far more than the ambiguity: on cloud2's
+#: last three iterations 70% of all answered proofs were expectimax, and 6-12
+#: plies from the end they were ~12,000 positions against ~55 chance-free ones --
+#: exactly where the value head misjudges late civilian games (a BGA review found
+#: run07 reading 61% on a position the solver proves LOST). Shared-civilian draws
+#: are ~0.1% of games, so zero draw mass misplaces at most half the true draw
+#: probability onto each side -- the same assumption ``value_soft`` already makes.
+#: Off restores chance-free-only labels (the A/B arm).
+SOLVER_EXPECTIMAX_VALUE_LABELS = True
 SOLVER_POLICY_BONUS = 0.0
 
 
@@ -668,7 +683,11 @@ def solver_row_weights(moves) -> dict[int, tuple[float, float]]:
     evidence is how a handful of games come to dominate a head.
     """
 
-    exact = [m.i for m in moves if m.solver_regime == "exact"]
+    exact = [
+        m.i for m in moves
+        if m.solver_regime == "exact"
+        or (SOLVER_EXPECTIMAX_VALUE_LABELS and m.solver_regime == "exact_expectimax")
+    ]
     masked = [m.i for m in moves if m.solver_masked]
     weights: dict[int, tuple[float, float]] = {}
     value_share = SOLVER_VALUE_BONUS / len(exact) if exact else 0.0
@@ -1434,8 +1453,15 @@ def solver_value_distribution(example: Example) -> tuple[float, float, float] | 
     the per-action ordering, which is exact in both regimes.
     """
 
-    if example.solver_value is None or not example.solver_exact:
+    if example.solver_value is None:
         return None
+    if not example.solver_exact:
+        if not SOLVER_EXPECTIMAX_VALUE_LABELS:
+            return None
+        # Expected utility over chance: P(win) - P(loss). Zero draw mass; see
+        # SOLVER_EXPECTIMAX_VALUE_LABELS for why that is safe here.
+        win = min(1.0, max(0.0, (1.0 + float(example.solver_value)) / 2.0))
+        return (win, 0.0, 1.0 - win)
     # Chance-free: every value in the explored tree is a min/max over terminals,
     # so the root value IS a terminal result -- exactly -1, 0 or +1 -- and 0
     # means a drawn game rather than a balance of outcomes.
