@@ -341,6 +341,9 @@ PACK_THREADS="${PACK_THREADS:-0}"
 # has since argued otherwise", which is a better starting point than argparse.
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.5}"
 VALUE_BOOTSTRAP="${VALUE_BOOTSTRAP:-0.5}"
+# Share of the value target from the TD(lambda) return over values recorded later
+# in the same game (dataset.short_term_values). 0 = off; launch_7wd_run.sh sets it.
+SHORT_TERM_VALUE_WEIGHT="${SHORT_TERM_VALUE_WEIGHT:-0}"
 MIN_BUFFER_POSITIONS="${MIN_BUFFER_POSITIONS:-200000}"
 REPLAY_WINDOW_COEFFICIENT="${REPLAY_WINDOW_COEFFICIENT:-1000}"
 REPLAY_WINDOW_EXPONENT="${REPLAY_WINDOW_EXPONENT:-0.6}"
@@ -1140,6 +1143,7 @@ TRAIN_CMD=(
   --rust-scheduler-workers "$RUST_SCHEDULER_WORKERS"
   --weight-decay "$WEIGHT_DECAY"
   --value-bootstrap "$VALUE_BOOTSTRAP"
+  --short-term-value-weight "$SHORT_TERM_VALUE_WEIGHT"
   --min-buffer-positions "$MIN_BUFFER_POSITIONS"
   --replay-window-coefficient "$REPLAY_WINDOW_COEFFICIENT"
   --replay-window-exponent "$REPLAY_WINDOW_EXPONENT"

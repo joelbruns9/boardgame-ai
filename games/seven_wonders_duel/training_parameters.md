@@ -129,7 +129,7 @@ two is visible.
   --rust-slots 256 --rust-global-batch-cap 2048 --rust-max-inflight-batches 1 `
   --gate-slots 144 --gate-global-batch-cap 1024 `
   --gate-sims 64 `
-  --weight-decay 0.5 --value-bootstrap 0.5 `
+  --weight-decay 0.5 --value-bootstrap 0.5 --short-term-value-weight 0.25 `
   --min-buffer-positions 200000 `
   --replay-window-coefficient 1000 --replay-window-exponent 0.6 `
   --temperature-floor 0.35 --temperature-anneal-moves 30 `
@@ -1046,6 +1046,27 @@ Pair it with a `--weight-decay` that actually acts.
 
 Values at or near 1.0 are pure self-distillation and remove the only ground
 truth the head has. Untested above 0.5.
+
+### `--short-term-value-weight`
+
+**Default:** `0.0` (off). **Cloud:** `0.25`. **Value:** float in [0, 1)
+
+Mixes a short-term value target into the value target, on top of
+`--value-bootstrap`: each position is also trained toward the TD(lambda) return
+over the values recorded LATER in the same game -- an endgame proof where the
+solver answered, else that move's search root value -- with per-ply decay
+`dataset.SHORT_TERM_DECAY = 0.8` (effective horizon ~5 plies) and the game's
+result absorbing the tail. With `--value-bootstrap 0.5` the mix is outcome
+37.5% / own search 37.5% / short-term 25%; a proof still replaces all three.
+
+Why: a BGA review (`SEARCH_DEPTH_OPTIMISM_REVIEW_REQUEST.md`) found the value head
+misjudging late civilian games (61% on a solver-proven loss) and a position's own
+shallow search inheriting the error. Values recorded a few moves later are closer
+to the end and, near it, proofs; this carries those corrections back along every
+game in one step instead of over many iterations. KataGo uses the same signal
+through separate heads; it is blended into the main target here so a running
+model adopts it without a shape change. Applies to cached examples at the next
+derivation (it is computed from the record, not stored in it).
 
 ### `--value-weight`
 

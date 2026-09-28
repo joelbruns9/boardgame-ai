@@ -589,6 +589,11 @@ class PhaseDConfig:
     """Independent W5 scorer loss; zero preserves historical training."""
     value_weight: float = 1.0
     value_bootstrap: float = 0.0
+    short_term_value_weight: float = 0.0
+    """Share of the value target taken from the TD(lambda) return over values
+    recorded later in the same game (`dataset.short_term_values`, decay
+    `SHORT_TERM_DECAY`). Carries endgame proofs and closer-to-the-end search
+    values back to earlier positions. 0 = off (unchanged targets)."""
     validate_every: int = 100
     restore_best_val: bool = False
     val_fraction: float = 0.05
@@ -1249,6 +1254,8 @@ class PhaseDConfig:
         }
 
     def validate(self) -> None:
+        if not 0.0 <= self.short_term_value_weight < 1.0:
+            raise ValueError("short_term_value_weight must be in [0, 1)")
         if self.precision not in {"fp32", "bf16"}:
             raise ValueError("precision must be fp32 or bf16")
         if self.schedule_basis not in {"games", "iterations"}:
@@ -5005,6 +5012,7 @@ class PhaseDLoop:
             aux_weight=self.config.aux_weight,
             value_weight=self.config.value_weight,
             value_bootstrap=self.config.value_bootstrap,
+            short_term_value_weight=self.config.short_term_value_weight,
             action_policy_weight=self.config.action_policy_weight,
             hier_value_weight=self.config.hier_value_weight,
             hier_value_replaces_joint7=self.config.hier_value_replaces_joint7,
@@ -5487,6 +5495,7 @@ class PhaseDLoop:
             aux_weight=self.config.aux_weight,
             value_weight=self.config.value_weight,
             value_bootstrap=self.config.value_bootstrap,
+            short_term_value_weight=self.config.short_term_value_weight,
             action_policy_weight=self.config.action_policy_weight,
             hier_value_weight=self.config.hier_value_weight,
             hier_value_replaces_joint7=self.config.hier_value_replaces_joint7,
@@ -7387,6 +7396,15 @@ def build_parser() -> argparse.ArgumentParser:
         "which is why this ships off.",
     )
     parser.add_argument(
+        "--short-term-value-weight",
+        type=float,
+        default=0.0,
+        help="share of the value target taken from the TD(lambda) return over "
+        "values recorded later in the same game (endgame proofs where the solver "
+        "answered, else search root values), decay dataset.SHORT_TERM_DECAY. "
+        "Carries late-game corrections back to earlier positions. 0 = off.",
+    )
+    parser.add_argument(
         "--value-bootstrap",
         type=float,
         default=0.0,
@@ -7969,6 +7987,7 @@ def main(argv=None) -> int:
         action_policy_weight=args.action_policy_weight,
         value_weight=args.value_weight,
         value_bootstrap=args.value_bootstrap,
+        short_term_value_weight=args.short_term_value_weight,
         validate_every=args.validate_every,
         restore_best_val=args.restore_best_val,
         val_fraction=args.val_fraction,

@@ -185,6 +185,10 @@ class Example:
     #: was biased AND this example is derived for the model that biased it.
     #: `specialist.assert_no_shaped_bootstrap` reads this.
     root_value_shaped: bool = False
+    #: Short-term value target (actor frame, in [-1, 1]): the TD(lambda) return
+    #: over the values recorded LATER in the same game -- see
+    #: `short_term_values`. None for rows with no source move.
+    short_term_value: float | None = None
     #: The recorded move this row came from, or None for a row with no move
     #: (reanalysis). Carried so one derivation can be PROJECTED onto another
     #: model's view without replaying the game again -- see
@@ -796,6 +800,60 @@ def _policy_for_move(move, legal: np.ndarray) -> np.ndarray:
     return policy
 
 
+#: Per-ply decay of the short-term value target. 0.8 weights the next move 0.2,
+#: the one after 0.16, ... -- an effective horizon of about five plies, with the
+#: final result absorbing the rest.
+SHORT_TERM_DECAY = 0.8
+
+
+def short_term_values(record, decay: float = SHORT_TERM_DECAY) -> dict[int, float]:
+    """``{move index: target}`` -- each position's TD(lambda) return, actor frame.
+
+    The target for the position before move ``j`` is
+    ``(1 - decay) * sum_m decay**m * u[j+1+m]``, where ``u`` is the value recorded
+    at each LATER move (its endgame proof when the solver answered, else its
+    search's root value) and, past the last move, the game's result. Each ``u`` is
+    converted to move ``j``'s mover's frame. A later move with no value (a
+    curriculum bot's) passes the return through unchanged.
+
+    Why: a position's own shallow search misjudges late civilian games (a BGA
+    review found 61% on a proven loss), while values recorded a few moves later
+    are closer to the end and, near it, are proofs. This carries those
+    corrections back along the game in one step -- KataGo's short-term value
+    idea, blended into the main value target rather than a separate head so a
+    running model can adopt it without a shape change.
+    """
+
+    moves = list(record.moves)
+    if record.winner is None:
+        tail = 0.0
+    else:
+        tail = 1.0 if record.winner == 0 else -1.0  # player 0's frame
+    out: dict[int, float] = {}
+    for move in reversed(moves):
+        out[move.i] = tail if move.actor == 0 else -tail
+        value = move.solver_value
+        if value is None:
+            value = bootstrap_root_value(move)[0]
+        if value is None:
+            continue
+        in_p0 = float(value) if move.actor == 0 else -float(value)
+        tail = (1.0 - decay) * in_p0 + decay * tail
+    return out
+
+
+def _with_short_term(examples: list, record) -> list:
+    if not examples:
+        return examples
+    targets = short_term_values(record)
+    return [
+        dataclasses.replace(example, short_term_value=targets.get(example.move_index))
+        if example.move_index is not None and not example.reanalysis
+        else example
+        for example in examples
+    ]
+
+
 def examples_from_record(
     record: GameRecord,
     *,
@@ -989,7 +1047,7 @@ def examples_from_record(
                 move_index=move_index,
             )
         )
-    return examples
+    return _with_short_term(examples, record)
 
 
 _CHANCE_KIND_IDS = {
@@ -1173,7 +1231,7 @@ def _examples_from_rust_payload(
         wonders_built=int(stats_payload["wonders_built"]),
         wonders_discarded=int(stats_payload["wonders_discarded"]),
     )
-    return examples, stats
+    return _with_short_term(examples, record), stats
 
 
 def usable_root_outlook(example) -> list[float] | None:
@@ -1509,6 +1567,10 @@ def collate(
     # the outcome term remains their only source of supervision.
     value_soft = torch.zeros((size, 3), dtype=torch.float32)
     value_soft_valid = torch.zeros(size, dtype=torch.bool)
+    # Short-term value target (see `short_term_values`), same zero-draw mapping
+    # as `value_soft`; blended in by `compute_losses(short_term_value_weight=)`.
+    value_short = torch.zeros((size, 3), dtype=torch.float32)
+    value_short_valid = torch.zeros(size, dtype=torch.bool)
     # The PROVEN value of the position, over the same (win, draw, loss) axis.
     # Kept separate from `value_soft` because the two mean different things: one
     # is the search's opinion, to be blended with the outcome in whatever
@@ -1559,6 +1621,11 @@ def collate(
             value_soft[row, 0] = probability
             value_soft[row, 2] = 1.0 - probability
             value_soft_valid[row] = True
+        if getattr(example, "short_term_value", None) is not None:
+            short = min(1.0, max(0.0, (1.0 + float(example.short_term_value)) / 2.0))
+            value_short[row, 0] = short
+            value_short[row, 2] = 1.0 - short
+            value_short_valid[row] = True
         proven = solver_value_distribution(example)
         if proven is not None:
             value_solver[row] = torch.tensor(proven)
@@ -1590,6 +1657,8 @@ def collate(
         "value_class": value_class,
         "value_soft": value_soft,
         "value_soft_valid": value_soft_valid,
+        "value_short": value_short,
+        "value_short_valid": value_short_valid,
         "value_solver": value_solver,
         "value_solver_valid": value_solver_valid,
         "joint7": joint7,

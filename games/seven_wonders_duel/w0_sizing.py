@@ -222,6 +222,8 @@ def _pack_examples(examples, val_fraction: float, split_salt: str) -> dict:
         # it, so a target added there has to be added here too.
         "value_soft": torch.zeros(rows, 3, dtype=torch.float32),
         "value_soft_valid": torch.zeros(rows, dtype=torch.bool),
+        "value_short": torch.zeros(rows, 3, dtype=torch.float32),
+        "value_short_valid": torch.zeros(rows, dtype=torch.bool),
         "value_solver": torch.zeros(rows, 3, dtype=torch.float32),
         "value_solver_valid": torch.zeros(rows, dtype=torch.bool),
         "joint7": torch.zeros(rows, dtype=torch.int8),
@@ -264,6 +266,11 @@ def _pack_examples(examples, val_fraction: float, split_salt: str) -> dict:
             storage["value_soft"][row, 0] = probability
             storage["value_soft"][row, 2] = 1.0 - probability
             storage["value_soft_valid"][row] = True
+        if getattr(example, "short_term_value", None) is not None:
+            short = min(1.0, max(0.0, (1.0 + float(example.short_term_value)) / 2.0))
+            storage["value_short"][row, 0] = short
+            storage["value_short"][row, 2] = 1.0 - short
+            storage["value_short_valid"][row] = True
         proven = solver_value_distribution(example)
         if proven is not None:
             storage["value_solver"][row] = torch.tensor(proven)

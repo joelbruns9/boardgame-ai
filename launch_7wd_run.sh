@@ -117,6 +117,10 @@ export SWD_CONTROL_FEATURES="${SWD_CONTROL_FEATURES:-1}"  # W3
 # CUDA-graph replay: on a 5090 one thread dispatching ~520 kernels per forward
 # capped generation while the shards idled 60%. See cuda_graphs.py.
 export CUDA_GRAPHS="${CUDA_GRAPHS:-1}"
+# Short-term value targets: carry endgame proofs and later, closer-to-the-end
+# search values back along each game (dataset.short_term_values). With the 0.5
+# value bootstrap the target mix is outcome 37.5% / own search 37.5% / this 25%.
+export SHORT_TERM_VALUE_WEIGHT="${SHORT_TERM_VALUE_WEIGHT:-0.25}"
 export ACTION_RESIDUAL="${ACTION_RESIDUAL:-1}"          # W5
 export ACTION_EXPOSES="${ACTION_EXPOSES:-1}"
 export ACTION_POLICY_WEIGHT="${ACTION_POLICY_WEIGHT:-0.5}"

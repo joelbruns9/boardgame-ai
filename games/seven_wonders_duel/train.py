@@ -93,6 +93,7 @@ def compute_losses(
     value_weight: float = VALUE_WEIGHT_DEFAULT,
     value_bootstrap: float = 0.0,
     solver_value_target: bool = True,
+    short_term_value_weight: float = 0.0,
     row_weights: bool = True,
     reply_weight: float = REPLY_WEIGHT_DEFAULT,
     action_policy_weight: float = ACTION_POLICY_WEIGHT_DEFAULT,
@@ -175,6 +176,21 @@ def compute_losses(
         target = F.one_hot(batch["value_class"], num_classes=3).float()
     else:
         target = None
+    if short_term_value_weight > 0.0 and "value_short" in batch:
+        # The TD(lambda) return over values recorded later in the game
+        # (`dataset.short_term_values`), mixed into whatever the target already
+        # is: outcome x (1-b)(1-s), own search x b(1-s), short-term x s. Rows
+        # without it keep their target. A proof, below, still replaces all three.
+        base = (
+            target if target is not None
+            else F.one_hot(batch["value_class"], num_classes=3).float()
+        )
+        target = torch.where(
+            batch["value_short_valid"].unsqueeze(1),
+            (1.0 - short_term_value_weight) * base
+            + short_term_value_weight * batch["value_short"],
+            base,
+        )
     if has_solver:
         # A proven value REPLACES the outcome outright rather than blending with
         # it -- at full weight, and regardless of `value_bootstrap`. The realised
@@ -1261,6 +1277,7 @@ def train_steps(
     aux_weight: float = AUX_WEIGHT_DEFAULT,
     value_weight: float = VALUE_WEIGHT_DEFAULT,
     value_bootstrap: float = 0.0,
+    short_term_value_weight: float = 0.0,
     validate_every: int = 100,
     optimizer_state: dict | None = None,
     restore_best_val: bool = False,
@@ -1371,6 +1388,7 @@ def train_steps(
                 hier_value_weight=hier_value_weight,
                 hier_value_replaces_joint7=hier_value_replaces_joint7,
                 outlook_bootstrap=outlook_bootstrap,
+                short_term_value_weight=short_term_value_weight,
             )
         scaler.scale(total).backward()
         scaler.unscale_(optimizer)
