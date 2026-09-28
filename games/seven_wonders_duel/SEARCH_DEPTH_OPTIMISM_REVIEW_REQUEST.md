@@ -469,3 +469,38 @@ and the final ply (where, interestingly, the solver reads 0.25 against deep 0.09
 * Would a treatment aimed at late-game value (solver-labelled correction
   positions, weighted) move the Arena/Port numbers, and does the gain reach
   earlier-game positions where the solver cannot answer?
+
+---
+
+## 10. The solver-label gap, and the fix now in run07
+
+§9.4 asked why run07 still misjudges proven late-game positions despite training
+on endgame-solver labels. Answer: **most proofs never became value labels.**
+`dataset.solver_value_distribution` accepted only chance-free (`exact`) proofs;
+`exact_expectimax` proofs -- a scalar P(win) - P(loss) over hidden cards -- were
+dropped because the scalar cannot separate draws. They still masked the policy
+and improved self-play endgames, but taught the value head nothing.
+
+Measured with `solver_label_coverage.py` (reads `buffers/iter_*.jsonl`):
+
+| run, iterations | answered proofs | value labels | answered 6-12 plies from end | of which labelled | search miss there (mean abs, value units) |
+|---|---|---|---|---|---|
+| cloud2, 94-96 | 24,650 | 7,480 (30%) | 12,217 | 55 | 0.21-0.23 |
+| run07, 36-40 | 38,509 | 11,734 (30%) | 19,302 | 78 | 0.18-0.20 |
+
+The recording search's value sits BELOW the proof from the mover's side at every
+distance (-0.05 to -0.10), the same direction as the §3 finding seen from the
+other seat.
+
+**Fix (`73a3504`):** expectimax proofs now label value as (win, 0, loss) --
+draws are ~0.1% of games, the assumption `value_soft` already makes -- replacing
+the outcome and sharing the per-game value bonus.
+`SOLVER_EXPECTIMAX_VALUE_LABELS = False` restores the old rule for an A/B arm.
+Records are unchanged, so it applies to the whole replay window at once. Expected
+effect: ~3.3x more proven value labels, nearly all 6-12 plies from the end.
+Applied to run07 by resuming at iteration ~41 with `ALLOW_RESUME_CODE_DRIFT=1`.
+
+Still open: whether this repairs the Arena/Port-type misjudgement (re-run the §9
+trace on a post-fix checkpoint), and whether the gain reaches positions earlier
+than the solver can answer. It does not address the discovery failure (§8, the
+Temple of Artemis reply), which remains the targeted-prior-correction work.
