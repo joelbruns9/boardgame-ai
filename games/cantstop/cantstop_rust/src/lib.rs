@@ -358,9 +358,64 @@ type TableRow = (
 /// `leaf_snapshots()`, evaluate them however you like, `set_leaf_values`
 /// (backs up), then query. `games/cantstop/rust_solver.py` wraps this in
 /// `solver.TurnSolver`'s interface.
-#[pyclass(name = "TurnSolver", unsendable)]
+#[pyclass(name = "TurnSolver")]
 pub struct PyTurnSolver {
     inner: TurnSolver,
+    candidate_values: Vec<f64>,
+    candidate_reach: Option<Vec<f64>>,
+    reach_evaluations: usize,
+}
+
+impl PyTurnSolver {
+    fn updated_values(&mut self, values: &[f64]) {
+        let n = self.inner.num_players;
+        let actor = self.inner.active as usize;
+        self.candidate_values = values.chunks_exact(n).map(|r| r[actor]).collect();
+        self.candidate_reach = None;
+    }
+
+    fn ensure_reach(&mut self) -> PyResult<()> {
+        if self.candidate_reach.is_none() {
+            self.candidate_reach = Some(self.inner.leaf_reach()?);
+            self.reach_evaluations += 1;
+        }
+        Ok(())
+    }
+}
+
+/// Shared native ranking kernel. Ascending iteration preserves Python max's
+/// first-leaf tie rule. Scale before comparing to preserve underflow ties.
+fn select_candidate(reach: &[f64], values: &[f64], excluded: &[usize], influence: f64,
+                    exploratory: bool) -> PyResult<Option<(f64, f64, usize)>> {
+    if reach.len() != values.len() || !influence.is_finite() || influence < 0.0 {
+        return Err(PyValueError::new_err("invalid candidate inputs"));
+    }
+    let mut skip = vec![false; reach.len()];
+    for &i in excluded {
+        if i >= skip.len() { return Err(PyValueError::new_err("excluded leaf out of range")); }
+        skip[i] = true;
+    }
+    let mut best: Option<(f64, f64, usize)> = None;
+    for (i, (&r, &v)) in reach.iter().zip(values).enumerate() {
+        let w = influence * r;
+        if !r.is_finite() || r < 0.0 || !v.is_finite() || !(0.0..=1.0).contains(&v) || !w.is_finite() {
+            return Err(PyValueError::new_err("nonfinite or invalid candidate score"));
+        }
+        if skip[i] { continue; }
+        let replace = match best {
+            None => true,
+            Some((bw, bv, _)) => if exploratory { v > bv || (v == bv && w > bw) }
+                                else { w > bw || (w == bw && v > bv) },
+        };
+        if replace { best = Some((w, v, i)); }
+    }
+    Ok(best)
+}
+
+#[pyfunction]
+fn select_leaf_candidate(reach: Vec<f64>, values: Vec<f64>, excluded: Vec<usize>,
+                         influence: f64, exploratory: bool) -> PyResult<Option<(f64, f64, usize)>> {
+    select_candidate(&reach, &values, &excluded, influence, exploratory)
 }
 
 #[pymethods]
@@ -369,7 +424,7 @@ impl PyTurnSolver {
     fn new(snap: Snapshot) -> PyResult<Self> {
         let state = state_from_snapshot(snap)?;
         let inner = TurnSolver::new_cached(&state)?;
-        Ok(PyTurnSolver { inner })
+        Ok(PyTurnSolver { inner, candidate_values: Vec::new(), candidate_reach: None, reach_evaluations: 0 })
     }
 
     #[getter]
@@ -394,8 +449,31 @@ impl PyTurnSolver {
 
     /// `TurnSolver::leaf_reach`, per leaf in `leaf_snapshots` order (after
     /// `set_leaf_values`): the lookahead's ranking signal, for diagnostics.
-    fn leaf_reach(&self) -> PyResult<Vec<f64>> {
-        Ok(self.inner.leaf_reach()?)
+    fn leaf_reach(&mut self) -> PyResult<Vec<f64>> {
+        self.ensure_reach()?;
+        Ok(self.candidate_reach.as_ref().unwrap().clone())
+    }
+
+    #[getter]
+    fn reach_evaluations(&self) -> usize { self.reach_evaluations }
+
+    fn leaf_reach_at(&mut self, leaf: usize) -> PyResult<f64> {
+        if leaf >= self.inner.num_leaves() { return Err(PyValueError::new_err("leaf out of range")); }
+        self.ensure_reach()?;
+        Ok(self.candidate_reach.as_ref().unwrap()[leaf])
+    }
+
+    fn best_candidate(&mut self, influence: f64, exploratory: bool, excluded: Vec<usize>)
+                      -> PyResult<Option<(f64, f64, usize)>> {
+        self.ensure_reach()?;
+        select_candidate(self.candidate_reach.as_ref().unwrap(), &self.candidate_values,
+                         &excluded, influence, exploratory)
+    }
+
+    /// Materialize only the requested continuation, including bust at zero.
+    fn leaf_snapshot(&self, leaf: usize) -> PyResult<Snapshot> {
+        if leaf >= self.inner.num_leaves() { return Err(PyValueError::new_err("leaf out of range")); }
+        Ok(snapshot_of(&self.inner.leaf_board(leaf)))
     }
 
     /// The value at the solve's root: the roll value for a turn start, or
@@ -430,7 +508,9 @@ impl PyTurnSolver {
             .into());
         }
         let flat: Vec<f64> = values.into_iter().flatten().collect();
-        Ok(self.inner.set_leaf_values(&flat)?)
+        self.inner.set_leaf_values(&flat)?;
+        self.updated_values(&flat);
+        Ok(())
     }
 
     /// The same from little-endian float64 bytes, row-major
@@ -444,7 +524,23 @@ impl PyTurnSolver {
             .chunks_exact(8)
             .map(|b| f64::from_le_bytes(b.try_into().expect("8 bytes")))
             .collect();
-        Ok(self.inner.set_leaf_values(&flat)?)
+        self.inner.set_leaf_values(&flat)?;
+        self.updated_values(&flat);
+        Ok(())
+    }
+
+    /// Replace continuation values and recompute the existing turn table.
+    fn rebackup(&mut self, values: Vec<Vec<f64>>) -> PyResult<()> {
+        let n = self.inner.num_players;
+        if values.len() != self.inner.num_leaves() || values.iter().any(|r|
+            r.len() != n || r.iter().any(|x| !x.is_finite() || *x < 0.0 || *x > 1.0)
+            || (r.iter().sum::<f64>() - 1.0).abs() > 1e-6) {
+            return Err(PyValueError::new_err("expected one probability vector per leaf"));
+        }
+        let flat: Vec<f64> = values.into_iter().flatten().collect();
+        self.inner.rebackup(&flat)?;
+        self.updated_values(&flat);
+        Ok(())
     }
 
     fn table(&self) -> Vec<TableRow> {
@@ -796,6 +892,7 @@ fn cantstop_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRng>()?;
     m.add_class::<PyGameState>()?;
     m.add_class::<PyTurnSolver>()?;
+    m.add_function(wrap_pyfunction!(select_leaf_candidate, m)?)?;
     m.add_class::<PySelfPlayPool>()?;
     m.add_function(wrap_pyfunction!(encode_snapshots, m)?)?;
     m.add_function(wrap_pyfunction!(menu_cache_stats, m)?)?;

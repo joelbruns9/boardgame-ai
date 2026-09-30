@@ -160,8 +160,12 @@ def persona_seating(schedule, rng, search, conservative=0.0,
 
 def generate(rule_sets, games_per_ruleset, evaluate, rng, backend="auto",
              threads=0, stats=None, in_flight=None, search=PLAIN,
-             conservative=0.0, aggressive=0.0, persona_bias=0.03):
+             conservative=0.0, aggressive=0.0, persona_bias=0.03,
+             allow_unfinished=False):
     """Play the scheduled games and return every result.
+
+    ``allow_unfinished`` (rust only) returns a game that hits the turn limit
+    with ``winner == -1`` instead of raising; the caller must drop it.
 
     Each game rolls from its own ``PortableRng``, seeded up front in
     schedule order, so both backends play exactly the same games:
@@ -177,6 +181,8 @@ def generate(rule_sets, games_per_ruleset, evaluate, rng, backend="auto",
         backend = "rust" if rust_pool.rust_available() else "python"
     if backend not in ("rust", "python"):
         raise ValueError(f"unknown backend {backend!r}")
+    if allow_unfinished and backend != "rust":
+        raise ValueError("allow_unfinished needs the rust backend")
     # ``games_per_ruleset``: one count for every rule set, or a
     # {rules: games} mapping (the Phase 4 row-balanced schedule).
     counts = (games_per_ruleset if isinstance(games_per_ruleset, dict)
@@ -193,7 +199,8 @@ def generate(rule_sets, games_per_ruleset, evaluate, rng, backend="auto",
             in_flight=in_flight or rust_pool.DEFAULT_IN_FLIGHT,
             searches=slots,
             search_seating=[[slots.index(x) for x in seats]
-                            for seats in seat_searches])
+                            for seats in seat_searches],
+            allow_unfinished=allow_unfinished)
     return [play_game(rules, evaluate, PortableRng(seed),
                       seat_searches=seats)
             for rules, seed, seats in zip(schedule, seeds, seat_searches)]

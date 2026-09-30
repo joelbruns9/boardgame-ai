@@ -1,0 +1,12 @@
+#cantstop-advisor-panel { position:fixed; top:80px; right:18px; z-index:2147483646; width:300px; background:#18232f; color:#edf3f8; padding:16px; border:1px solid #668093; border-radius:10px; box-shadow:0 5px 24px #0006; font:14px/1.5 system-ui,sans-serif; }
+#cantstop-advisor-panel header {font-size:18px; font-weight:700; margin-bottom:8px;}
+#cantstop-advisor-panel select {width:100%; margin:5px 0; color:#111;}
+#cantstop-advisor-panel button {color:#111; cursor:pointer;}
+#cantstop-advisor-panel .advisor-move {padding:8px 0; border-bottom:1px solid #ffffff20;}
+#cantstop-advisor-panel .advisor-move:first-child {color:#98e7be; font-weight:700;}
+#cantstop-advisor-panel footer {margin-top:12px;}
+#cantstop-advisor-panel [data-role=facts] {font-size:12px; color:#b7c7d6;}
+
+
+#cantstop-advisor-panel {max-height:85vh;overflow-y:auto;}
+#cantstop-advisor-panel .advisor-selected {border-left:3px solid #98e7be;padding-left:8px;}

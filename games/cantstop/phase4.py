@@ -18,7 +18,10 @@ ten-variant run:
 * **true resume**: ``state.pt`` holds the net, optimizer, replay buffer
   (with per-row variant / game / target-mode metadata -- also the dataset
   `capacity_probe --data` reads), RNG states, schedule, probes and
-  iteration; ``--resume`` continues the same run exactly.
+  iteration; ``--resume`` continues the same run exactly;
+* **delayed personas** (``personas_from``): plain self-play until that
+  iteration. An untrained net's values are nearly flat, so the aggressive
+  persona (stop_bias < 0) always prefers rolling and never banks.
 
     python -m games.cantstop.phase4 --out runs/p4_pilot --iterations 100 \\
         --rows-per-variant 4000 --td-lambda 0 --conservative 0.2 --aggressive 0.1 \\
@@ -38,15 +41,20 @@ from .engine import ALL_RULESETS
 from .experiment import identity, write_json
 from .model import CantStopNet, NetEvaluator, load_net, save_net
 from .schedule import RowSchedule
-from .self_play import PLAIN, Search, stack_training, summarize
+from .self_play import (PLAIN, Search, TurnLimitExceeded,
+                        stack_training, summarize)
 from .train import (ReplayBuffer, generate, lr_at, parse_lr_schedule,
                     steps_for_passes, train_steps)
 from .variant_eval import ProbeSet, evaluate_variants
 
+# Share of an iteration's games allowed to hit the turn limit (dropped).
+MAX_UNFINISHED = 0.05
+
 # Arguments that define the run; a resume must not change them.
 FIXED = ("rule_sets", "rows_per_variant", "hidden", "batch_size", "passes",
          "replay_window", "td_lambda", "exact_from", "conservative",
-         "aggressive", "persona_bias", "reflect_augment", "seed")
+         "aggressive", "persona_bias", "personas_from", "reflect_augment",
+         "seed")
 
 
 def _per_variant(results, rule_sets):
@@ -77,6 +85,7 @@ def run(out_dir, iterations, rule_sets=ALL_RULESETS, rows_per_variant=4000,
         hidden=(512, 512, 256, 256), lr=1e-3, lr_schedule=None,
         batch_size=256, passes=5.0, replay_window=10, td_lambda=0.0,
         exact_from=None, conservative=0.0, aggressive=0.0, persona_bias=0.03,
+        personas_from=None,
         reflect_augment=False, eval_every=5, eval_games=200,
         reference_iter=40, probes_per_variant=50, probe_alert=0.05, seed=0,
         device=None, init_checkpoint=None, threads=0, in_flight=None,
@@ -89,6 +98,7 @@ def run(out_dir, iterations, rule_sets=ALL_RULESETS, rows_per_variant=4000,
               "replay_window": replay_window, "td_lambda": td_lambda,
               "exact_from": exact_from, "conservative": conservative,
               "aggressive": aggressive, "persona_bias": persona_bias,
+              "personas_from": personas_from,
               "reflect_augment": reflect_augment, "seed": seed}
     device = torch.device(device or ("cuda" if torch.cuda.is_available()
                                      else "cpu"))
@@ -97,9 +107,10 @@ def run(out_dir, iterations, rule_sets=ALL_RULESETS, rows_per_variant=4000,
     if resume:
         st = torch.load(state_path, map_location=device, weights_only=False)
         for k in FIXED:
-            if st["config"][k] != config[k]:
+            # .get: runs saved before a key existed had its default (None).
+            if st["config"].get(k) != config[k]:
                 raise SystemExit(f"--resume must not change {k}: run has "
-                                 f"{st['config'][k]!r}, got {config[k]!r}")
+                                 f"{st['config'].get(k)!r}, got {config[k]!r}")
         net = CantStopNet(hidden=tuple(st["config"]["hidden"])).to(device)
         net.load_state_dict(st["net"])
         opt = torch.optim.Adam(net.parameters(), lr=lr)
@@ -148,14 +159,32 @@ def run(out_dir, iterations, rule_sets=ALL_RULESETS, rows_per_variant=4000,
             group["lr"] = it_lr
         exact = exact_from is not None and it >= exact_from
         search = Search(exact_root=exact)
+        personas = personas_from is None or it >= personas_from
         games = schedule.games()
 
         started = time.time()
         results = generate(rule_sets, games, NetEvaluator(net, device=str(device)),
                            rng, threads=threads, in_flight=in_flight,
-                           search=search, conservative=conservative,
-                           aggressive=aggressive, persona_bias=persona_bias)
+                           search=search,
+                           conservative=conservative if personas else 0.0,
+                           aggressive=aggressive if personas else 0.0,
+                           persona_bias=persona_bias,
+                           allow_unfinished=True)
         gen_seconds = time.time() - started
+        # An untrained net plays erratically, and the aggressive persona
+        # (stop_bias < 0) never banks while its values are flat, so a rare
+        # game hits the turn limit. Drop those games (no winner, no
+        # targets) rather than abort the run; a policy that stalls often
+        # is still a failure.
+        unfinished = {}
+        for r in results:
+            if r.winner < 0:
+                unfinished[str(r.rules)] = unfinished.get(str(r.rules), 0) + 1
+        if sum(unfinished.values()) > MAX_UNFINISHED * len(results):
+            raise TurnLimitExceeded(
+                f"iteration {it}: {sum(unfinished.values())} of "
+                f"{len(results)} games hit the turn limit {unfinished}")
+        results = [r for r in results if r.winner >= 0]
         schedule.update(results)
 
         x, y = stack_training(results, td_lambda)
@@ -171,7 +200,7 @@ def run(out_dir, iterations, rule_sets=ALL_RULESETS, rows_per_variant=4000,
         exact_share = buffer.meta("exact")
         record = {
             "iteration": it, "lr": it_lr, "loss": loss,
-            "exact_targets": exact,
+            "exact_targets": exact, "personas": personas,
             "buffer_rows": len(buffer), "window_iterations": buffer.iterations,
             "buffer_exact_share": (float(exact_share.mean())
                                    if exact_share is not None else None),
@@ -180,6 +209,7 @@ def run(out_dir, iterations, rule_sets=ALL_RULESETS, rows_per_variant=4000,
             "train_seconds": round(train_seconds, 1),
             "games": {str(r): g for r, g in games.items()},
             "variants": _per_variant(results, rule_sets),
+            "unfinished": unfinished,
         }
 
         if eval_every and it % eval_every == 0:
@@ -249,6 +279,9 @@ def main(argv=None):
     p.add_argument("--conservative", type=float, default=0.0)
     p.add_argument("--aggressive", type=float, default=0.0)
     p.add_argument("--persona-bias", type=float, default=0.03)
+    p.add_argument("--personas-from", type=int, default=None,
+                   help="plain self-play before this iteration, personas "
+                        "from it on (default: from the first)")
     p.add_argument("--reflect-augment", action="store_true")
     p.add_argument("--eval-every", type=int, default=5)
     p.add_argument("--eval-games", type=int, default=200,
@@ -273,6 +306,7 @@ def main(argv=None):
         replay_window=args.replay_window, td_lambda=args.td_lambda,
         exact_from=args.exact_from, conservative=args.conservative,
         aggressive=args.aggressive, persona_bias=args.persona_bias,
+        personas_from=args.personas_from,
         reflect_augment=args.reflect_augment, eval_every=args.eval_every,
         eval_games=args.eval_games, reference_iter=args.reference_iter,
         probes_per_variant=args.probes_per_variant,

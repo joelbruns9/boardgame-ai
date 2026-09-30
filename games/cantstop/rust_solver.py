@@ -86,6 +86,12 @@ class RustTurnSolver:
             raise ValueError(f"evaluator returned shape {values.shape}")
         self._s.set_leaf_values_bytes(values.astype("<f8").tobytes())
         self.evaluator_calls = rows
+        self._bust_value = values[0].copy()
+
+    @property
+    def bust_value(self):
+        """Absolute-seat value of losing this turn, from the original leaves."""
+        return self._bust_value.copy()
 
     @property
     def num_positions(self):

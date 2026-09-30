@@ -74,9 +74,11 @@ def seat_mask_tensor(x):
     """
     if x.ndim == 1:
         x = x[None, :]
-    idx = torch.tensor([seat_present_index(s) for s in range(MAX_SEATS)],
-                       device=x.device)
-    return x.index_select(1, idx) > 0.0
+    # Seat flags are evenly spaced. A strided view avoids allocating and
+    # copying a four-element index tensor to the GPU on every inference.
+    start = seat_present_index(0)
+    stride = seat_present_index(1) - start
+    return x[:, start:start + MAX_SEATS * stride:stride] > 0.0
 
 
 def masked_soft_cross_entropy(logits, targets, mask):

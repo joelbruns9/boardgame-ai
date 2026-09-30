@@ -146,6 +146,12 @@ def test_exact_from_switches_targets_and_logs_the_mixture(tmp_path):
     assert 0.0 < rows[1]["buffer_exact_share"] < 1.0
 
 
+def test_personas_from_delays_the_personas(tmp_path):
+    phase4.run(tmp_path, iterations=2, personas_from=2, **KW)
+    rows = [json.loads(l) for l in open(tmp_path / "run.jsonl")]
+    assert [r["personas"] for r in rows] == [False, True]
+
+
 def test_resume_continues_exactly(tmp_path):
     """3 iterations straight == 2, then --resume to 3: same weights, same
     log (timing fields aside)."""

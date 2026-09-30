@@ -1,0 +1,114 @@
+{
+  "format": "bga-cantstop-v1",
+  "playerorder": [
+    "89146710",
+    "85704276"
+  ],
+  "players": {
+    "85704276": {
+      "color": "ff0000",
+      "score": 0
+    },
+    "89146710": {
+      "color": "0000ff",
+      "score": 0
+    }
+  },
+  "active_player": "89146710",
+  "phase": "diceChoice",
+  "markers": [
+    {
+      "column": 2,
+      "height": 0,
+      "color": "ff0000"
+    },
+    {
+      "column": 7,
+      "height": 10,
+      "color": "0000ff"
+    },
+    {
+      "column": 7,
+      "height": 5,
+      "color": "ff0000"
+    },
+    {
+      "column": 8,
+      "height": 4,
+      "color": "0000ff"
+    },
+    {
+      "column": 9,
+      "height": 6,
+      "color": "ff0000"
+    },
+    {
+      "column": 10,
+      "height": 0,
+      "color": "0000ff"
+    }
+  ],
+  "dice": [
+    1,
+    1,
+    3,
+    5
+  ],
+  "required_column_count": 5,
+  "movement_variant_raw": "0",
+  "blocking": false,
+  "possible_moves_raw": [
+    {
+      "0": {
+        "move": false,
+        "dice": [
+          1,
+          1
+        ]
+      },
+      "1": {
+        "move": true,
+        "dice": [
+          3,
+          5
+        ]
+      },
+      "both": false
+    },
+    {
+      "0": {
+        "move": true,
+        "dice": [
+          1,
+          3
+        ]
+      },
+      "1": {
+        "move": true,
+        "dice": [
+          1,
+          5
+        ]
+      },
+      "both": true
+    },
+    {
+      "0": {
+        "move": true,
+        "dice": [
+          1,
+          5
+        ]
+      },
+      "1": {
+        "move": true,
+        "dice": [
+          1,
+          3
+        ]
+      },
+      "both": true
+    }
+  ],
+  "table_id": "923128580"
+}
