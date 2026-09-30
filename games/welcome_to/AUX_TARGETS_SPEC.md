@@ -193,6 +193,7 @@ train the same parameters as seat 0's common ones.
 | `end_trigger` | 3 | sigmoid (independent) | — |
 | `will_complete_plan_k` | 3 | sigmoid | — |
 | `plan_k_first` | 3 | sigmoid | — (masked) |
+| `forced_refusals_soon` | 1 | none | ÷3 (§6, added 2026-09-30) |
 
 ### Global head — 5 output units, applied to the main `h`
 
@@ -565,6 +566,38 @@ It is also the free strength metric made predictable: greedy ends 20/20 on the
 third permit refusal and never on plans or a full sheet, so the shift in this
 distribution *is* the learning curve.
 
+### `forced_refusals_soon` — per seat, ÷3, unmasked (added 2026-09-30)
+
+*Computes:* how many **forced** refusals this seat takes on the visit turn and
+the next `REFUSAL_HORIZON = 3` turns (`t ≤ refusal turn ≤ t + 3`). Forced means
+the direct refusal at `CHOOSE_CARDS` (`M_DIRECT_REFUSE`: no slot playable); the
+voluntary macro refusal is a choice, not an outcome of the sheet, and is
+excluded. After the game ends the count is a true zero, so it is unmasked;
+`turns_left` carries the horizon.
+
+*Why:* the placement-rollout test (2026-09-26, 240 disagreement positions,
+`runs/welcome_to_s2/v3_random_01/_test_rollouts`) found that the same stack
+placed to keep capacity saves **0.145 ± 0.021 refusals** and +1.0 margin, while
+the value head's preference between the two placements correlated **+0.03**
+with the real margin difference. `permits` carries that consequence as a
+terminal count through ~17 turns of noise; this target carries it through
+three. An outcome, not a goodness judgement: it says what happens, not what a
+placement is worth.
+
+*Source:* the terminal state keeps only the permit count, so the refusal turns
+come from the move sequence. Python replays record them with
+`training.ForcedRefusalLog`; the Rust capture's `finish(state, json, actions)`
+replays the macro list from the seed and refuses a list that does not reproduce
+the terminal state.
+
+*Base rate* (v3_random_01, 4,000 games, 123,891 learner roots): nonzero on 15%
+of learner-seat rows and 24% of all seat rows; 0.1% at turns 0–4, 10% at 10–14,
+55% at 20–24. Forced refusals are 94.5% of all refusals.
+
+*Cost:* a new per-seat head column changes the shard target layout — training
+shard version 5; version-4 shards are refused — and the per-seat head's output
+width, so earlier checkpoints no longer load.
+
 ### `will_complete_plan_k` — per seat, 3 sigmoids, **unmasked**
 
 *Computes:* did this seat ever complete plan slot k.
@@ -662,6 +695,8 @@ plan progress 0.3     plans_completed, turns_to_plan_k
 plan outcome  0.3     will_complete_plan_k, plan_k_first
 outcome mode  0.2     end_trigger
 components    0.2     score component heads
+short horizon 0.3     forced_refusals_soon  (own group: a fifth capacity member
+                      would cut the others from 0.3/4 to 0.3/5)
 ```
 
 Consistent with `PROJECT_PLAN.md` M2: "score dominant early, policy next,

@@ -168,9 +168,11 @@ def replay(trajectory: Trajectory) -> Iterator[Sample]:
         seed=trajectory.seed, config=trajectory.config, rng_kind=trajectory.rng
     )
     visits: list[tuple] = []
+    refusals = training.ForcedRefusalLog(state.config.players)
 
     for visited, macro in mc.collapse(state, trajectory.actions):
         actor = visited.actor
+        refusals.observe(visited, macro)
         visits.append(
             (
                 enc.encode_state(visited),
@@ -191,7 +193,7 @@ def replay(trajectory: Trajectory) -> Iterator[Sample]:
             f"replay diverged: scores {state.scores()} != recorded {trajectory.scores}"
         )
 
-    outcomes = training.final_outcomes(state)
+    outcomes = training.final_outcomes(state, refusals.turns())
     for encoded, legal, action, actor, turn, order in visits:
         sheet_planes, sheet_scalars, viewer_plane, global_scalars = encoded
         yield Sample(

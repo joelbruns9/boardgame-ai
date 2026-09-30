@@ -74,6 +74,7 @@ from dataclasses import dataclass
 from itertools import combinations
 from typing import Optional, Sequence
 
+from games.welcome_to import macro_codec as mc
 from games.welcome_to.constants import NUM_BOXES, PERMIT_BOXES
 from games.welcome_to.game import GameState
 from games.welcome_to.sheet import SheetScore
@@ -110,6 +111,14 @@ TURN_SCALE: float = 25.0
 BOX_SCALE: float = float(NUM_BOXES)
 PLAN_SCALE: float = 3.0
 
+#: ``forced_refusals_soon`` counts forced refusals on the visit turn and the
+#: next ``REFUSAL_HORIZON`` turns.  Short on purpose: the placement-rollout test
+#: (2026-09-26) found a capacity-keeping placement saves 0.145 refusals within a
+#: few turns while the value head's preference for it correlated +0.03 with the
+#: real margin.  A terminal count (``permits``) carries the same consequence
+#: through seventeen turns of noise; this carries it through three.
+REFUSAL_HORIZON: int = 3
+
 
 @dataclass(frozen=True, slots=True)
 class PlayerOutcome:
@@ -126,6 +135,13 @@ class PlayerOutcome:
     #: Whether each completed plan tied for the earliest completion turn.
     plan_first: tuple[bool, ...]
     plans_completed: int
+    #: Turns on which this seat took a **forced** refusal -- the direct refusal
+    #: at ``CHOOSE_CARDS`` (``macro_codec.M_DIRECT_REFUSE``), legal only when no
+    #: slot is playable.  The voluntary refusal (take a slot whose printed
+    #: number has nowhere to go) is a choice, not an outcome of the sheet, and
+    #: is excluded.  Not in the terminal state: the replay records it, see
+    #: :class:`ForcedRefusalLog`.
+    forced_refusal_turns: tuple[int, ...]
     #: Independent terminal clauses. More than one may be true on the final turn.
     end_full_sheet: bool
     end_all_plans: bool
@@ -222,10 +238,45 @@ def masked_mean(errors, mask):
     return (mask * errors).sum() / (count + (count == 0))
 
 
-def final_outcomes(state: GameState) -> list[PlayerOutcome]:
-    """Read the per-seat training targets off a finished game."""
+class ForcedRefusalLog:
+    """Per-seat turns of forced refusals, recorded while a game is replayed.
+
+    Call :meth:`observe` with the state a macro is about to be applied to.
+    The terminal state keeps only the permit *count*; when each refusal
+    happened exists only in the move sequence.
+    """
+
+    def __init__(self, players: int) -> None:
+        self._turns: list[list[int]] = [[] for _ in range(players)]
+
+    def observe(self, state: GameState, macro: int) -> None:
+        if macro == mc.M_DIRECT_REFUSE:
+            self._turns[state.actor].append(state.turn)
+
+    def turns(self) -> tuple[tuple[int, ...], ...]:
+        return tuple(tuple(seat) for seat in self._turns)
+
+
+def final_outcomes(
+    state: GameState, forced_refusals: Sequence[Sequence[int]]
+) -> list[PlayerOutcome]:
+    """Read the per-seat training targets off a finished game.
+
+    ``forced_refusals[seat]`` is the turns on which that seat was forced to
+    refuse -- :meth:`ForcedRefusalLog.turns` off the replay that reached
+    ``state``.  Required rather than defaulted: an empty default would train
+    ``forced_refusals_soon`` to zero everywhere and nothing would look wrong.
+    """
     if not state.is_terminal:
         raise ValueError("outcomes are only defined for a finished game")
+    if len(forced_refusals) != state.config.players:
+        raise ValueError("forced_refusals must have one entry per seat")
+    for seat, turns in enumerate(forced_refusals):
+        if len(turns) > state.sheets[seat].permits:
+            raise ValueError(
+                f"seat {seat} has {len(turns)} forced refusals but "
+                f"{state.sheets[seat].permits} permits"
+            )
 
     scores = state.scores()
     distributions = rank_distributions(state)
@@ -252,6 +303,7 @@ def final_outcomes(state: GameState) -> list[PlayerOutcome]:
                 plan_turns=turns,
                 plan_first=first,
                 plans_completed=sum(1 for t in turns if t is not None),
+                forced_refusal_turns=tuple(forced_refusals[player]),
                 end_full_sheet=not sheet.has_free_box(),
                 end_all_plans=all(t is not None for t in turns),
                 end_max_permit=sheet.permits >= PERMIT_BOXES,
@@ -329,6 +381,12 @@ def _seat_targets(outcome: PlayerOutcome, turn: int) -> dict[str, float]:
             "end_trigger_max_permit": float(outcome.end_max_permit),
         }
     )
+    # Unmasked: after the game ends there are no refusals, and zero is the
+    # true count.  turns_left carries the horizon.
+    targets["forced_refusals_soon"] = (
+        sum(1 for t in outcome.forced_refusal_turns if turn <= t <= turn + REFUSAL_HORIZON)
+        / PERMIT_SCALE
+    )
     #: 0.0 on a padded seat; see :data:`_PADDED_SEAT`.
     targets["seat_valid"] = 1.0
     return targets
@@ -344,6 +402,7 @@ _PROBE = PlayerOutcome(
     plan_turns=(None, None, None),
     plan_first=(False, False, False),
     plans_completed=0,
+    forced_refusal_turns=(),
     end_full_sheet=False,
     end_all_plans=False,
     end_max_permit=False,

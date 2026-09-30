@@ -24,10 +24,11 @@ use crate::rng::Rng;
 use crate::tables;
 use crate::{to_py, RustGameState};
 
+/// 5: adds the per-seat `forced_refusals_soon` target (2026-09-30).
 /// 4: encoder v3 rows after review 2026-09-25 (ENCODER_ABI_VERSION 3).
-/// Versions 1-3 hold rows of an earlier encoder and are refused, never read
-/// (spec §0.4). 3 was ABI 2, whose features the review corrected.
-pub const TRAINING_SHARD_VERSION: u16 = 4;
+/// Versions 1-4 are refused, never read (spec §0.4): 1-3 hold rows of an
+/// earlier encoder, 4 lacks a target that cannot be re-derived from the row.
+pub const TRAINING_SHARD_VERSION: u16 = 5;
 pub const GLOBAL_TARGET_NAMES: [&str; 9] = [
     "turns_left",
     "rank_p_0",
@@ -39,7 +40,7 @@ pub const GLOBAL_TARGET_NAMES: [&str; 9] = [
     "rank_p_3",
     "rank_mask_3",
 ];
-pub const PER_SEAT_TARGET_NAMES: [&str; 32] = [
+pub const PER_SEAT_TARGET_NAMES: [&str; 33] = [
     "score",
     "permits",
     "houses",
@@ -71,6 +72,7 @@ pub const PER_SEAT_TARGET_NAMES: [&str; 32] = [
     "end_trigger_full_sheet",
     "end_trigger_all_plans",
     "end_trigger_max_permit",
+    "forced_refusals_soon",
     "seat_valid",
 ];
 pub const GLOBAL_TARGET_COUNT: usize = GLOBAL_TARGET_NAMES.len();
@@ -83,6 +85,8 @@ const PERMIT_SCALE: f64 = 3.0;
 const TURN_SCALE: f64 = 25.0;
 const BOX_SCALE: f64 = 33.0;
 const PLAN_SCALE: f64 = 3.0;
+/// `training.REFUSAL_HORIZON`: the visit turn and the next three.
+const REFUSAL_HORIZON: i32 = 3;
 
 struct RootSample {
     encoded: EncodedState,
@@ -117,6 +121,8 @@ struct Outcome {
     end_full_sheet: bool,
     end_all_plans: bool,
     end_max_permit: bool,
+    /// Turns of this seat's forced (direct) refusals; see `forced_refusal_turns`.
+    forced_refusal_turns: Vec<i32>,
     final_turn: i32,
     num_seats: usize,
     rank_distribution: [f32; encoder::MAX_SEATS],
@@ -126,10 +132,40 @@ fn ratio(value: i32, scale: f64) -> f32 {
     (value as f64 / scale) as f32
 }
 
-fn outcomes(game: &Game) -> Result<Vec<Outcome>, EngineError> {
+/// Replay `actions` from `seed` and record, per seat, the turn of every forced
+/// refusal (`M_DIRECT_REFUSE`). The terminal state keeps only the permit count.
+/// The replay must reproduce `terminal` exactly, or the macro list is not this
+/// game's and the error is loud.
+fn forced_refusal_turns(
+    seed: u64,
+    terminal: &Game,
+    actions: &[usize],
+) -> Result<Vec<Vec<i32>>, EngineError> {
+    let mut game = Game::new(seed, terminal.config)?;
+    let mut turns = vec![Vec::new(); terminal.config.players];
+    for &action in actions {
+        if action == macro_codec::M_DIRECT_REFUSE {
+            turns[game.actor].push(game.turn);
+        }
+        macro_codec::apply_macro(&mut game, action)?;
+    }
+    if format!("{game:?}") != format!("{terminal:?}") {
+        return Err(EngineError::Invalid(
+            "replaying the recorded macros does not reproduce the terminal state".into(),
+        ));
+    }
+    Ok(turns)
+}
+
+fn outcomes(game: &Game, forced_refusals: &[Vec<i32>]) -> Result<Vec<Outcome>, EngineError> {
     if !game.is_terminal() {
         return Err(EngineError::Invalid(
             "training outcomes require a terminal game".into(),
+        ));
+    }
+    if forced_refusals.len() != game.config.players {
+        return Err(EngineError::Invalid(
+            "forced refusals need one entry per seat".into(),
         ));
     }
     let seats = game.config.players;
@@ -190,6 +226,7 @@ fn outcomes(game: &Game) -> Result<Vec<Outcome>, EngineError> {
             end_full_sheet: houses as usize == NUM_BOXES,
             end_all_plans: plans_completed == 3,
             end_max_permit: sheet.permits >= PERMIT_BOXES,
+            forced_refusal_turns: forced_refusals[player].clone(),
             final_turn: game.turn,
             num_seats: seats,
             rank_distribution: ranks[player],
@@ -243,7 +280,13 @@ fn seat_targets(outcome: &Outcome, turn: i32) -> [f32; PER_SEAT_TARGET_COUNT] {
     out[28] = outcome.end_full_sheet as u8 as f32;
     out[29] = outcome.end_all_plans as u8 as f32;
     out[30] = outcome.end_max_permit as u8 as f32;
-    out[31] = 1.0;
+    let soon = outcome
+        .forced_refusal_turns
+        .iter()
+        .filter(|&&refused| turn <= refused && refused <= turn + REFUSAL_HORIZON)
+        .count() as i32;
+    out[31] = ratio(soon, PERMIT_SCALE);
+    out[32] = 1.0;
     out
 }
 
@@ -376,6 +419,7 @@ impl RustTrainingCapture {
         &mut self,
         state: &RustGameState,
         trajectory_json: String,
+        actions: Vec<usize>,
     ) -> PyResult<RustTrainingGame> {
         if self.finished {
             return Err(PyRuntimeError::new_err(
@@ -385,7 +429,8 @@ impl RustTrainingCapture {
         if trajectory_json.is_empty() {
             return Err(PyValueError::new_err("trajectory JSON cannot be empty"));
         }
-        let terminal = outcomes(&state.inner).map_err(to_py)?;
+        let forced = forced_refusal_turns(self.seed, &state.inner, &actions).map_err(to_py)?;
+        let terminal = outcomes(&state.inner, &forced).map_err(to_py)?;
         let roots = std::mem::take(&mut self.roots);
         let samples = roots
             .into_iter()
@@ -576,7 +621,7 @@ fn read_shard_header(reader: &mut impl Read) -> Result<(usize, usize), String> {
     let signature = read_u64(reader)?;
     if &magic == MAGIC && version < TRAINING_SHARD_VERSION {
         return Err(format!(
-            "training shard version {version} holds rows of an earlier encoder ABI; this build reads version {TRAINING_SHARD_VERSION} (encoder ABI {}) only",
+            "training shard version {version} holds rows of an earlier encoder ABI or target schema; this build reads version {TRAINING_SHARD_VERSION} (encoder ABI {}) only",
             encoder::ENCODER_ABI_VERSION
         ));
     }

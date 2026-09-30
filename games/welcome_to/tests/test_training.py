@@ -7,15 +7,22 @@ import numpy as np
 import pytest
 
 from games.welcome_to import encoder as enc
+from games.welcome_to import macro_codec as mc
 from games.welcome_to import training as tr
 from games.welcome_to.bots import GreedyBot, play_match
 from games.welcome_to.game import GameConfig, GameState
 
 
+def _outcomes(state: GameState) -> list[tr.PlayerOutcome]:
+    """Outcomes with no refusal history.  GreedyBot games are played on
+    primitives outside a replay, so only the refusal tests below build one."""
+    return tr.final_outcomes(state, [()] * state.config.players)
+
+
 def _targets(state: GameState, viewer: int, turn: int) -> dict:
     """Targets for ``viewer`` on the encoder's own seat axis."""
     return tr.sample_targets(
-        tr.final_outcomes(state), enc.seat_order(state, viewer), turn
+        _outcomes(state), enc.seat_order(state, viewer), turn
     )
 
 
@@ -32,12 +39,14 @@ def _finished(players: int = 2, seed: int = 3, mirrored: bool = False) -> GameSt
 # ──────────────────────────────────────────────────────────────────────────
 def test_outcomes_need_a_finished_game():
     with pytest.raises(ValueError):
-        tr.final_outcomes(GameState.new(seed=1, config=GameConfig(players=2)))
+        tr.final_outcomes(
+            GameState.new(seed=1, config=GameConfig(players=2)), [(), ()]
+        )
 
 
 def test_outcomes_agree_with_the_final_state():
     state = _finished()
-    outcomes = tr.final_outcomes(state)
+    outcomes = _outcomes(state)
     assert [o.player for o in outcomes] == [0, 1]
     assert [o.score for o in outcomes] == state.scores()
     for outcome in outcomes:
@@ -87,7 +96,7 @@ def test_the_rank_value_reproduces_returns_at_two_seats():
         for mirrored in (False, True):
             state = _finished(seed=seed, mirrored=mirrored)
             returns = state.returns()
-            for outcome in tr.final_outcomes(state):
+            for outcome in _outcomes(state):
                 assert tr.rank_value(
                     outcome.rank_distribution, outcome.num_seats
                 ) == pytest.approx(returns[outcome.player])
@@ -105,7 +114,7 @@ def test_the_utility_is_seat_count_invariant_at_the_ends():
 def test_a_fifth_seat_is_refused_rather_than_truncated():
     state = _finished(players=5, seed=4)
     with pytest.raises(ValueError, match="MAX_RANKS"):
-        tr.final_outcomes(state)
+        _outcomes(state)
 
 
 def test_the_rank_mask_covers_exactly_the_live_positions():
@@ -122,7 +131,7 @@ def test_the_rank_mask_covers_exactly_the_live_positions():
 
 def test_the_rank_distribution_belongs_to_the_viewer():
     state = _finished(players=3, seed=9)
-    outcomes = tr.final_outcomes(state)
+    outcomes = _outcomes(state)
     for viewer in range(3):
         targets = _targets(state, viewer, turn=3)
         got = tuple(targets[f"rank_p_{r}"] for r in range(tr.MAX_RANKS))
@@ -141,7 +150,7 @@ def test_the_target_seat_axis_matches_the_encoder():
 @pytest.mark.parametrize("players", [2, 3, 4])
 def test_per_seat_targets_follow_the_encoders_seat_order(players):
     state = _finished(players=players, seed=players * 3)
-    outcomes = tr.final_outcomes(state)
+    outcomes = _outcomes(state)
     for viewer in range(players):
         order = enc.seat_order(state, viewer)
         targets = _targets(state, viewer, turn=2)
@@ -153,7 +162,7 @@ def test_per_seat_targets_follow_the_encoders_seat_order(players):
 
 def test_the_viewer_is_always_seat_zero():
     state = _finished(players=4, seed=8)
-    outcomes = tr.final_outcomes(state)
+    outcomes = _outcomes(state)
     for viewer in range(4):
         targets = _targets(state, viewer, turn=2)
         assert targets["score"][0] == pytest.approx(
@@ -175,6 +184,69 @@ def test_padded_seats_are_absent_rather_than_zero_scoring(players):
             assert targets[name][k] == float(tr.NEVER)
 
 
+def _random_macro_game(players: int, seed: int):
+    """A random game on the macro vocabulary, with its refusal log."""
+    rng = random.Random(seed)
+    state = GameState.new(seed=seed, config=GameConfig(players=players, advanced=True))
+    log = tr.ForcedRefusalLog(players)
+    voluntary = [0] * players
+    while not state.is_terminal:
+        macro = rng.choice(mc.legal_macros(state))
+        log.observe(state, macro)
+        if mc.M_REFUSE <= macro < mc.M_DIRECT_REFUSE:
+            voluntary[state.actor] += 1
+        mc.apply_macro(state, macro)
+    return state, log.turns(), voluntary
+
+
+@pytest.mark.parametrize("players", [2, 3, 4])
+def test_the_forced_refusal_log_accounts_for_every_permit(players):
+    """Forced plus voluntary refusals is every permit box, on every seat --
+    so the log misses no direct refusal and counts nothing else."""
+    forced_seen = 0
+    for seed in range(6):
+        state, forced, voluntary = _random_macro_game(players, seed)
+        for seat in range(players):
+            assert len(forced[seat]) + voluntary[seat] == state.sheets[seat].permits
+            assert list(forced[seat]) == sorted(forced[seat])
+            forced_seen += len(forced[seat])
+    assert forced_seen > 0, "no forced refusal occurred; the test has no power"
+
+
+def test_forced_refusals_soon_counts_the_visit_turn_and_the_next_three():
+    state = next(
+        s
+        for s in (_finished(players=2, seed=seed) for seed in range(40))
+        if s.sheets[0].permits >= 2
+    )
+    outcomes = tr.final_outcomes(state, [(5, 9), ()])
+    expected = {2: 1, 4: 1, 5: 1, 6: 1, 8: 1, 9: 1, 10: 0, 1: 0}
+    assert tr.REFUSAL_HORIZON == 3
+    for turn, count in expected.items():
+        targets = tr.sample_targets(outcomes, [0, 1], turn)
+        assert targets["forced_refusals_soon"] == (
+            pytest.approx(count / tr.PERMIT_SCALE), 0.0, 0.0, 0.0
+        ), turn
+    both = tr.final_outcomes(state, [(5, 7), ()])
+    assert tr.sample_targets(both, [0, 1], 4)["forced_refusals_soon"][0] == (
+        pytest.approx(2 / tr.PERMIT_SCALE)
+    )
+    # the seat axis moves the value with its seat
+    assert tr.sample_targets(outcomes, [1, 0], 5)["forced_refusals_soon"][:2] == (
+        0.0,
+        pytest.approx(1 / tr.PERMIT_SCALE),
+    )
+
+
+def test_outcomes_refuse_a_refusal_log_that_cannot_be_this_game():
+    state = _finished(players=2, seed=3)
+    with pytest.raises(ValueError, match="one entry per seat"):
+        tr.final_outcomes(state, [()])
+    too_many = tuple(range(1, state.sheets[0].permits + 2))
+    with pytest.raises(ValueError, match="forced refusals"):
+        tr.final_outcomes(state, [too_many, ()])
+
+
 def test_every_per_seat_target_has_one_value_per_seat():
     state = _finished(players=3, seed=2)
     targets = _targets(state, viewer=1, turn=5)
@@ -187,12 +259,12 @@ def test_every_per_seat_target_has_one_value_per_seat():
 def test_an_empty_seat_axis_is_refused():
     state = _finished(players=2, seed=1)
     with pytest.raises(ValueError):
-        tr.sample_targets(tr.final_outcomes(state), [], turn=1)
+        tr.sample_targets(_outcomes(state), [], turn=1)
 
 
 def test_plan_turns_match_the_recorded_validations():
     state = _finished(players=3, seed=11)
-    for outcome in tr.final_outcomes(state):
+    for outcome in _outcomes(state):
         for slot in range(3):
             assert outcome.plan_turns[slot] == state.plan_turns[slot].get(outcome.player)
         completed = [t for t in outcome.plan_turns if t is not None]
@@ -201,7 +273,7 @@ def test_plan_turns_match_the_recorded_validations():
 
 def test_turns_to_plan_is_relative_and_masked():
     state = _finished(players=3, seed=11)
-    outcomes = tr.final_outcomes(state)
+    outcomes = _outcomes(state)
     order = enc.seat_order(state, 0)
     targets = _targets(state, viewer=0, turn=4)
     for k, seat in enumerate(order):
@@ -220,7 +292,7 @@ def test_dense_plan_outcomes_and_independent_end_triggers_match_terminal_games()
     completed_seen = False
     for seed in range(1, 16):
         state = _finished(players=3, seed=seed)
-        outcomes = tr.final_outcomes(state)
+        outcomes = _outcomes(state)
         targets = _targets(state, viewer=1, turn=4)
         order = enc.seat_order(state, 1)
         for encoded, seat in enumerate(order):
@@ -266,7 +338,7 @@ def test_the_sentinel_never_appears_where_the_mask_is_one():
     """M2.  NEVER is not a value; if a loss ever sees it, it trains on -1."""
     for players in (2, 3, 4):
         state = _finished(players=players, seed=players * 5)
-        final_turn = tr.final_outcomes(state)[0].final_turn
+        final_turn = _outcomes(state)[0].final_turn
         for viewer in range(players):
             for turn in range(1, final_turn + 2):
                 targets = _targets(state, viewer, turn)
@@ -334,7 +406,7 @@ def test_target_names_cover_every_key():
 
 def test_turns_left_never_goes_negative():
     state = _finished()
-    final_turn = tr.final_outcomes(state)[0].final_turn
+    final_turn = _outcomes(state)[0].final_turn
     assert _targets(state, viewer=0, turn=final_turn + 5)["turns_left"] == 0.0
 
 

@@ -362,6 +362,39 @@ def test_s2_rust_sample_shards_are_exactly_the_python_oracle(captured_generation
                 ), name
 
 
+def test_the_oracle_comparison_covers_forced_refusals(captured_generation):
+    """Power for the exact-match test above: identical all-zero columns would
+    pass it without the Rust replay ever timestamping a refusal."""
+    (_, _), prefix = captured_generation
+    values = [
+        value
+        for trajectory in self_play.read_trajectories(prefix)
+        for sample in self_play.replay(trajectory)
+        for value in sample.targets["forced_refusals_soon"]
+    ]
+    assert any(value > 0.0 for value in values)
+
+
+def test_rust_capture_refuses_a_macro_list_that_is_not_this_game():
+    import random as _random
+
+    seed = 4_242
+    state = self_play.wr.RustGameState(
+        seed, players=2, advanced=True, expert=False, solo_rules=False
+    )
+    rng = _random.Random(seed)
+    actions = []
+    while not state.is_terminal:
+        action = rng.choice(state.legal_macros())
+        actions.append(action)
+        state.apply_macro(action)
+    self_play.wr.RustTrainingCapture(seed).finish(state, "{}", actions)
+    with pytest.raises(Exception, match="does not reproduce"):
+        self_play.wr.RustTrainingCapture(seed).finish(state, "{}", actions[:-1])
+    with pytest.raises(Exception):
+        self_play.wr.RustTrainingCapture(seed + 1).finish(state, "{}", actions)
+
+
 def test_s2_rust_training_loader_batches_match_the_row_oracle(captured_generation):
     (_, _), prefix = captured_generation
     cached = self_play.read_trajectories(prefix)
@@ -400,9 +433,10 @@ def test_s2_rust_training_loader_batches_match_the_row_oracle(captured_generatio
     assert np.array_equal(random_first, random_second)
 
 
-@pytest.mark.parametrize("version", [1, 2, 3])
+@pytest.mark.parametrize("version", [1, 2, 3, 4])
 def test_shards_from_an_earlier_encoder_are_refused(tmp_path, version):
-    """Shard versions 1-3 hold rows of an earlier encoder ABI (spec §0.4).
+    """Shard versions 1-3 hold rows of an earlier encoder ABI, and 4 lacks
+    ``forced_refusals_soon`` (spec §0.4).
 
     Before the refusal they failed only by accident ("ended inside a sample"),
     and a short enough shard could have lined up and been misread.
