@@ -16,6 +16,7 @@ crate-type = ["cdylib", "rlib"]
 # and `allow_threads` -> `detach`, which M3 needs at the evaluator boundary.
 pyo3 = { version = "0.28.3", features = ["extension-module"] }
 rayon = "1"
+sha2 = "0.10"
 
 [profile.release]
 opt-level = 3

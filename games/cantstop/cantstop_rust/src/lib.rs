@@ -4,6 +4,7 @@
 //! enumeration and backward induction. Python keeps the training loop, the
 //! replay buffer and torch. Only the per-turn leaf batch crosses back.
 
+pub mod audit_stream;
 pub mod encoder;
 pub mod engine;
 pub mod lookahead;
@@ -737,6 +738,52 @@ impl PySelfPlayPool {
         Ok(PySelfPlayPool { inner: selfplay::Pool::new(out, threads, in_flight, max_rows), features_taken: false })
     }
 
+    /// Enable baseline audit continuation before the pool advances. Each
+    /// row is (shared seed, completed root turns, root rolls, root correction).
+    fn configure_audit(&mut self, streams: Vec<(u64, u32, u32, Vec<f64>)>,
+                       max_rolls: u32, dice_luck: bool) -> PyResult<()> {
+        if streams.len() != self.inner.games.len() || max_rolls == 0 {
+            return Err(PyValueError::new_err("audit schedule must align and max_rolls must be positive"));
+        }
+        // Validate the entire schedule before changing any game.
+        for (g, (_, turns, rolls, correction)) in self.inner.games.iter().zip(&streams) {
+            if g.audit.is_some() || g.solves != 0 || g.turns != 0
+                || !matches!(g.status, selfplay::Status::Ready | selfplay::Status::Queued)
+                || g.state.phase != Phase::AwaitRoll || g.state.runners.iter().any(|&r| r != 0)
+                || *turns != 1 || *rolls > max_rolls
+                || correction.len() != g.state.rules.num_players as usize
+                || correction.iter().any(|v| !v.is_finite()) {
+                return Err(PyValueError::new_err("audit requires untouched, nonterminal turn-start games and valid root counters"));
+            }
+            if !g.audit_compatible() {
+                return Err(PyValueError::new_err("audit supports plain baseline continuation only"));
+            }
+        }
+        for (g, (seed, turns, rolls, correction)) in self.inner.games.iter_mut().zip(streams) {
+            g.turns = turns;
+            g.audit = Some(audit_stream::AuditStream {
+                seed, rolls, roll_index: 0, max_rolls, dice_luck, correction,
+            });
+        }
+        Ok(())
+    }
+
+    /// Payoffs/counters only; any failed game fails the entire audit batch.
+    fn audit_results(&self) -> PyResult<Vec<(u64, u8, u32, u32, Vec<f64>, Snapshot)>> {
+        if let Some(error) = self.inner.failure() {
+            return Err(PyRuntimeError::new_err(error));
+        }
+        if self.inner.running() { return Err(PyRuntimeError::new_err("games are still running")); }
+        self.inner.games.iter().map(|g| {
+            let audit = g.audit.as_ref().ok_or_else(|| PyRuntimeError::new_err("audit not configured"))?;
+            let winner = g.winner().ok_or_else(|| PyRuntimeError::new_err("missing terminal winner"))?;
+            if audit.correction.iter().any(|v| !v.is_finite()) {
+                return Err(PyRuntimeError::new_err("nonfinite dice-luck correction"));
+            }
+            Ok((g.id, winner, g.turns, audit.rolls, audit.correction.clone(), snapshot_of(&g.state)))
+        }).collect()
+    }
+
     fn advance(&mut self, py: Python<'_>) {
         let inner = &mut self.inner;
         py.detach(|| inner.advance());
@@ -887,8 +934,14 @@ fn set_menu_cache_cap(entries: usize) {
     solver::MENU_CACHE_CAP.store(entries, std::sync::atomic::Ordering::Relaxed);
 }
 
+#[pyfunction]
+fn audit_dice(seed: u64, turn: u32, roll: u32) -> Vec<u8> {
+    audit_stream::shared_dice(seed, turn, roll).to_vec()
+}
+
 #[pymodule]
 fn cantstop_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(audit_dice, m)?)?;
     m.add_class::<PyRng>()?;
     m.add_class::<PyGameState>()?;
     m.add_class::<PyTurnSolver>()?;

@@ -64,6 +64,7 @@ pub struct Game {
     pub id: u64,
     pub state: GameState,
     rng: Rng,
+    pub audit: Option<crate::audit_stream::AuditStream>,
     /// Which evaluator scores the leaves of each seat's turns. All zero in
     /// self-play; the seating in an arena game. A lookahead's refinement
     /// solves use the MOVER's evaluator: it is the mover's search.
@@ -111,6 +112,7 @@ impl Game {
             id,
             state,
             rng: Rng::new(seed),
+            audit: None,
             evaluator_of_seat,
             search_of_seat,
             solver: None,
@@ -132,6 +134,10 @@ impl Game {
             turn_values: Vec::new(),
             pending_value: None,
         }
+    }
+
+    pub fn audit_compatible(&self) -> bool {
+        self.search_of_seat.iter().all(|s| !s.exact_root && s.lookahead_k == 0 && s.stop_bias == 0.0)
     }
 
     pub fn winner(&self) -> Option<u8> {
@@ -170,6 +176,12 @@ impl Game {
 
     fn end_turn(&mut self) {
         self.turns += 1;
+        if let Some(audit) = self.audit.as_mut() {
+            audit.roll_index = 0;
+            self.decisions = 0;
+            self.solver = None;
+            return; // Audits retain payoffs, not training histories.
+        }
         self.turn_lengths.push(self.decisions);
         self.turn_values.push(self.pending_value.take());
         self.decisions = 0;
@@ -252,6 +264,41 @@ impl Game {
         Ok(())
     }
 
+    /// Draw and correct using the same immutable turn table. Opening rolls
+    /// have no table and therefore deliberately receive zero correction.
+    fn draw_roll(&mut self) -> Option<bool> {
+        let expected = if self.audit.as_ref().is_some_and(|a| a.dice_luck) {
+            self.solver.as_ref().map(|s| {
+                s.value(RKey::from_runners(&self.state.runners), Phase::AwaitRoll, None)
+                    .expect("pre-roll configuration is reachable")
+            })
+        } else { None };
+        let dice = if let Some(audit) = self.audit.as_mut() {
+            if audit.rolls >= audit.max_rolls {
+                self.status = Status::Failed("maximum dice rolls reached before rollout finished".into());
+                return None;
+            }
+            let dice = crate::audit_stream::shared_dice(audit.seed, self.turns, audit.roll_index);
+            audit.rolls += 1;
+            audit.roll_index += 1;
+            dice
+        } else { roll_dice(&mut self.rng) };
+        let busted = self.state.roll(dice).expect("rollable").is_empty();
+        if let Some(expected) = expected {
+            let n = self.state.rules.num_players as usize;
+            let realized = if busted {
+                self.final_values[..n].to_vec() // Immutable table's bust leaf is row zero.
+            } else {
+                self.solver.as_ref().expect("existing table")
+                    .value(RKey::from_runners(&self.state.runners), self.state.phase, self.state.dice)
+                    .expect("post-roll configuration is reachable")
+            };
+            let audit = self.audit.as_mut().expect("audit enabled");
+            for p in 0..n { audit.correction[p] += expected[p] - realized[p]; }
+        }
+        Some(busted)
+    }
+
     /// Play until the next solve needs values, or the game ends.
     pub fn advance(&mut self) {
         if self.status != Status::Ready {
@@ -261,8 +308,8 @@ impl Game {
             if let Some(solver) = self.solver.as_ref() {
                 if self.state.phase == Phase::AwaitRoll {
                     // exact_root: solved before the opening roll; roll now.
-                    let moves = self.state.roll(roll_dice(&mut self.rng)).expect("rollable");
-                    if moves.is_empty() {
+                    let Some(busted) = self.draw_roll() else { return; };
+                    if busted {
                         self.end_turn();
                     }
                     continue;
@@ -278,8 +325,8 @@ impl Game {
                     self.state.stop().expect("can_stop");
                     self.end_turn();
                 } else {
-                    let moves = self.state.roll(roll_dice(&mut self.rng)).expect("rollable");
-                    if moves.is_empty() {
+                    let Some(busted) = self.draw_roll() else { return; };
+                    if busted {
                         self.end_turn();
                     }
                 }
@@ -298,8 +345,8 @@ impl Game {
             }
             if !self.config().exact_root {
                 // Start a turn: an opening bust needs no solve.
-                let moves = self.state.roll(roll_dice(&mut self.rng)).expect("rollable");
-                if moves.is_empty() {
+                let Some(busted) = self.draw_roll() else { return; };
+                if busted {
                     self.end_turn();
                     continue;
                 }
