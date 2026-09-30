@@ -63,7 +63,8 @@ def test_margin_is_applied_only_after_minimum_all_candidate_stage():
                          RolloutConfig(dice_luck=True))
     b.evaluate(reversal())
     assert len(b.last_stats['stages'][0]['rollout']['actions'])==2
-    assert all(a['samples']==16 for a in b.last_stats['stages'][0]['rollout']['actions'])
+    assert all(a['samples']==0 for a in b.last_stats['stages'][0]['rollout']['actions'])
+    assert b.last_stats['stages'][0]['rollout']['source']=='exact_baseline'
     assert b.last_stats['stages'][0]['survivors']==['stop']
     assert b.last_stats['stages'][1]['horizon']==1
 
@@ -166,3 +167,16 @@ def test_progressive_full_game_last_stage_and_incomplete_failure():
     assert failed.last_stats['status']=='incomplete'
     assert len(failed.last_stats['stages'])==1
     assert 'finalists' not in failed.last_stats
+
+
+@pytest.mark.parametrize('variance',[False,True])
+def test_horizon_zero_never_calls_rollout_and_matches_baseline(monkeypatch,variance):
+    from games.cantstop.decision_search import TurnTableBackend
+    def fail(*args,**kwargs): raise AssertionError('H=0 must not sample')
+    monkeypatch.setattr(RolloutBackend,'evaluate',fail)
+    for state in (one_roll(),reversal()):
+        baseline=TurnTableBackend(hashed_evaluator).evaluate(state)
+        b=ProgressiveBackend(hashed_evaluator,ProgressiveConfig(horizons=(0,),samples=(8,)),
+                             RolloutConfig(dice_luck=variance))
+        assert b.evaluate(state)==baseline
+        assert all(a['samples']==0 for a in b.last_stats['stages'][0]['rollout']['actions'])

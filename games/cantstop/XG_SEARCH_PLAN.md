@@ -1,7 +1,7 @@
 # XG-inspired search and training plan for Can't Stop
 
 Date: 2026-09-29
-Status: proposed implementation and experiment plan; no runs started by this document.
+Status: implementation steps 1-5 complete; review findings 1-3 addressed below. Search-quality/strength experiments and training remain pending. Historical implementation entries retain the behavior at that time; the review follow-up supersedes them.
 
 ## Objective and starting point
 
@@ -53,7 +53,7 @@ Tests and gate:
 - Correct horizon counting after stop, bust, continued rolling, and early terminal wins.
 - On small enumeratable fixtures, sampled estimates agree with exhaustive expected values within predeclared Monte Carlo tolerances.
 - Repeated fixed-seed runs reproduce trajectories and estimates.
-- H=0 agrees statistically with the baseline forced-action expectation when using the baseline continuation policy.
+- H=0 with baseline continuation equals the baseline forced-action expectation. With dice-luck correction the within-turn terms telescope sample by sample; use exact table values in staged/adaptive search instead of sampling.
 - Full-game mode never substitutes NN evaluation for an unfinished trajectory. Safety-limit hits are explicit failures, not silently discarded samples.
 
 Deliverable: a working, unfiltered rollout search and independent long-rollout reference mode.
@@ -695,3 +695,97 @@ Step 5 is complete. The next work is the planned search-quality/strength
 experiments (S0-S6), beginning with budget/horizon comparisons and independent
 position audits. Training integration/runs (T0 onward) and advisor integration
 remain gated on that evidence; neither has been started.
+
+
+## Review follow-up: adaptive usefulness and failure visibility (2026-09-30)
+
+The independent review of `69323ea` found the dice-luck correction and original
+Hoeffding formula correct, but the adaptive design too conservative to resolve
+realistic gaps. At 512 samples the old radius is roughly 14-17 win-percentage
+points. The pilot's unresolved decisions therefore did not test useful search.
+Findings 1-3 are addressed as follows. Finding 4 is addressed in the follow-up
+below; finding 5 (cross-player exploratory priorities at depth >= 2) remains open.
+
+### Corrected paired-t decisions
+
+`AdaptiveConfig.confidence` now defaults to `paired_t`. It compares corrected
+paired differences with a Student-t interval, using sample standard deviation
+and a Bonferroni correction over all original pairs and all planned stages.
+`--confidence hoeffding` retains the previous raw-payoff finite-sample bound.
+SciPy supplies the Student-t quantiles and is declared in `requirements.txt`.
+
+The paired-t method is **approximate for nonnormal rollout payoffs**. Bonferroni
+accounts for the planned comparisons but does not make the underlying t-interval
+finite-sample valid for arbitrary game distributions. No claim of exact 95%
+coverage is made. Heavy tails and rare events remain a calibration concern;
+independent decision audits must examine them before promotion. Confidence
+applies only to the declared fixed policy/horizon, not NN accuracy or strength.
+
+The default minimum is 32 samples per contender. Smaller stages cannot eliminate
+in paired-t mode. Numerically zero observed variance is left unresolved rather
+than interpreted as proof of a deterministic difference. Reports identify the
+method, approximate status, sample kind, standard error, and interval per pair.
+Corrected samples remain unclipped. Ties/budget exhaustion still choose the
+baseline-preferred survivor and explicitly report fallback.
+
+AdaptiveBackend and the adaptive comparison/arena CLIs now enable shared dice
+and dice-luck correction by default. CLI ablations use `--no-dice-luck` and
+`--no-common-random-numbers`. The standalone RolloutConfig defaults are unchanged.
+No search setting should be declared stronger without fresh evidence.
+
+### Exact H=0 stage
+
+Progressive search obtains H=0 directly from the baseline table and records zero
+samples with `source=exact_baseline`. Existing stage sample arguments remain
+accepted for command compatibility, but H=0's budget is unused. Baseline filtering
+can still discard a choice that future play would favor, so margin/cap filtering
+remains optional and must be audited. Adaptive H=0 also returns exact baseline
+values with no rollouts and `stop_reason=exact_baseline`.
+
+This identity assumes the implemented baseline policy for the current remainder;
+stronger early continuation starts on future turns. Standalone raw H=0 rollouts
+remain available as a reference estimator for tests, not as a useful search stage.
+H=1 measures a one-turn consistency correction to NN values; H>=2/full-game
+rollouts are important comparison arms when evaluating additional future play.
+The initial H=1 setting remains an ablation, not an established strength setting.
+
+### Failures cannot masquerade as null arena results
+
+Adaptive evaluation errors now raise by default after retaining checkpoint/error
+diagnostics. Time-budget and cancellation interruptions retain explicit fallback
+behavior. `failure_policy=fallback` is an opt-in diagnostic mode, not exposed by
+the arena CLI. Training/advisor integration must retain the default raise policy.
+
+The arena aborts on a raised evaluation error or an error fallback returned by a
+custom backend. It saves the partial game's decisions, error message, and counts
+by stop/fallback reason, marks the run incomplete, and withholds the verdict.
+The final report also refuses a verdict if it contains any evaluation failure or
+cancellation. Ordinary unresolved/time-budget fallbacks are counted separately;
+they remain valid behavior of the declared budgeted policy. No failed game is
+silently removed from a completed strength result.
+
+Targeted validation covers close-action reversal under corrected intervals,
+comparison with conservative bounds, a normal-stream calibration smoke, ties
+and degenerate samples, real rollout reversal on a small fixture, exact H=0 with
+no rollout calls, interruption/resume, and arena failure-report persistence.
+These are correctness/design regression tests, not playing-strength evidence.
+No search arenas or training runs were launched for this follow-up.
+
+Validation result: 210 checks passed across `test_adaptive_search.py`,
+`test_progressive_search.py`, `test_rollout_search.py`,
+`test_rollout_variance.py`, and `test_decision_search.py` (7.15 seconds).
+`git diff --check` was clean. The full 753-test suite was not rerun; the
+independent review records that earlier full-suite result.
+
+
+### Finding 4: per-variant unfinished-game limit
+
+The five-percent limit now applies to each variant's actual attempted games,
+including unfinished games in that denominator. A variant above the limit aborts
+the iteration before replay updates or training; the exception lists offending
+variants with counts and rates. Exactly five percent remains allowed. Successful
+iteration records retain `unfinished` and add `attempted` counts by variant.
+Unfinished games continue to be dropped; target semantics are unchanged.
+Regression tests cover a stalled minority hidden by healthy variants, unequal
+attempt counts, the exact threshold, empty/all-stalled generation, and stopping
+the training loop before an update. Finding 5 is unchanged.

@@ -1,7 +1,7 @@
-"""Fixed-horizon adaptive allocation with simultaneous bounded-payoff intervals.
+"""Fixed-horizon allocation using approximate paired-t or bounded raw intervals.
 
-Variance-corrected estimates are reported, but elimination uses bounded raw
-payoffs. No normal-distribution assumption or optional-stopping shortcut.
+Paired-t uses corrected differences and Bonferroni across fixed stages/pairs.
+Its coverage is approximate for nonnormal rollout payoffs, not distribution-free.
 """
 from dataclasses import asdict, dataclass, replace
 import hashlib
@@ -26,12 +26,21 @@ class AdaptiveConfig:
     alpha: float = 0.05
     max_sample_bytes: int = 64 * 1024 * 1024
     workers: int = 1
+    confidence: str = "paired_t"
+    minimum_samples: int = 32
+    failure_policy: str = "raise"
 
     def __post_init__(self):
         if not isinstance(self.budgets, tuple) or not self.budgets:
             raise ValueError('budgets must be a nonempty tuple')
         if type(self.workers) is not int or not 1 <= self.workers <= 8:
             raise ValueError('workers must be 1-8')
+        if self.confidence not in ("paired_t", "hoeffding"):
+            raise ValueError("unknown confidence method")
+        if type(self.minimum_samples) is not int or self.minimum_samples < 2:
+            raise ValueError("minimum_samples must be at least two")
+        if self.failure_policy not in ("raise", "fallback"):
+            raise ValueError("unknown failure policy")
         previous = 0
         for n in self.budgets:
             if type(n) is not int or n <= previous:
@@ -43,29 +52,43 @@ class AdaptiveConfig:
             raise ValueError('max_sample_bytes must be positive')
 
 
-def paired_bounds(raw, actor, alpha, checks, total_actions):
-    """Union-bound Hoeffding over every pair at each predeclared sample count.
+def paired_bounds(samples, actor, alpha, checks, total_actions, *,
+                  method="hoeffding", minimum_samples=32):
+    """Compare aligned prefixes at predeclared looks, correcting for all pairs.
 
-    Each independent simulation-index pair has difference in [-1,1], whether
-    its two actions share dice or use independent dice. Adaptive elimination
-    selects subsets of these pre-existing streams, not a new outcome-dependent
-    sampling distribution. Interval coverage concerns the fixed rollout policy.
+    Hoeffding is finite-sample valid for raw differences in [-1,1]. Paired-t
+    uses corrected differences and is only approximate for nonnormal payoffs.
+    Zero observed variance is not proof of determinism: leave it unresolved.
     """
-    keys = list(raw)
+    if method not in ("paired_t", "hoeffding"):
+        raise ValueError("unknown confidence method")
+    keys = list(samples)
     pairs = max(1, total_actions * (total_actions-1)//2)
-    n = len(raw[keys[0]])
-    if any(len(raw[k]) != n for k in keys):
-        raise ValueError('paired comparisons require aligned sample counts')
-    radius = math.sqrt(2 * math.log(2 * pairs * checks / alpha) / n)
+    n = len(samples[keys[0]])
+    if n == 0 or any(len(samples[k]) != n for k in keys):
+        raise ValueError('paired comparisons require nonempty aligned sample counts')
     eliminated, comparisons = set(), []
     for i, a in enumerate(keys):
         for b in keys[i+1:]:
-            mean = float(np.mean(np.asarray(raw[a])[:,actor]-np.asarray(raw[b])[:,actor]))
-            low, high = mean-radius, mean+radius
-            comparisons.append({'a':a, 'b':b, 'raw_mean_difference':mean,
-                                'low':low, 'high':high, 'samples':n})
-            if low > 0: eliminated.add(b)
-            if high < 0: eliminated.add(a)
+            difference = np.asarray(samples[a])[:,actor]-np.asarray(samples[b])[:,actor]
+            if not np.isfinite(difference).all():
+                raise ValueError('nonfinite paired samples')
+            mean = float(np.mean(difference))
+            se = float(np.std(difference, ddof=1)/math.sqrt(n)) if n > 1 else None
+            if method == 'hoeffding':
+                radius = math.sqrt(2 * math.log(2 * pairs * checks / alpha) / n)
+            elif n < minimum_samples or se is None or se <= 1e-14:
+                radius = None
+            else:
+                from scipy.stats import t
+                radius = float(t.isf(alpha/(2*pairs*checks), n-1)*se)
+            low, high = (None, None) if radius is None else (mean-radius, mean+radius)
+            comparisons.append({'a':a, 'b':b, 'mean_difference':mean,
+                'sample_kind':'adjusted' if method=='paired_t' else 'raw',
+                'method':method, 'approximate':method=='paired_t',
+                'standard_error':se, 'low':low, 'high':high, 'samples':n})
+            if low is not None and low > 0: eliminated.add(b)
+            if high is not None and high < 0: eliminated.add(a)
     return [k for k in keys if k not in eliminated], comparisons
 
 
@@ -91,7 +114,7 @@ def source_identity():
 
 
 class AdaptiveBackend:
-    def __init__(self, evaluator, config=AdaptiveConfig(), rollout=RolloutConfig(),
+    def __init__(self, evaluator, config=AdaptiveConfig(), rollout=RolloutConfig(dice_luck=True, common_random_numbers=True),
                  continuation=ProgressiveConfig(), *, evaluator_key=None):
         if config.workers > 1 and not getattr(evaluator,'thread_safe_batching',False):
             raise ValueError('parallel candidates require BatchingEvaluator')
@@ -130,16 +153,19 @@ class AdaptiveBackend:
             self._validate_checkpoint(data, legal, state.rules.num_players)
         policy = EarlyTurnPolicy(self.evaluator,self.continuation)
         self.last_stats = {'status':'running','stages':data['stages'], 'policy':policy.stats,
-                           'fallback':False,'confidence_method':'simultaneous paired raw-payoff Hoeffding',
+                           'fallback':False,'confidence_method':self.config.confidence,
+                           'confidence_approximate':self.config.confidence == 'paired_t',
                            'alpha':self.config.alpha,'configuration':asdict(self.config)}
         reason = 'sample_budget'
+        failure = None
+        exact = self.rollout.horizon == 0
         try:
-            required = len(legal)*self.config.budgets[-1]*state.rules.num_players*8*2
+            required = 0 if exact else len(legal)*self.config.budgets[-1]*state.rules.num_players*8*2
             self.last_stats['planned_numeric_sample_bytes'] = required
             if required > self.config.max_sample_bytes:
                 raise MemoryError('numeric sample storage budget exceeded')
             if checkpoint is not None: atomic_json(checkpoint,data)
-            while data['next_stage'] < len(self.config.budgets) and len(data['active']) > 1:
+            while not exact and data['next_stage'] < len(self.config.budgets) and len(data['active']) > 1:
                 if cancelled(): raise RolloutInterrupted('cancelled')
                 if deadline is not None and clock() >= deadline: raise RolloutInterrupted('time_budget')
                 stage = data['next_stage']; target = self.config.budgets[stage]
@@ -182,24 +208,27 @@ class AdaptiveBackend:
                 for key in data['active']:
                     new_samples[key]={field:data['samples'][key][field]+batch_samples[key][field].tolist()
                                       for field in ('raw','adjusted')}
-                raw = {k:new_samples[k]['raw'] for k in data['active']}
-                keep, comparisons = paired_bounds(raw,state.active_player,self.config.alpha,
-                                                    len(self.config.budgets),len(legal))
+                field = 'adjusted' if self.config.confidence == 'paired_t' else 'raw'
+                paired = {k:new_samples[k][field] for k in data['active']}
+                keep, comparisons = paired_bounds(paired,state.active_player,self.config.alpha,
+                    len(self.config.budgets),len(legal),method=self.config.confidence,
+                    minimum_samples=self.config.minimum_samples)
                 data['samples']=new_samples
                 data['stages'].append({'target':target,'active_before':data['active'],
                     'active_after':keep,'comparisons':comparisons,'rollout':batch_stats})
                 data['active'] = keep
                 data['next_stage'] += 1
                 if checkpoint is not None: atomic_json(checkpoint,data)
-            reason = 'resolved' if len(data['active']) <= 1 else 'sample_budget'
+            reason = 'exact_baseline' if exact else ('resolved' if len(data['active']) <= 1 else 'sample_budget')
         except RolloutInterrupted as exc:
             reason = str(exc)
         except (MemoryError, RuntimeError, ValueError) as exc:
             reason = 'evaluation_failure'
+            failure = exc
             self.last_stats['error'] = f'{type(exc).__name__}: {exc}'
         finally:
             policy.cache.clear()
-        resolved = len(data['active']) <= 1
+        resolved = exact or len(data['active']) <= 1
         selected = next((o.action for o in baseline.options if o.action.key in data['active']),None)
         options=[]
         for option in baseline.options:
@@ -209,13 +238,18 @@ class AdaptiveBackend:
             options.append(ActionValue(option.action,value))
         options.sort(key=lambda o:-o.value[state.active_player])
         value=next((o.value for o in options if o.action==selected),baseline.value)
-        self.last_stats.update(status='complete' if reason in ('resolved','sample_budget') else 'interrupted',
+        self.last_stats.update(status='complete' if reason in ('resolved','sample_budget','exact_baseline') else 'interrupted',
             stop_reason=reason,fallback=not resolved,active=data['active'],
             committed_samples={k:len(v['raw']) for k,v in data['samples'].items()},
             elapsed_seconds=clock()-start,
             time_budget_overshoot_seconds=0 if deadline is None else max(0,clock()-deadline))
         data['status']=self.last_stats['status']; data['stop_reason']=reason
+        if failure is not None: data['error']=self.last_stats['error']
+        else: data.pop('error',None)
         if checkpoint is not None: atomic_json(checkpoint,data)
+        if failure is not None and self.config.failure_policy == 'raise':
+            self.last_stats['fallback'] = False  # No action was returned.
+            raise failure
         return Decision(state.active_player,value,selected,tuple(options))
 
     def _validate_checkpoint(self,data,legal,n):

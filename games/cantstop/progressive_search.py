@@ -9,7 +9,7 @@ import json
 import math
 import time
 
-from .decision_search import TurnTableBackend
+from .decision_search import Decision, TurnTableBackend
 from .rollout_search import RolloutBackend, RolloutConfig
 from .rust_solver import RustTurnSolver
 from .snapshot import snapshot
@@ -119,9 +119,17 @@ class ProgressiveBackend:
             survivors = [o.action for o in baseline.options]
             result = baseline
             for i, (h, samples) in enumerate(zip(self.config.horizons, self.config.samples)):
-                cfg = replace(self.rollout, samples=samples, horizon=h)
-                backend = RolloutBackend(self.evaluator, cfg, policy_factory=policy)
-                result = backend.evaluate(state, candidates=survivors)
+                if h == 0:
+                    # Baseline continuation makes H=0 exactly the root table.
+                    options = tuple(o for o in baseline.options if o.action in survivors)
+                    result = Decision(baseline.actor, options[0].value, options[0].action, options)
+                    stage_stats = {'status':'complete', 'source':'exact_baseline',
+                        'actions':[{'action':o.action.key, 'samples':0} for o in options]}
+                else:
+                    cfg = replace(self.rollout, samples=samples, horizon=h)
+                    backend = RolloutBackend(self.evaluator, cfg, policy_factory=policy)
+                    result = backend.evaluate(state, candidates=survivors)
+                    stage_stats = backend.last_stats
                 keep = [o.action for o in result.options]
                 # All actions get the first stage. Only same-stage estimates
                 # are filtered; survivors all advance to the final horizon.
@@ -133,7 +141,7 @@ class ProgressiveBackend:
                     if self.config.max_candidates is not None:
                         keep = keep[:self.config.max_candidates]
                 self.last_stats['stages'].append({'index': i, 'horizon': h,
-                    'result': result.to_dict(), 'rollout': backend.last_stats,
+                    'result': result.to_dict(), 'rollout': stage_stats,
                     'pruned': [a.key for a in survivors if a not in keep],
                     'survivors': [a.key for a in keep]})
                 survivors = keep

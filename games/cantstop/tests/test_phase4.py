@@ -137,6 +137,8 @@ def test_loop_logs_per_variant_and_evaluates(tmp_path):
     assert set(rows[1]["probes"]) == {str(R2), str(R3)}
     assert rows[1]["buffer_exact_share"] == 0.0
     assert (tmp_path / "run_meta.json").exists()
+    assert rows[0]["attempted"] == rows[0]["games"]
+    assert set(rows[0]["attempted"]) == {str(R2), str(R3)}
 
 
 def test_exact_from_switches_targets_and_logs_the_mixture(tmp_path):
@@ -195,3 +197,47 @@ def test_variant_selection_for_a_specialist():
         phase4.parse_variants(["3-4-b"])
     with pytest.raises(ValueError):
         phase4.parse_variants(["2:4"])                  # 2p plays to 3 or 5
+
+
+# ---- unfinished-game guard ----
+
+def _fake_results(rules, attempted, unfinished):
+    from types import SimpleNamespace
+    return [SimpleNamespace(rules=rules,winner=-1 if i<unfinished else 0)
+            for i in range(attempted)]
+
+
+def test_one_stalling_variant_cannot_hide_in_healthy_variants():
+    results=[]
+    for i,rules in enumerate(ALL_RULESETS):
+        results += _fake_results(rules,20,2 if i==0 else 0)
+    # 1% pooled, but 10% in the affected variant.
+    with pytest.raises(phase4.TurnLimitExceeded) as error:
+        phase4._check_unfinished(results,7)
+    message=str(error.value)
+    assert 'iteration 7' in message and str(ALL_RULESETS[0]) in message
+    assert '2/20 (10.0%)' in message and '5%' in message
+
+
+def test_unfinished_boundary_uses_actual_attempts_and_accepts_exactly_five_percent():
+    results=_fake_results(R2,20,1)+_fake_results(R3,100,0)
+    attempted,unfinished=phase4._check_unfinished(results,1)
+    assert attempted=={str(R2):20,str(R3):100}
+    assert unfinished=={str(R2):1}
+    with pytest.raises(phase4.TurnLimitExceeded):
+        phase4._check_unfinished(_fake_results(R2,19,1)+_fake_results(R3,100,0),1)
+
+
+def test_unfinished_guard_rejects_empty_and_completely_stalled_generation():
+    for results in ([],_fake_results(R2,3,3)):
+        with pytest.raises(phase4.TurnLimitExceeded): phase4._check_unfinished(results,1)
+
+
+def test_run_checks_variant_stalls_before_training(tmp_path,monkeypatch):
+    results=_fake_results(R2,20,2)+_fake_results(R3,100,0)
+    monkeypatch.setattr(phase4,'generate',lambda *args,**kwargs:results)
+    def unexpected(*args,**kwargs): raise AssertionError('must stop before training')
+    monkeypatch.setattr(phase4,'train_steps',unexpected)
+    with pytest.raises(phase4.TurnLimitExceeded,match='per variant'):
+        phase4.run(tmp_path,iterations=1,**KW)
+    assert not (tmp_path/'iter_0001.pt').exists()

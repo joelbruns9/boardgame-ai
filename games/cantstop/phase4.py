@@ -47,7 +47,7 @@ from .train import (ReplayBuffer, generate, lr_at, parse_lr_schedule,
                     steps_for_passes, train_steps)
 from .variant_eval import ProbeSet, evaluate_variants
 
-# Share of an iteration's games allowed to hit the turn limit (dropped).
+# Share of each variant's attempted games allowed to hit the turn limit (dropped).
 MAX_UNFINISHED = 0.05
 
 # Arguments that define the run; a resume must not change them.
@@ -55,6 +55,26 @@ FIXED = ("rule_sets", "rows_per_variant", "hidden", "batch_size", "passes",
          "replay_window", "td_lambda", "exact_from", "conservative",
          "aggressive", "persona_bias", "personas_from", "reflect_augment",
          "seed")
+
+
+def _check_unfinished(results, iteration):
+    """A healthy variant must not hide stalling in another variant."""
+    attempted, unfinished = {}, {}
+    for result in results:
+        key = str(result.rules)
+        attempted[key] = attempted.get(key, 0) + 1
+        if result.winner < 0:
+            unfinished[key] = unfinished.get(key, 0) + 1
+    failures = [f"{key}: {count}/{attempted[key]} ({count/attempted[key]:.1%})"
+                for key, count in unfinished.items()
+                if count > MAX_UNFINISHED * attempted[key]]
+    if failures:
+        raise TurnLimitExceeded(
+            f"iteration {iteration}: turn-limit rate exceeds {MAX_UNFINISHED:.0%} "
+            f"per variant: {'; '.join(failures)}")
+    if not attempted:
+        raise TurnLimitExceeded(f"iteration {iteration}: no games generated")
+    return attempted, unfinished
 
 
 def _per_variant(results, rule_sets):
@@ -176,14 +196,7 @@ def run(out_dir, iterations, rule_sets=ALL_RULESETS, rows_per_variant=4000,
         # game hits the turn limit. Drop those games (no winner, no
         # targets) rather than abort the run; a policy that stalls often
         # is still a failure.
-        unfinished = {}
-        for r in results:
-            if r.winner < 0:
-                unfinished[str(r.rules)] = unfinished.get(str(r.rules), 0) + 1
-        if sum(unfinished.values()) > MAX_UNFINISHED * len(results):
-            raise TurnLimitExceeded(
-                f"iteration {it}: {sum(unfinished.values())} of "
-                f"{len(results)} games hit the turn limit {unfinished}")
+        attempted, unfinished = _check_unfinished(results, it)
         results = [r for r in results if r.winner >= 0]
         schedule.update(results)
 
@@ -210,6 +223,7 @@ def run(out_dir, iterations, rule_sets=ALL_RULESETS, rows_per_variant=4000,
             "games": {str(r): g for r, g in games.items()},
             "variants": _per_variant(results, rule_sets),
             "unfinished": unfinished,
+            "attempted": attempted,
         }
 
         if eval_every and it % eval_every == 0:

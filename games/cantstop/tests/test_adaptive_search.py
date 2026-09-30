@@ -75,15 +75,18 @@ def test_cancelled_batch_not_committed_and_time_memory_fallback(tmp_path):
     b.evaluate(one_roll(),seconds=0)
     assert b.last_stats['stop_reason']=='time_budget'
     tiny=AdaptiveBackend(flat_evaluator,replace(cfg,max_sample_bytes=1),rc)
-    assert tiny.evaluate(one_roll()).selected is not None
+    with pytest.raises(MemoryError): tiny.evaluate(one_roll())
     assert tiny.last_stats['stop_reason']=='evaluation_failure'
     assert 'MemoryError' in tiny.last_stats['error']
 
 
-def test_inference_failure_retains_valid_baseline(monkeypatch):
+def test_inference_failure_raises_unless_diagnostic_fallback_requested(monkeypatch):
     def fail(*args,**kwargs): raise RuntimeError('inference failed')
     monkeypatch.setattr(RolloutBackend,'evaluate',fail)
     b=AdaptiveBackend(flat_evaluator,AdaptiveConfig(budgets=(4,)))
+    with pytest.raises(RuntimeError,match='inference failed'): b.evaluate(one_roll())
+    assert not b.last_stats['fallback']
+    b=AdaptiveBackend(flat_evaluator,AdaptiveConfig(budgets=(4,),failure_policy='fallback'))
     r=b.evaluate(one_roll())
     assert r.selected is not None and b.last_stats['fallback']
     assert 'inference failed' in b.last_stats['error']
@@ -145,7 +148,7 @@ def test_adaptive_resolves_misleading_baseline_and_stops_allocating(monkeypatch)
             'adjusted':np.tile([.95,.05] if a.kind=='stop' else [.05,.95],(self.config.samples,1))} for a in candidates}
         self.last_stats={'status':'complete'}
     monkeypatch.setattr(RolloutBackend,'evaluate',fake)
-    b=AdaptiveBackend(flat_evaluator,AdaptiveConfig(budgets=(4,64,256)))
+    b=AdaptiveBackend(flat_evaluator,AdaptiveConfig(budgets=(4,64,256),confidence="hoeffding"))
     result=b.evaluate(one_roll())
     assert result.selected==Action('stop')
     assert not b.last_stats['fallback'] and b.last_stats['stop_reason']=='resolved'
@@ -233,4 +236,131 @@ def test_arena_accepts_other_decision_backends(mode):
         return RolloutBackend(flat_evaluator,RolloutConfig(samples=2,horizon=0))
     result=play_game(state.rules,flat_evaluator,5,0,AdaptiveConfig(budgets=(2,)),
                      RolloutConfig(horizon=0),start=state,backend_factory=factory)
-    assert result['decisions'] and all(d['samples']>0 for d in result['decisions'])
+    assert result['decisions']
+    assert all(d['samples']==0 if mode=='progressive' else d['samples']>0 for d in result['decisions'])
+
+
+def test_corrected_t_resolves_close_reversal_while_raw_hoeffding_cannot(monkeypatch):
+    from games.cantstop.decision_search import TurnTableBackend
+    state=one_roll()
+    baseline=TurnTableBackend(flat_evaluator).evaluate(state).selected
+    other=Action('stop') if baseline.kind=='roll' else Action('roll')
+    def fake(self,state,*,candidates=None):
+        rng=np.random.default_rng(77)
+        noise=rng.normal(0,.005,self.config.samples)
+        self.last_samples={}
+        for a in candidates:
+            adjusted=.5 + (noise+.01 if a==other else np.zeros(len(noise)))
+            raw=.5 + (rng.uniform(-.2,.2,len(noise)))
+            self.last_samples[a.key]={'raw':np.column_stack((raw,1-raw)),
+                'adjusted':np.column_stack((adjusted,1-adjusted))}
+        self.last_stats={'status':'complete'}
+    monkeypatch.setattr(RolloutBackend,'evaluate',fake)
+    b=AdaptiveBackend(flat_evaluator,AdaptiveConfig(budgets=(32,128,512)))
+    assert b.evaluate(state).selected==other
+    assert b.last_stats['confidence_approximate']
+    assert b.last_stats['stop_reason']=='resolved'
+    assert len(b.last_stats['stages'])==1
+    old=AdaptiveBackend(flat_evaluator,AdaptiveConfig(budgets=(32,128,512),confidence='hoeffding'))
+    assert old.evaluate(state).selected==baseline
+    assert old.last_stats['fallback']
+
+
+def test_paired_t_matches_student_quantile_and_keeps_degenerate_samples():
+    from scipy.stats import t
+    d=np.linspace(-.02,.03,64)
+    samples={'a':np.column_stack((d,1-d)), 'b':np.zeros((64,2))}
+    keep,rows=paired_bounds(samples,0,.05,3,4,method='paired_t')
+    expected=t.isf(.05/(2*6*3),63)*d.std(ddof=1)/8
+    assert rows[0]['high']-rows[0]['mean_difference']==pytest.approx(expected)
+    assert rows[0]['sample_kind']=='adjusted'
+    constant={'a':np.ones((64,2)), 'b':np.zeros((64,2))}
+    assert paired_bounds(constant,0,.05,3,2,method='paired_t')[0]==['a','b']
+    assert paired_bounds({k:v[:16] for k,v in samples.items()},0,.05,3,2,method='paired_t')[1][0]['low'] is None
+
+
+def test_t_interval_null_coverage_on_predeclared_normal_toy_streams():
+    # Calibration smoke for the intended approximation, not a proof for game payoffs.
+    rng=np.random.default_rng(102)
+    false_eliminations=0
+    for _ in range(200):
+        d=rng.normal(0,.005,128)
+        for n in (32,64,128):
+            samples={'a':np.column_stack((d[:n],-d[:n])), 'b':np.zeros((n,2))}
+            if len(paired_bounds(samples,0,.05,3,2,method='paired_t')[0])<2:
+                false_eliminations+=1
+                break
+    assert false_eliminations<=20
+
+
+def test_adaptive_horizon_zero_returns_exact_baseline_without_rollouts(monkeypatch):
+    from games.cantstop.decision_search import TurnTableBackend
+    def fail(*args,**kwargs): raise AssertionError('H=0 must not sample')
+    monkeypatch.setattr(RolloutBackend,'evaluate',fail)
+    state=one_roll()
+    backend=AdaptiveBackend(flat_evaluator,rollout=RolloutConfig(horizon=0))
+    assert backend.evaluate(state)==TurnTableBackend(flat_evaluator).evaluate(state)
+    assert backend.last_stats['stop_reason']=='exact_baseline'
+    assert not backend.last_stats['fallback']
+    assert sum(backend.last_stats['committed_samples'].values())==0
+
+
+@pytest.mark.parametrize('failure_policy',['raise','fallback'])
+def test_arena_cannot_play_through_evaluation_failure(monkeypatch,failure_policy):
+    from games.cantstop.adaptive_arena import play_game,ArenaEvaluationFailure,finalize_report
+    def fail(*args,**kwargs): raise RuntimeError('CUDA out of memory')
+    monkeypatch.setattr(RolloutBackend,'evaluate',fail)
+    state=one_roll()
+    with pytest.raises(ArenaEvaluationFailure) as error:
+        play_game(state.rules,flat_evaluator,1,0,AdaptiveConfig(budgets=(32,),failure_policy=failure_policy),
+                  RolloutConfig(horizon=1),start=state)
+    report={'status':'complete','games':[], 'failed_game':error.value.game,
+            'meta':{'start_fixture':None,'rules':{'num_players':2}}}
+    finalize_report(report)
+    assert report['result'] is None and report['status']=='incomplete'
+    assert report['decision_summary']['evaluation_failures']==1
+    assert 'CUDA out of memory' in report['failed_game']['decisions'][-1]['error']
+
+
+def test_arena_summary_counts_budget_fallbacks_and_refuses_error_results():
+    from games.cantstop.adaptive_arena import finalize_report
+    game={'winner_seat':0,'challenger_seat':0,'decisions':[
+        {'stop_reason':'sample_budget','fallback':True},
+        {'stop_reason':'time_budget','fallback':True}]}
+    report={'status':'complete','games':[game], 'meta':{'start_fixture':None,'rules':{'num_players':2}}}
+    finalize_report(report)
+    assert report['result'] is not None
+    assert report['decision_summary']['fallbacks_by_reason']=={'sample_budget':1,'time_budget':1}
+    game['decisions'].append({'stop_reason':'evaluation_failure','fallback':True})
+    finalize_report(report)
+    assert report['result'] is None and report['verdict_withheld']=='evaluation_failure'
+
+
+def test_real_rollout_can_reverse_baseline_under_corrected_t():
+    from games.cantstop.tests.test_progressive_search import reversal
+    from games.cantstop.rust_solver import hashed_evaluator
+    from games.cantstop.decision_search import TurnTableBackend
+    state=reversal()
+    assert TurnTableBackend(hashed_evaluator).evaluate(state).selected==Action('stop')
+    backend=AdaptiveBackend(hashed_evaluator,AdaptiveConfig(budgets=(32,128,512)))
+    assert backend.evaluate(state).selected==Action('roll')
+    assert backend.last_stats['stop_reason']=='resolved'
+    assert not backend.last_stats['fallback']
+
+
+def test_arena_cli_saves_failure_and_no_verdict(tmp_path,monkeypatch):
+    from games.cantstop import adaptive_arena
+    from games.cantstop.model import CantStopNet,save_net
+    checkpoint=tmp_path/'model.pt'; save_net(CantStopNet(hidden=(8,)),checkpoint)
+    out=tmp_path/'arena.json'
+    partial={'seed':1,'challenger_seat':0,'turns':1,'decisions':[
+        {'stop_reason':'evaluation_failure','fallback':False,'error':'inference failed'}]}
+    def fail(*args,**kwargs):
+        raise adaptive_arena.ArenaEvaluationFailure('inference failed',partial)
+    monkeypatch.setattr(adaptive_arena,'play_game',fail)
+    with pytest.raises(adaptive_arena.ArenaEvaluationFailure):
+        adaptive_arena.main(['--checkpoint',str(checkpoint),'--device','cpu','--games','2','--out',str(out)])
+    report=json.loads(out.read_text())
+    assert report['status']=='incomplete' and report['result'] is None
+    assert report['decision_summary']['evaluation_failures']==1
+    assert report['failed_game']==partial
