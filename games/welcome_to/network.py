@@ -107,6 +107,9 @@ LOSS_WEIGHTS: dict[str, float] = {
     # Its own group, not a fifth `capacity` member: joining would cut each
     # existing capacity target from 0.3/4 to 0.3/5.
     "short_horizon": 0.3,
+    # Separate from short_horizon for the same reason: three plan slots would
+    # otherwise cut forced_refusals_soon from 0.3 to 0.3/4.
+    "plan_hazard": 0.3,
 }
 
 _GROUP_OF: dict[str, str] = {
@@ -131,6 +134,7 @@ _GROUP_OF: dict[str, str] = {
     "end_trigger_all_plans": "outcome_mode",
     "end_trigger_max_permit": "outcome_mode",
     "forced_refusals_soon": "short_horizon",
+    **{f"plan_{slot}_dies_soon": "plan_hazard" for slot in range(3)},
     **{
         f"score_{part}": "components"
         for part in (

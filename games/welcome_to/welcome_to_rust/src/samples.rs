@@ -20,15 +20,17 @@ use crate::constants::{EMPTY, NUM_BOXES, PERMIT_BOXES, STREET_SIZES};
 use crate::encoder::{self, EncodedState};
 use crate::game::{EngineError, Game};
 use crate::macro_codec;
+use crate::plans;
 use crate::rng::Rng;
 use crate::tables;
 use crate::{to_py, RustGameState};
 
+/// 6: adds the per-seat `plan_k_dies_soon` targets (2026-09-30).
 /// 5: adds the per-seat `forced_refusals_soon` target (2026-09-30).
 /// 4: encoder v3 rows after review 2026-09-25 (ENCODER_ABI_VERSION 3).
-/// Versions 1-4 are refused, never read (spec §0.4): 1-3 hold rows of an
-/// earlier encoder, 4 lacks a target that cannot be re-derived from the row.
-pub const TRAINING_SHARD_VERSION: u16 = 5;
+/// Versions 1-5 are refused, never read (spec §0.4): 1-3 hold rows of an
+/// earlier encoder, 4-5 lack targets that cannot be re-derived from the row.
+pub const TRAINING_SHARD_VERSION: u16 = 6;
 pub const GLOBAL_TARGET_NAMES: [&str; 9] = [
     "turns_left",
     "rank_p_0",
@@ -40,7 +42,7 @@ pub const GLOBAL_TARGET_NAMES: [&str; 9] = [
     "rank_p_3",
     "rank_mask_3",
 ];
-pub const PER_SEAT_TARGET_NAMES: [&str; 33] = [
+pub const PER_SEAT_TARGET_NAMES: [&str; 39] = [
     "score",
     "permits",
     "houses",
@@ -73,6 +75,12 @@ pub const PER_SEAT_TARGET_NAMES: [&str; 33] = [
     "end_trigger_all_plans",
     "end_trigger_max_permit",
     "forced_refusals_soon",
+    "plan_0_dies_soon",
+    "plan_0_dies_soon_mask",
+    "plan_1_dies_soon",
+    "plan_1_dies_soon_mask",
+    "plan_2_dies_soon",
+    "plan_2_dies_soon_mask",
     "seat_valid",
 ];
 pub const GLOBAL_TARGET_COUNT: usize = GLOBAL_TARGET_NAMES.len();
@@ -121,8 +129,10 @@ struct Outcome {
     end_full_sheet: bool,
     end_all_plans: bool,
     end_max_permit: bool,
-    /// Turns of this seat's forced (direct) refusals; see `forced_refusal_turns`.
+    /// Turns of this seat's forced (direct) refusals; see `replay_history`.
     forced_refusal_turns: Vec<i32>,
+    /// Per slot, the turn during which this seat's plan died; see `replay_history`.
+    plan_death_turns: [Option<i32>; 3],
     final_turn: i32,
     num_seats: usize,
     rank_distribution: [f32; encoder::MAX_SEATS],
@@ -132,40 +142,81 @@ fn ratio(value: i32, scale: f64) -> f32 {
     (value as f64 / scale) as f32
 }
 
+/// `training.ReplayHistory`: what the move sequence says that the terminal
+/// state does not.
+struct ReplayHistory {
+    forced_refusals: Vec<Vec<i32>>,
+    plan_deaths: Vec<[Option<i32>; 3]>,
+}
+
+fn seat_completed(game: &Game, slot: usize, seat: usize) -> bool {
+    game.plan_turns[slot].iter().any(|&(who, _)| who == seat as i32)
+}
+
+/// `training.ReplayLog._boundary`: at a turn boundary every sheet is settled;
+/// a plan found infeasible there died during the turn that just ended.
+fn record_plan_deaths(game: &Game, ended: i32, deaths: &mut [[Option<i32>; 3]]) {
+    for (seat, seat_deaths) in deaths.iter_mut().enumerate() {
+        for slot in 0..3 {
+            if seat_deaths[slot].is_some() || seat_completed(game, slot, seat) {
+                continue;
+            }
+            if !plans::feasible(&plans::PLANS[game.plan_ids[slot]], &game.sheets[seat]) {
+                seat_deaths[slot] = Some(ended);
+            }
+        }
+    }
+}
+
 /// Replay `actions` from `seed` and record, per seat, the turn of every forced
-/// refusal (`M_DIRECT_REFUSE`). The terminal state keeps only the permit count.
-/// The replay must reproduce `terminal` exactly, or the macro list is not this
-/// game's and the error is loud.
-fn forced_refusal_turns(
+/// refusal (`M_DIRECT_REFUSE`) and the turn each plan died. The terminal state
+/// keeps only the permit count. The replay must reproduce `terminal` exactly,
+/// or the macro list is not this game's and the error is loud.
+fn replay_history(
     seed: u64,
     terminal: &Game,
     actions: &[usize],
-) -> Result<Vec<Vec<i32>>, EngineError> {
+) -> Result<ReplayHistory, EngineError> {
     let mut game = Game::new(seed, terminal.config)?;
-    let mut turns = vec![Vec::new(); terminal.config.players];
+    let players = terminal.config.players;
+    let mut forced_refusals = vec![Vec::new(); players];
+    let mut plan_deaths = vec![[None; 3]; players];
+    let mut turn = game.turn;
     for &action in actions {
+        if game.turn != turn {
+            record_plan_deaths(&game, turn, &mut plan_deaths);
+            turn = game.turn;
+        }
         if action == macro_codec::M_DIRECT_REFUSE {
-            turns[game.actor].push(game.turn);
+            forced_refusals[game.actor].push(game.turn);
         }
         macro_codec::apply_macro(&mut game, action)?;
+    }
+    if game.turn != turn {
+        record_plan_deaths(&game, turn, &mut plan_deaths);
     }
     if format!("{game:?}") != format!("{terminal:?}") {
         return Err(EngineError::Invalid(
             "replaying the recorded macros does not reproduce the terminal state".into(),
         ));
     }
-    Ok(turns)
+    Ok(ReplayHistory {
+        forced_refusals,
+        plan_deaths,
+    })
 }
 
-fn outcomes(game: &Game, forced_refusals: &[Vec<i32>]) -> Result<Vec<Outcome>, EngineError> {
+fn outcomes(game: &Game, history: &ReplayHistory) -> Result<Vec<Outcome>, EngineError> {
     if !game.is_terminal() {
         return Err(EngineError::Invalid(
             "training outcomes require a terminal game".into(),
         ));
     }
-    if forced_refusals.len() != game.config.players {
+    if history.forced_refusals.len() != game.config.players
+        || history.plan_deaths.len() != game.config.players
+    {
         return Err(EngineError::Invalid(
-            "forced refusals need one entry per seat".into(),
+            "the replay history needs one entry per seat".into(),
         ));
     }
     let seats = game.config.players;
@@ -226,7 +277,8 @@ fn outcomes(game: &Game, forced_refusals: &[Vec<i32>]) -> Result<Vec<Outcome>, E
             end_full_sheet: houses as usize == NUM_BOXES,
             end_all_plans: plans_completed == 3,
             end_max_permit: sheet.permits >= PERMIT_BOXES,
-            forced_refusal_turns: forced_refusals[player].clone(),
+            forced_refusal_turns: history.forced_refusals[player].clone(),
+            plan_death_turns: history.plan_deaths[player],
             final_turn: game.turn,
             num_seats: seats,
             rank_distribution: ranks[player],
@@ -286,7 +338,22 @@ fn seat_targets(outcome: &Outcome, turn: i32) -> [f32; PER_SEAT_TARGET_COUNT] {
         .filter(|&&refused| turn <= refused && refused <= turn + REFUSAL_HORIZON)
         .count() as i32;
     out[31] = ratio(soon, PERMIT_SCALE);
-    out[32] = 1.0;
+    // Masked where the plan is already settled (dead or completed) before the
+    // visit turn; see `training._seat_targets`.
+    for slot in 0..3 {
+        let value = 32 + slot * 2;
+        let died = outcome.plan_death_turns[slot];
+        let settled = died.is_some_and(|d| d < turn)
+            || outcome.plan_turns[slot].is_some_and(|c| c < turn);
+        if settled {
+            out[value] = -1.0;
+            out[value + 1] = 0.0;
+        } else {
+            out[value] = died.is_some_and(|d| d <= turn + REFUSAL_HORIZON) as u8 as f32;
+            out[value + 1] = 1.0;
+        }
+    }
+    out[38] = 1.0;
     out
 }
 
@@ -314,6 +381,7 @@ fn sample_targets(
             for slot in 0..3 {
                 out[start + 13 + slot * 2] = -1.0;
                 out[start + 22 + slot * 2] = -1.0;
+                out[start + 32 + slot * 2] = -1.0;
             }
         }
     }
@@ -429,8 +497,8 @@ impl RustTrainingCapture {
         if trajectory_json.is_empty() {
             return Err(PyValueError::new_err("trajectory JSON cannot be empty"));
         }
-        let forced = forced_refusal_turns(self.seed, &state.inner, &actions).map_err(to_py)?;
-        let terminal = outcomes(&state.inner, &forced).map_err(to_py)?;
+        let history = replay_history(self.seed, &state.inner, &actions).map_err(to_py)?;
+        let terminal = outcomes(&state.inner, &history).map_err(to_py)?;
         let roots = std::mem::take(&mut self.roots);
         let samples = roots
             .into_iter()

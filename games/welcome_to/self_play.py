@@ -367,7 +367,7 @@ def replay(trajectory: SelfPlayTrajectory) -> Iterator[datagen.Sample]:
     )
     targets = {target.decision: target for target in trajectory.searches}
     visits = []
-    refusals = training.ForcedRefusalLog(state.config.players)
+    log = training.ReplayLog(state)
     for decision, action in enumerate(trajectory.actions):
         target = targets.get(decision)
         if target is not None:
@@ -402,7 +402,7 @@ def replay(trajectory: SelfPlayTrajectory) -> Iterator[datagen.Sample]:
             )
         if action not in mc.legal_macros(state):
             raise ValueError(f"recorded macro {action} is illegal at decision {decision}")
-        refusals.observe(state, action)
+        log.observe(state, action)
         mc.apply_macro(state, action)
 
     if not state.is_terminal:
@@ -414,7 +414,7 @@ def replay(trajectory: SelfPlayTrajectory) -> Iterator[datagen.Sample]:
     if len(visits) != len(trajectory.searches):
         raise ValueError("one or more search targets were not replayed")
 
-    outcomes = training.final_outcomes(state, refusals.turns())
+    outcomes = training.final_outcomes(state, log.history(state))
     for encoded, legal, action, actor, turn, order, policy in visits:
         sheet_planes, sheet_scalars, viewer_plane, global_scalars = encoded
         yield datagen.Sample(
@@ -579,8 +579,8 @@ def _read_training_shard(path: Path) -> list[SelfPlayTrajectory]:
             and tuple(wr.TRAINING_GLOBAL_TARGET_NAMES) == training.GLOBAL_TARGETS
             and tuple(wr.TRAINING_PER_SEAT_TARGET_NAMES) == training.PER_SEAT_TARGETS
         )
-        # Earlier versions hold rows of an earlier encoder ABI (1-3) or lack a
-        # target that cannot be re-derived from a row (4).  §0.4: refused,
+        # Earlier versions hold rows of an earlier encoder ABI (1-3) or lack
+        # targets that cannot be re-derived from a row (4-5).  §0.4: refused,
         # never read or upgraded.
         if magic == b"WTSHRD01" and version < int(wr.TRAINING_SHARD_VERSION):
             raise ValueError(

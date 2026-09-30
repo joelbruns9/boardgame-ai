@@ -1,6 +1,7 @@
 """Auxiliary targets and the self-play diversity meter."""
 from __future__ import annotations
 
+import copy
 import random
 
 import numpy as np
@@ -8,6 +9,7 @@ import pytest
 
 from games.welcome_to import encoder as enc
 from games.welcome_to import macro_codec as mc
+from games.welcome_to import plans as pl
 from games.welcome_to import training as tr
 from games.welcome_to.bots import GreedyBot, play_match
 from games.welcome_to.game import GameConfig, GameState
@@ -16,7 +18,7 @@ from games.welcome_to.game import GameConfig, GameState
 def _outcomes(state: GameState) -> list[tr.PlayerOutcome]:
     """Outcomes with no refusal history.  GreedyBot games are played on
     primitives outside a replay, so only the refusal tests below build one."""
-    return tr.final_outcomes(state, [()] * state.config.players)
+    return tr.final_outcomes(state, tr.ReplayHistory.empty(state.config.players))
 
 
 def _targets(state: GameState, viewer: int, turn: int) -> dict:
@@ -40,7 +42,7 @@ def _finished(players: int = 2, seed: int = 3, mirrored: bool = False) -> GameSt
 def test_outcomes_need_a_finished_game():
     with pytest.raises(ValueError):
         tr.final_outcomes(
-            GameState.new(seed=1, config=GameConfig(players=2)), [(), ()]
+            GameState.new(seed=1, config=GameConfig(players=2)), tr.ReplayHistory.empty(2)
         )
 
 
@@ -184,19 +186,25 @@ def test_padded_seats_are_absent_rather_than_zero_scoring(players):
             assert targets[name][k] == float(tr.NEVER)
 
 
-def _random_macro_game(players: int, seed: int):
-    """A random game on the macro vocabulary, with its refusal log."""
+def _random_macro_game(players: int, seed: int, turn_starts: bool = False):
+    """A random game on the macro vocabulary, with its replay history."""
     rng = random.Random(seed)
     state = GameState.new(seed=seed, config=GameConfig(players=players, advanced=True))
-    log = tr.ForcedRefusalLog(players)
+    log = tr.ReplayLog(state)
     voluntary = [0] * players
+    starts = {state.turn: copy.deepcopy(state)}
     while not state.is_terminal:
         macro = rng.choice(mc.legal_macros(state))
         log.observe(state, macro)
         if mc.M_REFUSE <= macro < mc.M_DIRECT_REFUSE:
             voluntary[state.actor] += 1
         mc.apply_macro(state, macro)
-    return state, log.turns(), voluntary
+        if turn_starts and state.turn not in starts:
+            starts[state.turn] = copy.deepcopy(state)
+    history = log.history(state)
+    if turn_starts:
+        return state, history, starts
+    return state, history.forced_refusals, voluntary
 
 
 @pytest.mark.parametrize("players", [2, 3, 4])
@@ -213,13 +221,21 @@ def test_the_forced_refusal_log_accounts_for_every_permit(players):
     assert forced_seen > 0, "no forced refusal occurred; the test has no power"
 
 
+def _history(state: GameState, refusals=None, deaths=None) -> tr.ReplayHistory:
+    players = state.config.players
+    return tr.ReplayHistory(
+        tuple(refusals or ((),) * players),
+        tuple(deaths or ((None,) * 3,) * players),
+    )
+
+
 def test_forced_refusals_soon_counts_the_visit_turn_and_the_next_three():
     state = next(
         s
         for s in (_finished(players=2, seed=seed) for seed in range(40))
         if s.sheets[0].permits >= 2
     )
-    outcomes = tr.final_outcomes(state, [(5, 9), ()])
+    outcomes = tr.final_outcomes(state, _history(state, [(5, 9), ()]))
     expected = {2: 1, 4: 1, 5: 1, 6: 1, 8: 1, 9: 1, 10: 0, 1: 0}
     assert tr.REFUSAL_HORIZON == 3
     for turn, count in expected.items():
@@ -227,7 +243,7 @@ def test_forced_refusals_soon_counts_the_visit_turn_and_the_next_three():
         assert targets["forced_refusals_soon"] == (
             pytest.approx(count / tr.PERMIT_SCALE), 0.0, 0.0, 0.0
         ), turn
-    both = tr.final_outcomes(state, [(5, 7), ()])
+    both = tr.final_outcomes(state, _history(state, [(5, 7), ()]))
     assert tr.sample_targets(both, [0, 1], 4)["forced_refusals_soon"][0] == (
         pytest.approx(2 / tr.PERMIT_SCALE)
     )
@@ -238,13 +254,78 @@ def test_forced_refusals_soon_counts_the_visit_turn_and_the_next_three():
     )
 
 
-def test_outcomes_refuse_a_refusal_log_that_cannot_be_this_game():
+def test_outcomes_refuse_a_history_that_cannot_be_this_game():
     state = _finished(players=2, seed=3)
     with pytest.raises(ValueError, match="one entry per seat"):
-        tr.final_outcomes(state, [()])
+        tr.final_outcomes(state, tr.ReplayHistory(((),), ((None,) * 3,)))
     too_many = tuple(range(1, state.sheets[0].permits + 2))
     with pytest.raises(ValueError, match="forced refusals"):
-        tr.final_outcomes(state, [too_many, ()])
+        tr.final_outcomes(state, _history(state, [too_many, ()]))
+    state, seat, slot = next(
+        (state, seat, slot)
+        for seed in range(40)
+        for state in [_finished(players=2, seed=seed)]
+        for slot in range(3)
+        for seat in state.plan_turns[slot]
+    )
+    deaths = [[None] * 3, [None] * 3]
+    deaths[seat][slot] = 1
+    with pytest.raises(ValueError, match="after it died"):
+        tr.final_outcomes(state, _history(state, deaths=[tuple(d) for d in deaths]))
+
+
+@pytest.mark.parametrize("players", [2, 3])
+def test_plan_deaths_are_dated_to_the_turn_the_plan_became_unreachable(players):
+    """At the start of the death turn the plan was feasible; at the start of
+    the next it was not.  A plan with no death is feasible at the end or
+    completed.  Checked against the replay's own turn-start states."""
+    deaths_seen = 0
+    for seed in range(8):
+        state, history, starts = _random_macro_game(players, seed, turn_starts=True)
+        final_start = max(starts)
+        for seat in range(players):
+            for slot, plan_id in enumerate(state.plan_ids):
+                plan = pl.PLANS[plan_id]
+                died = history.plan_deaths[seat][slot]
+                completed = seat in state.plan_turns[slot]
+                if died is None:
+                    assert completed or pl.feasible(plan, state.sheets[seat])
+                    continue
+                deaths_seen += 1
+                assert not completed
+                assert pl.feasible(plan, starts[died].sheets[seat])
+                after = starts[died + 1] if died + 1 <= final_start else state
+                assert not pl.feasible(plan, after.sheets[seat])
+    assert deaths_seen > 0, "no plan died; the test has no power"
+
+
+def test_plan_dies_soon_is_windowed_and_masked_once_settled():
+    state, slot, completed_slot = next(
+        (s, free, done)
+        for s in (_finished(players=2, seed=seed) for seed in range(60))
+        for free in range(3)
+        for done in range(3)
+        if 0 not in s.plan_turns[free] and 0 in s.plan_turns[done]
+    )
+    completed_on = state.plan_turns[completed_slot][0]
+    deaths = [None] * 3
+    deaths[slot] = 6
+    outcomes = tr.final_outcomes(state, _history(state, deaths=[tuple(deaths), (None,) * 3]))
+    name, mask = f"plan_{slot}_dies_soon", f"plan_{slot}_dies_soon_mask"
+    expected = {2: (0.0, 1.0), 3: (1.0, 1.0), 6: (1.0, 1.0), 7: (float(tr.NEVER), 0.0)}
+    for turn, (value, weight) in expected.items():
+        targets = tr.sample_targets(outcomes, [0, 1], turn)
+        assert (targets[name][0], targets[mask][0]) == (value, weight), turn
+        # the other seat recorded no death: never dies, always live
+        assert (targets[name][1], targets[mask][1]) == (0.0, 1.0)
+    done, done_mask = (
+        f"plan_{completed_slot}_dies_soon",
+        f"plan_{completed_slot}_dies_soon_mask",
+    )
+    before = tr.sample_targets(outcomes, [0, 1], completed_on)
+    assert (before[done][0], before[done_mask][0]) == (0.0, 1.0)
+    after = tr.sample_targets(outcomes, [0, 1], completed_on + 1)
+    assert (after[done][0], after[done_mask][0]) == (float(tr.NEVER), 0.0)
 
 
 def test_every_per_seat_target_has_one_value_per_seat():

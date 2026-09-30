@@ -194,6 +194,7 @@ train the same parameters as seat 0's common ones.
 | `will_complete_plan_k` | 3 | sigmoid | — |
 | `plan_k_first` | 3 | sigmoid | — (masked) |
 | `forced_refusals_soon` | 1 | none | ÷3 (§6, added 2026-09-30) |
+| `plan_k_dies_soon` | 3 | sigmoid | — (masked once settled; §6, added 2026-09-30) |
 
 ### Global head — 5 output units, applied to the main `h`
 
@@ -586,7 +587,7 @@ placement is worth.
 
 *Source:* the terminal state keeps only the permit count, so the refusal turns
 come from the move sequence. Python replays record them with
-`training.ForcedRefusalLog`; the Rust capture's `finish(state, json, actions)`
+`training.ReplayLog`; the Rust capture's `finish(state, json, actions)`
 replays the macro list from the seed and refuses a list that does not reproduce
 the terminal state.
 
@@ -597,6 +598,39 @@ of learner-seat rows and 24% of all seat rows; 0.1% at turns 0–4, 10% at 10–
 *Cost:* a new per-seat head column changes the shard target layout — training
 shard version 5; version-4 shards are refused — and the per-seat head's output
 width, so earlier checkpoints no longer load.
+
+### `plan_k_dies_soon` — per seat, 3 sigmoids, masked once settled (added 2026-09-30)
+
+*Computes:* whether this seat's plan in slot k becomes **provably unreachable**
+(`plans.feasible` false) during turns `t .. t + 3`. Feasibility is checked at
+turn boundaries, when every sheet is settled — mid-turn, a half-validated estate
+plan has chosen estates not yet consumed, and `feasible` could read that as the
+death of the plan being validated. A death found at a boundary is dated to the
+turn that just ended. `feasible` is sound (it never reports a death that is not
+real; `tests/plan_reachability.py` is its oracle) but not complete, so this
+label misses some deaths and never invents one.
+
+*Mask:* 0 when the plan is already settled at the visit — dead or completed
+before turn `t`. M3's unmasked complement is the **input**: plan feasibility is
+an encoder feature, so the mask removes only cases the network reads off its
+input.
+
+*Why:* v3_random_01 iterations 7–8 (1,000 games). Park/pool (DECORATIVE) plans
+are never completed and 70% die, at median turn **8** (a quarter by turn 5) — a
+house written on a pool box without a pool. COMPLETE_STREET dies 95% of the
+time, median turn 13. Games end around turn 24. The damage is done 10+ turns
+before any completion could happen, so completion targets (`will_complete`,
+`turns_to_plan`, a short-horizon "completed within k") cannot reach it; this
+target lands on the placement that does it. An outcome, not a goodness
+judgement.
+
+*Base rate* (learner seat, live rows): 3.8% overall — DECORATIVE 21%,
+COMPLETE_STREET 31%, FIVE_BIS 10%, FULL_STREET 7.7%, EXTREMITIES 7.7%, ESTATE
+0.85% (estates stay feasible and simply go unbuilt; that is the curriculum's
+problem, not this head's), SEVEN_TEMP 0 (cannot die).
+
+*Source:* the same replay as `forced_refusals_soon` (`training.ReplayLog`,
+Rust `replay_history`). Training shard version 6.
 
 ### `will_complete_plan_k` — per seat, 3 sigmoids, **unmasked**
 
@@ -697,6 +731,8 @@ outcome mode  0.2     end_trigger
 components    0.2     score component heads
 short horizon 0.3     forced_refusals_soon  (own group: a fifth capacity member
                       would cut the others from 0.3/4 to 0.3/5)
+plan hazard   0.3     plan_k_dies_soon  (own group, so three slots do not cut
+                      forced_refusals_soon to 0.3/4)
 ```
 
 Consistent with `PROJECT_PLAN.md` M2: "score dominant early, policy next,

@@ -75,6 +75,7 @@ from itertools import combinations
 from typing import Optional, Sequence
 
 from games.welcome_to import macro_codec as mc
+from games.welcome_to import plans as pl
 from games.welcome_to.constants import NUM_BOXES, PERMIT_BOXES
 from games.welcome_to.game import GameState
 from games.welcome_to.sheet import SheetScore
@@ -140,8 +141,12 @@ class PlayerOutcome:
     #: slot is playable.  The voluntary refusal (take a slot whose printed
     #: number has nowhere to go) is a choice, not an outcome of the sheet, and
     #: is excluded.  Not in the terminal state: the replay records it, see
-    #: :class:`ForcedRefusalLog`.
+    #: :class:`ReplayLog`.
     forced_refusal_turns: tuple[int, ...]
+    #: Per plan slot, the turn during which this seat's plan became provably
+    #: unreachable (:func:`plans.feasible` false at the next turn boundary), or
+    #: ``None`` if it never did.  A completed plan never dies.
+    plan_death_turns: tuple[Optional[int], ...]
     #: Independent terminal clauses. More than one may be true on the final turn.
     end_full_sheet: bool
     end_all_plans: bool
@@ -238,45 +243,95 @@ def masked_mean(errors, mask):
     return (mask * errors).sum() / (count + (count == 0))
 
 
-class ForcedRefusalLog:
-    """Per-seat turns of forced refusals, recorded while a game is replayed.
+@dataclass(frozen=True, slots=True)
+class ReplayHistory:
+    """What a finished game's move sequence says that its terminal state does not.
 
-    Call :meth:`observe` with the state a macro is about to be applied to.
-    The terminal state keeps only the permit *count*; when each refusal
-    happened exists only in the move sequence.
+    ``forced_refusals[seat]`` -- the turns of that seat's forced refusals.
+    ``plan_deaths[seat][slot]`` -- the turn during which that seat's plan died.
     """
 
-    def __init__(self, players: int) -> None:
-        self._turns: list[list[int]] = [[] for _ in range(players)]
+    forced_refusals: tuple[tuple[int, ...], ...]
+    plan_deaths: tuple[tuple[Optional[int], ...], ...]
+
+    @classmethod
+    def empty(cls, players: int) -> "ReplayHistory":
+        """No refusals and no deaths.  For tests on games played outside a
+        replay; training data always comes from :class:`ReplayLog`."""
+        return cls(((),) * players, ((None,) * 3,) * players)
+
+
+class ReplayLog:
+    """Records a :class:`ReplayHistory` while a game is replayed.
+
+    Call :meth:`observe` with the state each macro is about to be applied to,
+    then :meth:`history` with the terminal state.
+
+    Plan feasibility is checked at **turn boundaries**, when every sheet is
+    settled.  Mid-turn a half-validated estate plan has chosen estates that are
+    not yet consumed, and :func:`plans.feasible` can read that transient as a
+    death of the very plan being validated.  A death found at a boundary is
+    dated to the turn that just ended.  Feasibility reads only the seat's own
+    sheet, so no seat's plan can die on another seat's move.
+    """
+
+    def __init__(self, state: GameState) -> None:
+        players = state.config.players
+        self._plan_ids = tuple(state.plan_ids)
+        self._refusals: list[list[int]] = [[] for _ in range(players)]
+        self._deaths: list[list[Optional[int]]] = [[None] * 3 for _ in range(players)]
+        self._turn = state.turn
+
+    def _boundary(self, state: GameState) -> None:
+        if state.turn == self._turn:
+            return
+        ended = self._turn
+        self._turn = state.turn
+        for seat, deaths in enumerate(self._deaths):
+            for slot, plan_id in enumerate(self._plan_ids):
+                if deaths[slot] is not None or seat in state.plan_turns[slot]:
+                    continue
+                if not pl.feasible(pl.PLANS[plan_id], state.sheets[seat]):
+                    deaths[slot] = ended
 
     def observe(self, state: GameState, macro: int) -> None:
+        self._boundary(state)
         if macro == mc.M_DIRECT_REFUSE:
-            self._turns[state.actor].append(state.turn)
+            self._refusals[state.actor].append(state.turn)
 
-    def turns(self) -> tuple[tuple[int, ...], ...]:
-        return tuple(tuple(seat) for seat in self._turns)
+    def history(self, state: GameState) -> ReplayHistory:
+        if not state.is_terminal:
+            raise ValueError("the replay has not reached a terminal state")
+        self._boundary(state)
+        return ReplayHistory(
+            tuple(tuple(seat) for seat in self._refusals),
+            tuple(tuple(seat) for seat in self._deaths),
+        )
 
 
-def final_outcomes(
-    state: GameState, forced_refusals: Sequence[Sequence[int]]
-) -> list[PlayerOutcome]:
+def final_outcomes(state: GameState, history: ReplayHistory) -> list[PlayerOutcome]:
     """Read the per-seat training targets off a finished game.
 
-    ``forced_refusals[seat]`` is the turns on which that seat was forced to
-    refuse -- :meth:`ForcedRefusalLog.turns` off the replay that reached
+    ``history`` is :meth:`ReplayLog.history` off the replay that reached
     ``state``.  Required rather than defaulted: an empty default would train
-    ``forced_refusals_soon`` to zero everywhere and nothing would look wrong.
+    the short-horizon targets to "nothing happens" everywhere and nothing
+    would look wrong.
     """
     if not state.is_terminal:
         raise ValueError("outcomes are only defined for a finished game")
-    if len(forced_refusals) != state.config.players:
-        raise ValueError("forced_refusals must have one entry per seat")
-    for seat, turns in enumerate(forced_refusals):
+    players = state.config.players
+    if len(history.forced_refusals) != players or len(history.plan_deaths) != players:
+        raise ValueError("the replay history must have one entry per seat")
+    for seat, turns in enumerate(history.forced_refusals):
         if len(turns) > state.sheets[seat].permits:
             raise ValueError(
                 f"seat {seat} has {len(turns)} forced refusals but "
                 f"{state.sheets[seat].permits} permits"
             )
+    for seat, deaths in enumerate(history.plan_deaths):
+        for slot, died in enumerate(deaths):
+            if died is not None and seat in state.plan_turns[slot]:
+                raise ValueError(f"seat {seat} completed plan slot {slot} after it died")
 
     scores = state.scores()
     distributions = rank_distributions(state)
@@ -303,7 +358,8 @@ def final_outcomes(
                 plan_turns=turns,
                 plan_first=first,
                 plans_completed=sum(1 for t in turns if t is not None),
-                forced_refusal_turns=tuple(forced_refusals[player]),
+                forced_refusal_turns=tuple(history.forced_refusals[player]),
+                plan_death_turns=tuple(history.plan_deaths[player]),
                 end_full_sheet=not sheet.has_free_box(),
                 end_all_plans=all(t is not None for t in turns),
                 end_max_permit=sheet.permits >= PERMIT_BOXES,
@@ -323,6 +379,7 @@ MASKED_TARGETS: dict[str, str] = {
         for slot in range(3)
     },
     **{f"plan_{slot}_first": f"plan_{slot}_first_mask" for slot in range(3)},
+    **{f"plan_{slot}_dies_soon": f"plan_{slot}_dies_soon_mask" for slot in range(3)},
 }
 
 #: Per-seat Bernoulli targets. Network outputs for these names are raw logits;
@@ -333,6 +390,7 @@ BINARY_TARGETS: tuple[str, ...] = (
     "end_trigger_full_sheet",
     "end_trigger_all_plans",
     "end_trigger_max_permit",
+    *(f"plan_{slot}_dies_soon" for slot in range(3)),
 )
 
 
@@ -387,6 +445,23 @@ def _seat_targets(outcome: PlayerOutcome, turn: int) -> dict[str, float]:
         sum(1 for t in outcome.forced_refusal_turns if turn <= t <= turn + REFUSAL_HORIZON)
         / PERMIT_SCALE
     )
+    # Masked where the plan is already settled at the visit: dead or completed
+    # before turn t.  That status is an encoder input (plan feasibility), so
+    # the mask removes only cases the network can read off its input -- M3's
+    # unmasked complement is the input itself.
+    for slot, died in enumerate(outcome.plan_death_turns):
+        completed = outcome.plan_turns[slot]
+        settled = (died is not None and died < turn) or (
+            completed is not None and completed < turn
+        )
+        if settled:
+            targets[f"plan_{slot}_dies_soon"] = float(NEVER)
+            targets[f"plan_{slot}_dies_soon_mask"] = 0.0
+        else:
+            targets[f"plan_{slot}_dies_soon"] = float(
+                died is not None and died <= turn + REFUSAL_HORIZON
+            )
+            targets[f"plan_{slot}_dies_soon_mask"] = 1.0
     #: 0.0 on a padded seat; see :data:`_PADDED_SEAT`.
     targets["seat_valid"] = 1.0
     return targets
@@ -403,6 +478,7 @@ _PROBE = PlayerOutcome(
     plan_first=(False, False, False),
     plans_completed=0,
     forced_refusal_turns=(),
+    plan_death_turns=(None, None, None),
     end_full_sheet=False,
     end_all_plans=False,
     end_max_permit=False,
