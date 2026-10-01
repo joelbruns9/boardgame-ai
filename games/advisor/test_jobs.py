@@ -8,6 +8,7 @@ whole point of standardizing the host.
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass
 
 from games.advisor import (
@@ -184,6 +185,103 @@ def test_annotators_decorate_settled_recommendations():
     resp = mgr.run_blocking(state, RecommendRequest(max_sims=60, chunk_sims=20, top_k=3))
     assert all(r.annotations.get("tag") == {"seen": True} for r in resp.recommendations)
     assert resp.summary.get("tag") == {"count": 3}
+
+
+def test_concurrent_annotator_overlaps_search_and_survives_later_publishes():
+    """A position-only analysis starts before the first search advance.
+
+    The two workers handshake, so this deadlocks/fails if either one is run
+    before the other instead of concurrently. The final assertion also catches
+    a later MCTS publish replacing the response and erasing the early result.
+    """
+
+    annotator_started = threading.Event()
+    search_started = threading.Event()
+
+    class _ConcurrentAnnotator:
+        name = "parallel"
+        concurrent = True
+        default_budget_secs = 1.0
+
+        def annotate(self, state, recommendations, req, *, deadline, stop_event):
+            assert recommendations == [], "concurrent analyses are position-only"
+            annotator_started.set()
+            assert search_started.wait(1.0), "search never overlapped the annotator"
+            return AnnotationResult(
+                name=self.name,
+                per_action={str(i): {"exact": True} for i in range(state.n_actions)},
+                summary={"overlapped": True},
+            )
+
+    class _OverlapHandle(_FakeHandle):
+        def advance(self, chunk_sims, stop_event):
+            assert annotator_started.wait(1.0), "annotator did not start before search"
+            search_started.set()
+            return super().advance(chunk_sims, stop_event)
+
+    class _OverlapAdapter(_FakeAdapter):
+        def open_search(self, state, req):
+            return _OverlapHandle(state.n_actions, req.max_sims)
+
+    manager = JobManager(
+        _OverlapAdapter(annotators=[_ConcurrentAnnotator()]),
+        publish_target_ms=0,
+    )
+    response = manager.run_blocking(
+        _FakeState("overlap", 3),
+        RecommendRequest(max_sims=80, chunk_sims=10, top_k=3),
+    )
+    assert response.sims_done == 80
+    assert response.summary["parallel"] == {"overlapped": True}
+    assert response.summary["annotation_status"]["parallel"] == {
+        "status": "complete"
+    }
+    assert all(rec.annotations["parallel"] == {"exact": True} for rec in response.recommendations)
+
+
+def test_cancellation_does_not_wait_for_concurrent_annotator():
+    """A stale Rust solve is clock-bounded but cannot delay a board change."""
+
+    release = threading.Event()
+    started = threading.Event()
+
+    class _SlowConcurrentAnnotator:
+        name = "slow"
+        concurrent = True
+        default_budget_secs = 1.0
+
+        def annotate(self, state, recommendations, req, *, deadline, stop_event):
+            started.set()
+            release.wait(1.0)  # deliberately ignores stop_event, like Rust in flight
+            return None
+
+    manager = JobManager(
+        _FakeAdapter(annotators=[_SlowConcurrentAnnotator()]),
+        chunk_default=1,
+        publish_target_ms=0,
+    )
+    job = manager.start(
+        _FakeState("cancel-concurrent", 3),
+        RecommendRequest(max_sims=10_000_000, chunk_sims=1),
+    )
+    assert started.wait(1.0)
+    live_deadline = time.perf_counter() + 1.0
+    live = manager.poll(job.job_id)
+    while live is not None and live.snapshot is None and time.perf_counter() < live_deadline:
+        time.sleep(0.005)
+        live = manager.poll(job.job_id)
+    assert live is not None and live.snapshot is not None
+    assert live.snapshot.summary["annotation_status"]["slow"] == {
+        "status": "running",
+        "budget_secs": 1.0,
+    }
+    stopped_at = time.perf_counter()
+    assert manager.stop(job.job_id)
+    final = _drain(manager, job)
+    elapsed = time.perf_counter() - stopped_at
+    release.set()
+    assert final.status == "cancelled"
+    assert elapsed < 0.25, "cancellation waited for the concurrent annotator"
 
 
 # --- abandoned streaming searches -------------------------------------------
@@ -363,3 +461,46 @@ def test_publish_target_zero_keeps_the_caller_s_chunk():
 
     manager = JobManager(_FakeAdapter(), publish_target_ms=0)
     assert manager._next_chunk(10, 10, 0.0001) == 10
+
+
+def test_worker_threads_are_pooled_not_one_per_job():
+    """The advisor panel starts one job per position -- tens per game, hundreds
+    across a session -- and torch's CPU inference leaks per-thread arenas it
+    never returns when the thread exits (measured ~18 MB for every thread a 7WD
+    search ran on: one game cost 1.3 GB, and several took the machine down).
+    A pool makes that a one-off, so the number of DISTINCT threads that ever run
+    a search must stay bounded, not track the job count. Counting live threads
+    would prove nothing -- a per-job thread is gone by the time the job is.
+    """
+
+    seen: set[int] = set()
+
+    class _RecordingAdapter(_FakeAdapter):
+        def open_search(self, state, req):
+            seen.add(threading.get_ident())
+            return _FakeHandle(state.n_actions, req.max_sims)
+
+    mgr = JobManager(_RecordingAdapter(), search_workers=2)
+    for i in range(12):
+        job = mgr.start(
+            _FakeState(f"pooled-{i}", 3), RecommendRequest(max_sims=60, chunk_sims=10)
+        )
+        _drain(mgr, job)
+    assert len(seen) <= 2, f"12 jobs ran on {len(seen)} threads; the pool is not reused"
+
+
+def test_reap_keeps_the_dedup_key_of_a_live_successor():
+    """A finished job must not take a newer search's key with it: the panel
+    re-asks the same position after a transient rejection, and losing the key
+    would start a second full search beside the first."""
+
+    mgr = JobManager(_FakeAdapter())
+    req = RecommendRequest(max_sims=40, chunk_sims=10)
+    old = mgr.start(_FakeState("same", 3), req)
+    _drain(mgr, old)
+    mgr._ttl_secs = 0.0  # the finished job is now due for reaping
+    new = mgr.start(_FakeState("same", 3), req)  # reaps `old` on the way in
+    assert new.job_id != old.job_id
+    assert mgr._by_key.get(("same", mgr._params_key(req))) == new.job_id
+    rejoined = mgr.start(_FakeState("same", 3), req)
+    assert rejoined.job_id == new.job_id, "a live job must still deduplicate"

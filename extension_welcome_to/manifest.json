@@ -1,0 +1,52 @@
+{
+  "manifest_version": 3,
+  "name": "BGA Welcome To Advisor",
+  "version": "0.1.0",
+  "description": "Reads the live Welcome To board on Board Game Arena and shows the local advisor's ranked moves and its own forecast of the game.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "welcometo-advisor@local",
+      "strict_min_version": "115.0"
+    }
+  },
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "*://*.boardgamearena.com/*",
+    "http://127.0.0.1:8001/*",
+    "http://localhost:8001/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.boardgamearena.com/*"
+      ],
+      "all_frames": true,
+      "js": [
+        "content.js"
+      ],
+      "css": [
+        "panel.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "bga_snippet.js",
+        "page_bridge.js"
+      ],
+      "matches": [
+        "*://*.boardgamearena.com/*"
+      ]
+    }
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "scripts": [
+      "background.js"
+    ]
+  }
+}

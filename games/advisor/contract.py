@@ -177,7 +177,7 @@ class SearchHandle(Protocol):
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass(frozen=True, slots=True)
 class AnnotationResult:
-    """Output of one annotator pass over a settled recommendation list.
+    """Output of one annotator pass over a position/recommendation list.
 
     ``per_action`` maps ``action_id`` to a blob merged into that
     recommendation's ``annotations``; ``summary`` is a position-level blob.
@@ -197,9 +197,11 @@ class Annotator(Protocol):
 
     This is the plug-in slot for per-game research value -- an exact endgame
     solve, trap/swindle search, a draft-danger matrix -- kept *out* of the
-    host.  It runs after the main search settles, under its own deadline, and
-    must honor ``stop_event``.  Caching by state key is the annotator's own
-    concern.
+    host.  By default it runs after the main search settles. An annotator that
+    depends only on the immutable position may declare ``concurrent = True``;
+    the host then starts it beside the main search and folds its answer into
+    every later snapshot. It still runs under its own deadline and must honor
+    ``stop_event``. Caching by state key is the annotator's own concern.
     """
 
     name: str
