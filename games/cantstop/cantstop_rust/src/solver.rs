@@ -659,6 +659,11 @@ impl TurnSolver {
         Ok(out)
     }
 
+    /// Whether `set_leaf_values` has run (the table is backed up).
+    pub fn is_solved(&self) -> bool {
+        self.solved
+    }
+
     /// Redo the backward induction with new leaf values (same layout as
     /// `set_leaf_values`). The selective lookahead's second pass.
     pub fn rebackup(&mut self, values: &[f64]) -> Result<(), SolveError> {

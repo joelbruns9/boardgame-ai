@@ -458,6 +458,25 @@ impl PyTurnSolver {
     #[getter]
     fn reach_evaluations(&self) -> usize { self.reach_evaluations }
 
+    #[getter]
+    fn stop_bias(&self) -> f64 { self.inner.stop_bias }
+
+    /// Risk attitude of the backup, as `self_play.Search.stop_bias`: stop
+    /// when stop value + bias >= roll value. The backup reads it, so it must
+    /// be set BEFORE `set_leaf_values`; a solved table refuses the change
+    /// rather than silently keeping the old bias.
+    #[setter]
+    fn set_stop_bias(&mut self, bias: f64) -> PyResult<()> {
+        if !bias.is_finite() {
+            return Err(PyValueError::new_err("stop_bias must be finite"));
+        }
+        if self.inner.is_solved() {
+            return Err(PyValueError::new_err("set stop_bias before set_leaf_values"));
+        }
+        self.inner.stop_bias = bias;
+        Ok(())
+    }
+
     fn leaf_reach_at(&mut self, leaf: usize) -> PyResult<f64> {
         if leaf >= self.inner.num_leaves() { return Err(PyValueError::new_err("leaf out of range")); }
         self.ensure_reach()?;

@@ -63,12 +63,15 @@ def _rust():
 class RustTurnSolver:
     """``solver.TurnSolver``'s interface on the Rust solver."""
 
-    def __init__(self, state, evaluate):
+    def __init__(self, state, evaluate, stop_bias=0.0):
         if state.game_over:
             raise ValueError("game is over")
         self.active = state.active_player
         self.num_players = state.rules.num_players
         self._s = _rust().TurnSolver(snapshot(state))
+        if stop_bias:
+            # Before the backup: a biased persona's table, as TurnSolver's.
+            self._s.stop_bias = float(stop_bias)
         if hasattr(evaluate, "evaluate_features"):
             # Fast path: Rust encodes the leaves; only one float32 buffer
             # crosses. ``reference`` carries the two things the output
