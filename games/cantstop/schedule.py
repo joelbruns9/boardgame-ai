@@ -33,9 +33,16 @@ class RowSchedule:
     """Games per variant for a per-variant row target."""
 
     def __init__(self, rule_sets=ALL_RULESETS, rows_per_variant=4000,
-                 smoothing=0.5, min_games=1):
+                 smoothing=0.5, min_games=1, weights=None):
         self.rule_sets = tuple(rule_sets)
         self.rows_per_variant = rows_per_variant
+        # Emphasis: a variant's row target is rows_per_variant x its weight
+        # (default 1). Configuration, not state: a resume takes the CLI's.
+        self.weights = {rules_key(r): 1.0 for r in self.rule_sets}
+        for k, w in (weights or {}).items():
+            if k not in self.weights or not w > 0:
+                raise ValueError(f"bad variant weight {k}: {w}")
+            self.weights[k] = float(w)
         self.smoothing = smoothing          # weight kept on the old estimate
         self.min_games = min_games
         self.rows_per_game = {rules_key(r): SEED_ROWS_PER_GAME[rules_key(r)]
@@ -45,6 +52,7 @@ class RowSchedule:
         """{rules: games} for the next iteration, in rule-set order."""
         return {r: max(self.min_games,
                        math.ceil(self.rows_per_variant
+                                 * self.weights[rules_key(r)]
                                  / self.rows_per_game[rules_key(r)]))
                 for r in self.rule_sets}
 

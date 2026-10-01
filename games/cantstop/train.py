@@ -158,14 +158,32 @@ def persona_seating(schedule, rng, search, conservative=0.0,
     return out
 
 
+def _starts(schedule, seeds, fraction, turns_per_player):
+    """Start boards for the pool: None (all empty boards) when off."""
+    if not fraction:
+        return None
+    from .engine import GameState
+    from .random_starts import pick_random_starts, random_start
+    picks = pick_random_starts(seeds, fraction)
+    return [random_start(rules, seed, turns_per_player) if pick
+            else GameState(rules)
+            for rules, seed, pick in zip(schedule, seeds, picks, strict=True)]
+
+
 def generate(rule_sets, games_per_ruleset, evaluate, rng, backend="auto",
              threads=0, stats=None, in_flight=None, search=PLAIN,
              conservative=0.0, aggressive=0.0, persona_bias=0.03,
-             allow_unfinished=False):
+             allow_unfinished=False, random_start_fraction=0.0,
+             random_start_turns=8):
     """Play the scheduled games and return every result.
 
     ``allow_unfinished`` (rust only) returns a game that hits the turn limit
     with ``winner == -1`` instead of raising; the caller must drop it.
+
+    ``random_start_fraction`` (rust only) starts that share of games from a
+    random-play prefix (``random_starts``) instead of the empty board. The
+    choice and the prefix draw from each game's own seed, so 0 reproduces
+    earlier runs exactly.
 
     Each game rolls from its own ``PortableRng``, seeded up front in
     schedule order, so both backends play exactly the same games:
@@ -183,6 +201,8 @@ def generate(rule_sets, games_per_ruleset, evaluate, rng, backend="auto",
         raise ValueError(f"unknown backend {backend!r}")
     if allow_unfinished and backend != "rust":
         raise ValueError("allow_unfinished needs the rust backend")
+    if random_start_fraction and backend != "rust":
+        raise ValueError("random starts need the rust backend")
     # ``games_per_ruleset``: one count for every rule set, or a
     # {rules: games} mapping (the Phase 4 row-balanced schedule).
     counts = (games_per_ruleset if isinstance(games_per_ruleset, dict)
@@ -200,6 +220,8 @@ def generate(rule_sets, games_per_ruleset, evaluate, rng, backend="auto",
             searches=slots,
             search_seating=[[slots.index(x) for x in seats]
                             for seats in seat_searches],
+            starts=_starts(schedule, seeds, random_start_fraction,
+                           random_start_turns),
             allow_unfinished=allow_unfinished)
     return [play_game(rules, evaluate, PortableRng(seed),
                       seat_searches=seats)

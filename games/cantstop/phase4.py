@@ -106,7 +106,9 @@ def run(out_dir, iterations, rule_sets=ALL_RULESETS, rows_per_variant=4000,
         batch_size=256, passes=5.0, replay_window=10, td_lambda=0.0,
         exact_from=None, conservative=0.0, aggressive=0.0, persona_bias=0.03,
         personas_from=None,
-        reflect_augment=False, eval_every=5, eval_games=200,
+        reflect_augment=False, variant_weights=None,
+        random_start_fraction=0.0, random_start_turns=8,
+        eval_every=5, eval_games=200,
         reference_iter=40, probes_per_variant=50, probe_alert=0.05, seed=0,
         device=None, init_checkpoint=None, threads=0, in_flight=None,
         resume=False):
@@ -119,7 +121,12 @@ def run(out_dir, iterations, rule_sets=ALL_RULESETS, rows_per_variant=4000,
               "exact_from": exact_from, "conservative": conservative,
               "aggressive": aggressive, "persona_bias": persona_bias,
               "personas_from": personas_from,
-              "reflect_augment": reflect_augment, "seed": seed}
+              "reflect_augment": reflect_augment, "seed": seed,
+              # Not FIXED: a resume may change the emphasis and the start mix.
+              "variant_weights": {str(k): w for k, w
+                                  in (variant_weights or {}).items()},
+              "random_start_fraction": random_start_fraction,
+              "random_start_turns": random_start_turns}
     device = torch.device(device or ("cuda" if torch.cuda.is_available()
                                      else "cpu"))
     state_path = out / "state.pt"
@@ -139,7 +146,8 @@ def run(out_dir, iterations, rule_sets=ALL_RULESETS, rows_per_variant=4000,
         rng, torch_rng = random.Random(), random.Random()
         rng.setstate(st["rng"])
         torch_rng.setstate(st["torch_rng"])
-        schedule = RowSchedule(rule_sets, rows_per_variant)
+        schedule = RowSchedule(rule_sets, rows_per_variant,
+                               weights=variant_weights)
         schedule.load(st["schedule"])
         probes = ProbeSet.from_state(st["probes"])
         start = st["iteration"] + 1
@@ -156,7 +164,8 @@ def run(out_dir, iterations, rule_sets=ALL_RULESETS, rows_per_variant=4000,
                else CantStopNet(hidden=hidden)).to(device)
         opt = torch.optim.Adam(net.parameters(), lr=lr)
         buffer = ReplayBuffer(window_iterations=replay_window)
-        schedule = RowSchedule(rule_sets, rows_per_variant)
+        schedule = RowSchedule(rule_sets, rows_per_variant,
+                               weights=variant_weights)
         probes = ProbeSet.build(rule_sets, probes_per_variant, seed)
         save_net(net, out / "iter_0000.pt")
         start = 1
@@ -189,7 +198,9 @@ def run(out_dir, iterations, rule_sets=ALL_RULESETS, rows_per_variant=4000,
                            conservative=conservative if personas else 0.0,
                            aggressive=aggressive if personas else 0.0,
                            persona_bias=persona_bias,
-                           allow_unfinished=True)
+                           allow_unfinished=True,
+                           random_start_fraction=random_start_fraction,
+                           random_start_turns=random_start_turns)
         gen_seconds = time.time() - started
         # An untrained net plays erratically, and the aggressive persona
         # (stop_bias < 0) never banks while its values are flat, so a rare
@@ -224,6 +235,8 @@ def run(out_dir, iterations, rule_sets=ALL_RULESETS, rows_per_variant=4000,
             "variants": _per_variant(results, rule_sets),
             "unfinished": unfinished,
             "attempted": attempted,
+            "random_start_fraction": random_start_fraction,
+            "variant_weights": config["variant_weights"],
         }
 
         if eval_every and it % eval_every == 0:
@@ -266,6 +279,19 @@ def parse_variants(items):
     return tuple(out)
 
 
+def parse_weights(items):
+    """``["3:4:b=2"]`` -> {(3, 4, True): 2.0}, keyed like the schedule."""
+    from .schedule import rules_key
+    out = {}
+    for item in items or ():
+        spec, sep, weight = item.partition("=")
+        if not sep:
+            raise SystemExit(f"variant weights are P:C[:b]=W, got {item!r}")
+        (rules,) = parse_variants([spec])
+        out[rules_key(rules)] = float(weight)
+    return out
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--out", required=True)
@@ -297,6 +323,13 @@ def main(argv=None):
                    help="plain self-play before this iteration, personas "
                         "from it on (default: from the first)")
     p.add_argument("--reflect-augment", action="store_true")
+    p.add_argument("--variant-weights", nargs="+", default=None,
+                   metavar="P:C[:b]=W",
+                   help="row emphasis per variant, e.g. 3:4:b=2 (default 1)")
+    p.add_argument("--random-start-fraction", type=float, default=0.0,
+                   help="share of games starting from a random-play prefix")
+    p.add_argument("--random-start-turns", type=int, default=8,
+                   help="prefix length: up to this many turns per player")
     p.add_argument("--eval-every", type=int, default=5)
     p.add_argument("--eval-games", type=int, default=200,
                    help="per opponent per variant (rounded up to seat cycles)")
@@ -321,7 +354,11 @@ def main(argv=None):
         exact_from=args.exact_from, conservative=args.conservative,
         aggressive=args.aggressive, persona_bias=args.persona_bias,
         personas_from=args.personas_from,
-        reflect_augment=args.reflect_augment, eval_every=args.eval_every,
+        reflect_augment=args.reflect_augment,
+        variant_weights=parse_weights(args.variant_weights),
+        random_start_fraction=args.random_start_fraction,
+        random_start_turns=args.random_start_turns,
+        eval_every=args.eval_every,
         eval_games=args.eval_games, reference_iter=args.reference_iter,
         probes_per_variant=args.probes_per_variant,
         probe_alert=args.probe_alert, seed=args.seed, device=args.device,
