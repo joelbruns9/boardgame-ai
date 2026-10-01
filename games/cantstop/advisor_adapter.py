@@ -11,7 +11,7 @@ from .engine import (COLUMNS, COLUMN_HEIGHTS, GameState, Phase, RuleSet,
 from .snapshot import snapshot
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CHECKPOINT = ROOT / "runs/p4_pilot/iter_0080.pt"
+DEFAULT_CHECKPOINT = ROOT / "extension_cantstop/models/cantstop_generalist_iter0154.pt"
 PHASES = {"diceChoice": Phase.AWAIT_MOVE, "continueChoice": Phase.AWAIT_DECISION}
 
 

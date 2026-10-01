@@ -15,7 +15,11 @@ powershell -ExecutionPolicy Bypass -File games\cantstop\run_advisor.ps1
 ```
 
 The launcher selects this checkout's venv or the sibling boardgame-ai venv.
-Default: generalist `runs/p4_pilot/iter_0080.pt`, CUDA, port 8765.
+Default model: `extension_cantstop/models/cantstop_generalist_iter0154.pt`,
+committed with the extension so it does not depend on the untracked `runs/`
+folder. It is a copy of `runs/p4_night/iter_0154.pt` (sha256 `c615b682e4a3...`),
+the all-variant generalist that scored best on the Rule of 28 yardstick
+(2026-10-01). CUDA, port 8765.
 Use `-Device cpu` if needed. Or, with an activated project environment:
 
 ```powershell
