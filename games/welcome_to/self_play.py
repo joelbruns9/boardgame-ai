@@ -1277,6 +1277,7 @@ def generate(
     search_policy_net: Optional[nw.WelcomeToNet] = None,
     cuda_events: bool = False,
     restarts: Mapping[int, tuple[curriculum.Restart, tuple[int, ...]]] = {},
+    move_override: Optional[Callable[[object, int], int]] = None,
 ) -> tuple[list[SelfPlayTrajectory], dict[str, Any]]:
     """Generate a continuously replenished batch of learner-only S2 games.
 
@@ -1292,6 +1293,11 @@ def generate(
     (:func:`curriculum.plan_restarts`); that job starts mid-game.  Strength
     metrics are reported over ordinary games only, so they stay comparable
     across iterations; the curriculum games get their own ``curriculum_*``.
+
+    ``move_override`` is a diagnostic seam (``hygiene_rescue``): called as
+    ``override(state, choice)`` before every real move, learner or opponent,
+    it returns the macro actually played.  A learner root's visit target is
+    still the search's; never pass it when generating training data.
     """
     if wr is None:
         raise RuntimeError(
@@ -1465,6 +1471,8 @@ def generate(
 
             for game, result, full in searched:
                 choice = int(result["choice"])
+                if move_override is not None:
+                    choice = int(move_override(game.state, choice))
                 visits = tuple(int(round(value)) for value in result["visits"])
                 if sum(visits) > 0:
                     if any(float(value) != visit for value, visit in zip(result["visits"], visits)):
@@ -1513,6 +1521,8 @@ def generate(
                     rng,
                     temperature_for_turn(config, game.state.turn),
                 )
+                if move_override is not None:
+                    choice = move_override(game.state, int(choice))
                 game.actions.append(int(choice))
                 game.state.apply_macro(int(choice))
 
