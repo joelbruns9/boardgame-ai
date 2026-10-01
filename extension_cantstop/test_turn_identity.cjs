@@ -1,0 +1,18 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const ctx = vm.createContext({});
+vm.runInContext(fs.readFileSync(__dirname + '/turn_identity.js', 'utf8'), ctx);
+const track = ctx.createCantStopTurnTracker('session1');
+const observe = (phase, active_player='a', table_id='t') => track({phase, active_player, table_id});
+const first = observe('diceChoice');
+for (const phase of ['continueChoice', 'diceRoll', 'diceChoice']) assert.equal(observe(phase), first);
+observe('failConfirm');
+const second = observe('diceChoice');
+assert.notEqual(second, first);
+observe('nextPlayer', 'b');
+assert.notEqual(observe('diceChoice', 'a'), second);
+assert.notEqual(observe('diceChoice', 'a', 'other'), second);
+const fresh = ctx.createCantStopTurnTracker('session2');
+assert.notEqual(fresh({phase:'diceChoice', active_player:'a', table_id:'t'}), first);
+console.log('Turn identity checks passed');

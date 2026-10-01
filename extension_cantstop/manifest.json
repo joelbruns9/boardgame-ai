@@ -1,0 +1,53 @@
+{
+  "manifest_version": 3,
+  "name": "BGA Can't Stop Advisor",
+  "version": "0.2.0",
+  "description": "Can't Stop model on the shared local advisor host.",
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "*://*.boardgamearena.com/*",
+    "http://127.0.0.1:8765/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.boardgamearena.com/*"
+      ],
+      "all_frames": true,
+      "js": [
+        "decision_cache.js",
+        "request_retry.js",
+        "content.js"
+      ],
+      "css": [
+        "panel.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "bga_snippet.js",
+        "turn_identity.js",
+        "page_bridge.js"
+      ],
+      "matches": [
+        "*://*.boardgamearena.com/*"
+      ]
+    }
+  ],
+  "background": {
+    "scripts": [
+      "background.js"
+    ]
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "cantstop-advisor@local",
+      "strict_min_version": "115.0"
+    }
+  }
+}

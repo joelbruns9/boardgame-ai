@@ -1,533 +1,546 @@
-# train.py
-# Training pipeline for the Can't Stop neural network.
-#
-# Loads training data from .jsonl files, converts to tensors,
-# and trains the dual-head (value + policy) network.
-#
-# Usage:
-#   python games/cantstop/train.py --data data/cantstop/training_data_*.jsonl
-#   python games/cantstop/train.py --data data/cantstop/training_data_*.jsonl --epochs 10
+"""MVP training loop: self-play with the current net, then fit the winner.
 
-import os
-import sys
-import json
-import time
-import random
+Phase 2 of ``VARIANT_SOLVER_PLAN.md``. Deliberately narrow and standalone --
+it is *not* wired into ``games/az_loop``, because az_loop is built around
+policy+value AlphaZero learners and integrating it would gate this on
+plumbing rather than on the only question that matters here: does the loop
+learn at all?
+
+Run (from the repo root):
+
+    python -m games.cantstop.train --out runs/mvp --iterations 10 --games 20
+
+Generation is single-process for now. The fan-out below (which rule sets,
+how many games each, how rows are collected) is kept separate from *how* the
+games are executed precisely so a process pool -- and later the Rust engine --
+can replace the execution without touching the schedule.
+"""
+
 import argparse
-import numpy as np
+import json
+import math
+import random
+import time
+from collections import deque
 from pathlib import Path
-from datetime import datetime
 
+import numpy as np
 import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
-
-from games.cantstop.features import (
-    FEATURE_SIZE, ACTION_SPACE, COLUMNS,
-    extract_features, get_legal_action_mask,
-    move_to_action, action_to_move_decision,
-    BUST_CACHE, ROLL_FREQUENCY, DIFFICULTY_WT,
-    MAX_THREAT, COL_INDEX
+from .arena import compare
+from .encoder import FEATURE_SIZE
+from .engine import ALL_RULESETS, RuleSet
+from .model import (
+    CantStopNet, NetEvaluator, load_net, masked_cross_entropy,
+    masked_soft_cross_entropy, save_net,
+    seat_mask_tensor,
 )
-from games.cantstop.engine import GameState, COLUMN_HEIGHTS
-from games.cantstop.model import CantStopNet, combined_loss
+from .self_play import PLAIN, Search, play_game, stack_training, summarize
+from .portable_rng import PortableRng
+from .solver import ProgressHeuristic
+
+# The MVP rule set: fewest seats and fewest columns to win, so games are as
+# short as the variant space allows. The encoder is full width regardless.
+MVP_RULES = RuleSet.make(2, extended=False, blocking=False)
 
 
-# ---- DATASET ----
+class ReplayBuffer:
+    """Most-recent rows, one chunk per ``add`` (per iteration).
 
-class CantStopDataset(Dataset):
+    Two independent limits, either or both:
+
+    * ``window_iterations`` -- keep the last K iterations' rows, as 7WD's
+      ``--replay-window``. The run's default; it is what makes
+      ``--passes`` mean "passes over each position's lifetime".
+    * ``max_rows`` -- a hard row cap, trimmed by whole iterations. Rows, not
+      games, because a 4-player or 5-column game contributes several times
+      the rows of a 2-player base game.
     """
-    Memory-efficient dataset — stores masks as move lists,
-    reconstructs bool tensor on demand in __getitem__.
-    Reduces RAM usage by ~3.4GB for 21M records.
-    """
 
-    def __init__(self, jsonl_paths, max_records=None, skip_exploration=False):
-        print(f"Loading and preprocessing training data...")
+    def __init__(self, max_rows=None, window_iterations=None):
+        if max_rows is None and window_iterations is None:
+            raise ValueError("give max_rows, window_iterations, or both")
+        self.max_rows = max_rows
+        self.window_iterations = window_iterations
+        self._chunks = deque()
+        self._rows = 0
 
-        raw_records = []
-        for path in jsonl_paths:
-            print(f"  Reading {path}...")
-            loaded = skipped = 0
-            with open(path, 'r') as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    try:
-                        record = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
+    def add(self, features, slots, meta=None):
+        """One iteration's rows. ``meta``: optional per-row arrays (e.g.
+        variant, source game, target mode) kept alongside, so the buffer
+        can be exported as a dataset and its target mixture logged."""
+        if len(features) != len(slots):
+            raise ValueError("features and labels disagree in length")
+        meta = dict(meta or {})
+        if any(len(v) != len(features) for v in meta.values()):
+            raise ValueError("meta arrays disagree in length")
+        if not len(features):
+            return
+        self._chunks.append((features, slots, meta))
+        self._rows += len(features)
+        while len(self._chunks) > 1 and (
+                (self.max_rows is not None and self._rows > self.max_rows)
+                or (self.window_iterations is not None
+                    and len(self._chunks) > self.window_iterations)):
+            old_x = self._chunks.popleft()[0]
+            self._rows -= len(old_x)
 
-                    if skip_exploration and record.get('is_exploration', False):
-                        skipped += 1
-                        continue
-
-                    raw_records.append(record)
-                    loaded += 1
-
-                    if max_records and len(raw_records) >= max_records:
-                        break
-
-            print(f"    Loaded {loaded:,} records (skipped {skipped:,})")
-            if max_records and len(raw_records) >= max_records:
-                break
-
-        import gc
-        n = len(raw_records)
-        print(f"\n  Preprocessing {n:,} records...")
-        random.shuffle(raw_records)
-
-        # Pre-allocate compact arrays
-        # Features: float32 — unavoidable
-        self.features       = np.zeros((n, FEATURE_SIZE), dtype=np.float32)
-        # Masks: packed bits — 154 bits = 20 bytes per record vs 154 bytes
-        packed_size         = (ACTION_SPACE + 7) // 8
-        self.masks_packed   = np.zeros((n, packed_size),   dtype=np.uint8)
-        self.value_targets  = np.zeros(n,                  dtype=np.float32)
-        self.policy_targets = np.zeros(n,                  dtype=np.int32)
-
-        errors = 0
-        for i, rec in enumerate(raw_records):
-            try:
-                state = _record_to_state(rec)
-                valid_moves = [tuple(m) for m in rec['valid_moves']]
-
-                self.features[i] = extract_features(state, valid_moves)
-
-                # Pack mask into bits
-                mask = get_legal_action_mask(valid_moves)
-                self.masks_packed[i] = np.packbits(mask, bitorder='little')
-
-                self.value_targets[i]  = float(rec['outcome'])
-
-                move = tuple(rec['move'])
-                decision = rec['decision']
-                try:
-                    action_idx = move_to_action(move, decision)
-                except ValueError:
-                    errors += 1
-                    continue
-                self.policy_targets[i] = action_idx
-
-            except Exception as e:
-                errors += 1
-                continue
-
-            if (i + 1) % 500_000 == 0:
-                print(f"    Preprocessed {i+1:,} / {n:,}...")
-
-        # Free raw records immediately
-        del raw_records
-        gc.collect()
-
-        if errors:
-            print(f"    Warning: {errors} records failed")
-
-        # Report memory usage
-        feature_mb = self.features.nbytes / 1024**2
-        mask_mb    = self.masks_packed.nbytes / 1024**2
-        total_mb   = (self.features.nbytes + self.masks_packed.nbytes +
-                     self.value_targets.nbytes + self.policy_targets.nbytes) / 1024**2
-        print(f"  Memory usage:")
-        print(f"    Features: {feature_mb:.0f}MB")
-        print(f"    Masks:    {mask_mb:.0f}MB")
-        print(f"    Total:    {total_mb:.0f}MB")
-        print(f"  Done. {n:,} records ready.\n")
+    @property
+    def iterations(self):
+        """Iterations actually held (realised window)."""
+        return len(self._chunks)
 
     def __len__(self):
-        return len(self.value_targets)
+        return self._rows
 
-    def __getitem__(self, idx):
-        # Unpack bits back to bool tensor
-        mask = np.unpackbits(
-            self.masks_packed[idx], count=ACTION_SPACE, bitorder='little'
-        ).astype(bool)
+    def arrays(self):
+        if not self._chunks:
+            return (np.zeros((0, FEATURE_SIZE), dtype=np.float32),
+                    np.zeros(0, dtype=np.int64))
+        return (np.concatenate([c[0] for c in self._chunks]),
+                np.concatenate([c[1] for c in self._chunks]))
 
-        return (
-            torch.from_numpy(self.features[idx].copy()),
-            torch.from_numpy(mask),
-            torch.tensor(float(self.value_targets[idx])),
-            torch.tensor(int(self.policy_targets[idx])),
-        )
+    def meta(self, name):
+        """One metadata column over the whole buffer (None if any chunk
+        lacks it)."""
+        cols = [c[2].get(name) for c in self._chunks]
+        if not cols or any(c is None for c in cols):
+            return None
+        return np.concatenate(cols)
+
+    def state(self):
+        """Everything needed to rebuild the buffer exactly (resume)."""
+        return {"max_rows": self.max_rows,
+                "window_iterations": self.window_iterations,
+                "chunks": [(x, y, dict(m)) for x, y, m in self._chunks]}
+
+    @classmethod
+    def from_state(cls, state):
+        buf = cls(max_rows=state["max_rows"],
+                  window_iterations=state["window_iterations"])
+        for x, y, m in state["chunks"]:
+            buf._chunks.append((x, y, m))
+            buf._rows += len(x)
+        return buf
 
 
-def _record_to_state(rec):
+def persona_seating(schedule, rng, search, conservative=0.0,
+                    aggressive=0.0, bias=0.03):
+    """Per game, one ``Search`` per seat: the self-play personas.
+
+    ``conservative`` / ``aggressive`` are fractions of games (rounded) in
+    which ONE seat plays with ``stop_bias`` +``bias`` / -``bias`` on top of
+    ``search``; every other seat plays ``search``. Which games get a
+    persona is a deterministic shuffle drawn from ``rng`` (after the seeds),
+    and the persona sits at seat ``game_index % players`` so no seat is
+    favoured. Coverage, not exploration: human opponents mostly stop too
+    early, and pure self-play never shows the net those positions.
     """
-    Reconstruct a GameState from a training record.
-    Used for feature extraction during dataset loading.
+    from dataclasses import replace
+    k = len(schedule)
+    n_c = round(conservative * k)
+    n_a = round(aggressive * k)
+    if n_c + n_a > k:
+        raise ValueError("persona fractions exceed 1")
+    if n_c + n_a == 0:
+        # No shuffle, so a persona-free run draws exactly the random
+        # numbers it did before personas existed.
+        return [[search] * rules.num_players for rules in schedule]
+    kinds = ["c"] * n_c + ["a"] * n_a + ["p"] * (k - n_c - n_a)
+    rng.shuffle(kinds)
+    out = []
+    for i, (rules, kind) in enumerate(zip(schedule, kinds)):
+        seats = [search] * rules.num_players
+        if kind != "p":
+            seats[i % rules.num_players] = replace(
+                search, stop_bias=bias if kind == "c" else -bias)
+        out.append(seats)
+    return out
+
+
+def _starts(schedule, seeds, fraction, turns_per_player):
+    """Start boards for the pool: None (all empty boards) when off."""
+    if not fraction:
+        return None
+    from .engine import GameState
+    from .random_starts import pick_random_starts, random_start
+    picks = pick_random_starts(seeds, fraction)
+    return [random_start(rules, seed, turns_per_player) if pick
+            else GameState(rules)
+            for rules, seed, pick in zip(schedule, seeds, picks, strict=True)]
+
+
+def generate(rule_sets, games_per_ruleset, evaluate, rng, backend="auto",
+             threads=0, stats=None, in_flight=None, search=PLAIN,
+             conservative=0.0, aggressive=0.0, persona_bias=0.03,
+             allow_unfinished=False, random_start_fraction=0.0,
+             random_start_turns=8):
+    """Play the scheduled games and return every result.
+
+    ``allow_unfinished`` (rust only) returns a game that hits the turn limit
+    with ``winner == -1`` instead of raising; the caller must drop it.
+
+    ``random_start_fraction`` (rust only) starts that share of games from a
+    random-play prefix (``random_starts``) instead of the empty board. The
+    choice and the prefix draw from each game's own seed, so 0 reproduces
+    earlier runs exactly.
+
+    Each game rolls from its own ``PortableRng``, seeded up front in
+    schedule order, so both backends play exactly the same games:
+
+    * ``"rust"`` -- the M3 pool: every game in flight at once, Rust doing
+      the turns on ``threads`` cores, one batched forward per round;
+    * ``"python"`` -- one game at a time through ``self_play.play_game``,
+      the reference the M3 gate replays;
+    * ``"auto"`` -- rust when the extension is built.
     """
-    state = GameState(2)
-    player   = rec['active_player']
-    opponent = 1 - player
+    from . import rust_pool
+    if backend == "auto":
+        backend = "rust" if rust_pool.rust_available() else "python"
+    if backend not in ("rust", "python"):
+        raise ValueError(f"unknown backend {backend!r}")
+    if allow_unfinished and backend != "rust":
+        raise ValueError("allow_unfinished needs the rust backend")
+    if random_start_fraction and backend != "rust":
+        raise ValueError("random starts need the rust backend")
+    # ``games_per_ruleset``: one count for every rule set, or a
+    # {rules: games} mapping (the Phase 4 row-balanced schedule).
+    counts = (games_per_ruleset if isinstance(games_per_ruleset, dict)
+              else {r: games_per_ruleset for r in rule_sets})
+    schedule = [r for r in rule_sets for _ in range(counts[r])]
+    seeds = rust_pool.game_seeds(rng, len(schedule))
+    seat_searches = persona_seating(schedule, rng, search, conservative,
+                                    aggressive, persona_bias)
+    if backend == "rust":
+        slots = list(dict.fromkeys(x for seats in seat_searches
+                                   for x in seats))
+        return rust_pool.run_pool(
+            schedule, seeds, [evaluate], threads=threads, stats=stats,
+            in_flight=in_flight or rust_pool.DEFAULT_IN_FLIGHT,
+            searches=slots,
+            search_seating=[[slots.index(x) for x in seats]
+                            for seats in seat_searches],
+            starts=_starts(schedule, seeds, random_start_fraction,
+                           random_start_turns),
+            allow_unfinished=allow_unfinished)
+    return [play_game(rules, evaluate, PortableRng(seed),
+                      seat_searches=seats)
+            for rules, seed, seats in zip(schedule, seeds, seat_searches)]
 
-    state.active_player = player
-    state.dice = list(rec['dice'])
 
-    # Progress — convert string keys back to int
-    state.progress[player]   = {int(k): v for k, v in rec['progress_active'].items()}
-    state.progress[opponent] = {int(k): v for k, v in rec['progress_opponent'].items()}
-
-    # Claimed columns
-    state.claimed[player]   = set(rec['claimed_active'])
-    state.claimed[opponent] = set(rec['claimed_opponent'])
-    state.all_claimed       = state.claimed[0] | state.claimed[1]
-
-    # Runners
-    state.runners = {int(k): v for k, v in rec['runners'].items()} \
-        if rec['runners'] else {}
-
-    return state
+def reflect_half(x, rng, perm):
+    """Mirror each row of a minibatch with probability 1/2 (column
+    reflection is an exact symmetry; targets are seat slots, which do not
+    move). Returns the batch and the number of rows mirrored."""
+    flip = torch.tensor([rng.random() < 0.5 for _ in range(len(x))],
+                        device=x.device)
+    return torch.where(flip[:, None], x.index_select(1, perm), x), int(flip.sum())
 
 
-# ---- TRAINING LOOP ----
+def train_steps(net, buffer, opt, steps, batch_size, device, rng,
+                reflect=False):
+    """Sample minibatches from the buffer and fit. Returns the mean loss.
+    ``reflect``: randomly mirror half of every minibatch (augmentation)."""
+    x_all, y_all = buffer.arrays()
+    if not len(x_all):
+        return float("nan")
+    x_all = torch.from_numpy(x_all).to(device)
+    y_all = torch.from_numpy(y_all).to(device)
+    mask_all = seat_mask_tensor(x_all)
+    # 1-D integer rows are winner slots; 2-D float rows are TD targets
+    # (a distribution over slots, ``self_play.td_targets``).
+    soft = y_all.ndim == 2
+    loss_fn = masked_soft_cross_entropy if soft else masked_cross_entropy
+    if reflect:
+        from .encoder import REFLECTION
+        perm = torch.as_tensor(REFLECTION, device=x_all.device)
 
-def train_epoch(model, loader, optimizer, device, epoch):
-    """Run one full pass through the training data."""
-    model.train()
-
-    total_loss   = 0.0
-    total_v_loss = 0.0
-    total_p_loss = 0.0
-    total_samples = 0
-    correct_policy = 0
-
-    start = time.time()
-
-    for batch_idx, (features, masks, value_targets, policy_targets) in enumerate(loader):
-        features       = features.to(device)
-        masks          = masks.to(device)
-        value_targets  = value_targets.to(device)
-        policy_targets = policy_targets.to(device)
-
-        # Forward pass
-        optimizer.zero_grad()
-        value_pred, policy_logits = model(features, masks)
-
-        # Loss
-        loss, v_loss, p_loss = combined_loss(
-            value_pred, value_targets,
-            policy_logits, policy_targets
-        )
-
-        # Backward pass
+    net.train()
+    losses = []
+    n = len(x_all)
+    for _ in range(steps):
+        idx = torch.from_numpy(
+            np.array([rng.randrange(n) for _ in range(min(batch_size, n))])
+        ).to(device)
+        opt.zero_grad()
+        xb = x_all[idx]
+        if reflect:
+            xb, _ = reflect_half(xb, rng, perm)
+        loss = loss_fn(net(xb), y_all[idx], mask_all[idx])
         loss.backward()
-
-        # Gradient clipping — prevents exploding gradients
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-        optimizer.step()
-
-        # Metrics
-        batch_size = features.shape[0]
-        total_loss   += loss.item()   * batch_size
-        total_v_loss += v_loss.item() * batch_size
-        total_p_loss += p_loss.item() * batch_size
-        total_samples += batch_size
-
-        # Policy accuracy — did we predict the chosen action?
-        masked_logits = policy_logits.masked_fill(~masks, -1e9)
-        predicted = masked_logits.argmax(dim=1)
-        correct_policy += (predicted == policy_targets).sum().item()
-
-        # Progress update every 100 batches
-        if (batch_idx + 1) % 100 == 0:
-            elapsed = time.time() - start
-            samples_per_sec = total_samples / elapsed
-            avg_loss = total_loss / total_samples
-
-            print(
-                f"\r  Epoch {epoch} | "
-                f"Batch {batch_idx+1}/{len(loader)} | "
-                f"Loss: {avg_loss:.4f} | "
-                f"Speed: {samples_per_sec:,.0f} samples/s",
-                end="", flush=True
-            )
-
-    print()  # newline after progress
-
-    n = total_samples
-    return {
-        'loss':          total_loss   / n,
-        'value_loss':    total_v_loss / n,
-        'policy_loss':   total_p_loss / n,
-        'policy_acc':    correct_policy / n,
-    }
+        opt.step()
+        losses.append(loss.item())
+    net.eval()
+    return float(np.mean(losses))
 
 
-def evaluate(model, loader, device):
-    """Evaluate model on validation set."""
-    model.eval()
+def arena_search_for(search):
+    """The search the per-iteration matches use for a self-play ``search``.
 
-    total_loss   = 0.0
-    total_v_loss = 0.0
-    total_p_loss = 0.0
-    total_samples = 0
-    correct_policy = 0
-    total_mae = 0.0
-
-    with torch.no_grad():
-        for features, masks, value_targets, policy_targets in loader:
-            features       = features.to(device)
-            masks          = masks.to(device)
-            value_targets  = value_targets.to(device)
-            policy_targets = policy_targets.to(device)
-
-            value_pred, policy_logits = model(features, masks)
-
-            loss, v_loss, p_loss = combined_loss(
-                value_pred, value_targets,
-                policy_logits, policy_targets
-            )
-
-            batch_size = features.shape[0]
-            total_loss   += loss.item()   * batch_size
-            total_v_loss += v_loss.item() * batch_size
-            total_p_loss += p_loss.item() * batch_size
-            total_samples += batch_size
-
-            masked_logits = policy_logits.masked_fill(~masks, -1e9)
-            predicted = masked_logits.argmax(dim=1)
-            correct_policy += (predicted == policy_targets).sum().item()
-
-            # Value MAE — mean absolute error in win probability
-            total_mae += (value_pred - value_targets).abs().sum().item()
-
-    n = total_samples
-    return {
-        'loss':          total_loss   / n,
-        'value_loss':    total_v_loss / n,
-        'policy_loss':   total_p_loss / n,
-        'policy_acc':    correct_policy / n,
-        'value_mae': total_mae / max(n, 1),
-    }
-
-
-# ---- CHECKPOINT ----
-
-def save_checkpoint(model, optimizer, epoch, metrics, path):
-    """Save model checkpoint with pure Python types for compatibility."""
-
-    def to_python(obj):
-        """Recursively convert numpy types to plain Python."""
-        if isinstance(obj, dict):
-            return {k: to_python(v) for k, v in obj.items()}
-        elif isinstance(obj, (list, tuple)):
-            return type(obj)(to_python(v) for v in obj)
-        elif hasattr(obj, 'item'):
-            # numpy scalar → Python scalar
-            return obj.item()
-        else:
-            return obj
-
-    torch.save({
-        'epoch':       int(epoch),
-        'model_state': model.state_dict(),
-        'optim_state': optimizer.state_dict(),
-        'metrics':     to_python(metrics),
-    }, path)
-    print(f"  Saved checkpoint: {path}")
-
-
-def load_checkpoint(model, optimizer, path, device):
-    """Load model checkpoint."""
-    checkpoint = torch.load(path, map_location=device, weights_only=False)
-    model.load_state_dict(checkpoint['model_state'])
-    optimizer.load_state_dict(checkpoint['optim_state'])
-    epoch = checkpoint['epoch']
-    metrics = checkpoint['metrics']
-    print(f"  Loaded checkpoint from epoch {epoch}: {path}")
-    return epoch, metrics
-
-
-# ---- MAIN TRAINING FUNCTION ----
-
-def train(
-    data_paths,
-    output_dir='models/cantstop',
-    epochs=20,
-    batch_size=512,
-    lr=1e-3,
-    val_fraction=0.1,
-    max_records=None,
-    resume=None,
-    device=None,
-):
+    With no lookahead, exact_root changes only the RECORDED value, never a
+    move, so the matches drop it: same games at a fifth of the cost. With
+    lookahead it DOES change moves -- refined leaves are chosen by reach
+    from the solve's root, before vs after the roll -- so it stays (review
+    finding 2: the arena was measuring a different search).
     """
-    Main training function.
+    from dataclasses import replace
+    if search.lookahead_k == 0:
+        return replace(search, exact_root=False)
+    return search
 
-    Parameters:
-        data_paths:    list of .jsonl file paths
-        output_dir:    where to save checkpoints and final model
-        epochs:        number of training epochs
-        batch_size:    samples per gradient update
-        lr:            learning rate
-        val_fraction:  fraction of data held out for validation
-        max_records:   cap on training records (None = all)
-        resume:        path to checkpoint to resume from
-        device:        'cuda', 'cpu', or None (auto-detect)
+
+def parse_lr_schedule(items):
+    """``["1:1e-3", "60:3e-4", "150:1e-4"]`` -> {1: 1e-3, 60: 3e-4, ...}:
+    from iteration 60 on the rate is 3e-4, and so on."""
+    out = {}
+    for item in items or ():
+        it, _, value = item.partition(":")
+        if not value:
+            raise ValueError(f"lr schedule entries are ITER:LR, got {item!r}")
+        out[int(it)] = float(value)
+    return out
+
+
+def lr_at(iteration, base_lr, schedule):
+    """The rate in force at ``iteration``: the latest schedule entry at or
+    before it, else ``base_lr``."""
+    starts = [k for k in (schedule or {}) if k <= iteration]
+    return schedule[max(starts)] if starts else base_lr
+
+
+def steps_for_passes(buffer_rows, passes, replay_window, batch_size):
+    """Optimizer steps this iteration so that every position is sampled
+    ``passes`` times on average over its whole life in the buffer.
+
+    Each iteration draws ``passes / replay_window`` of the current buffer, so
+    a row that lives the full window collects exactly ``passes`` -- whether
+    it arrived in a thin early buffer or a full one. (A per-new-row rule,
+    ``passes * new_rows``, instead hammers the first iterations' rows: they
+    are resampled every iteration while the buffer is small, ~5 * H(30) = 20
+    passes for iteration 1's rows at a 30-iteration window.) The cost is
+    light training early, until the window fills.
     """
-    if device is None:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    os.makedirs(output_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    print(f"\n{'='*55}")
-    print(f"  Can't Stop Neural Network Training")
-    print(f"{'='*55}")
-    print(f"  Device:      {device}")
-    if device == 'cuda':
-        print(f"  GPU:         {torch.cuda.get_device_name(0)}")
-    print(f"  Epochs:      {epochs}")
-    print(f"  Batch size:  {batch_size}")
-    print(f"  LR:          {lr}")
-    print(f"  Output:      {output_dir}")
-    print(f"{'='*55}\n")
-
-    # ---- LOAD DATA ----
-    dataset = CantStopDataset(data_paths, max_records=max_records)
-
-    # Train/validation split
-    val_size   = int(len(dataset) * val_fraction)
-    train_size = len(dataset) - val_size
-    train_set, val_set = torch.utils.data.random_split(dataset, [train_size, val_size])
-
-    num_dl_workers = 4 if device == 'cuda' else 0
-    train_loader = DataLoader(
-        train_set,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_dl_workers,
-        persistent_workers=(num_dl_workers > 0),
-        prefetch_factor=(2 if num_dl_workers > 0 else None),
-        pin_memory=(device == 'cuda'),
-    )
-    val_loader = DataLoader(
-        val_set,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_dl_workers,
-        persistent_workers=(num_dl_workers > 0),
-        prefetch_factor=(2 if num_dl_workers > 0 else None),
-        pin_memory=(device == 'cuda'),
-    )
-
-    print(f"  Training samples:   {train_size:,}")
-    print(f"  Validation samples: {val_size:,}\n")
-
-    # ---- MODEL ----
-    model = CantStopNet().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, patience=3, factor=0.5, verbose=True
-    )
-
-    start_epoch = 1
-    best_val_loss = float('inf')
-    history = []
-
-    # Resume from checkpoint if provided
-    if resume:
-        start_epoch, _ = load_checkpoint(model, optimizer, resume, device)
-        start_epoch += 1
-
-    # ---- TRAINING LOOP ----
-    for epoch in range(start_epoch, epochs + 1):
-        epoch_start = time.time()
-
-        print(f"\nEpoch {epoch}/{epochs}")
-        print("-" * 45)
-
-        # Train
-        train_metrics = train_epoch(model, train_loader, optimizer, device, epoch)
-
-        # Validate
-        val_metrics = evaluate(model, val_loader, device)
-
-        # Learning rate schedule
-        scheduler.step(val_metrics['loss'])
-
-        epoch_time = time.time() - epoch_start
-
-        # Print metrics
-        print(f"  Train loss:    {train_metrics['loss']:.4f}"
-              f"  (value: {train_metrics['value_loss']:.4f}"
-              f"  policy: {train_metrics['policy_loss']:.4f})")
-        print(f"  Val loss:      {val_metrics['loss']:.4f}"
-              f"  (value: {val_metrics['value_loss']:.4f}"
-              f"  policy: {val_metrics['policy_loss']:.4f})")
-        print(f"  Policy acc:    train={train_metrics['policy_acc']:.3f}"
-              f"  val={val_metrics['policy_acc']:.3f}")
-        print(f"  Value MAE:     {val_metrics['value_mae']:.4f}")
-        print(f"  Time:          {epoch_time:.1f}s")
-
-        # Save history
-        history.append({
-            'epoch': epoch,
-            'train': train_metrics,
-            'val':   val_metrics,
-            'time':  epoch_time,
-        })
-
-        # Save checkpoint every epoch
-        ckpt_path = os.path.join(output_dir, f'checkpoint_epoch_{epoch:03d}.pt')
-        save_checkpoint(model, optimizer, epoch,
-                       {'train': train_metrics, 'val': val_metrics},
-                       ckpt_path)
-
-        # Save best model
-        if val_metrics['loss'] < best_val_loss:
-            best_val_loss = val_metrics['loss']
-            best_path = os.path.join(output_dir, 'best_model.pt')
-            save_checkpoint(model, optimizer, epoch,
-                           {'train': train_metrics, 'val': val_metrics},
-                           best_path)
-            print(f"  ★ New best model! Val loss: {best_val_loss:.4f}")
-
-    # ---- SAVE FINAL MODEL ----
-    final_path = os.path.join(output_dir, f'final_model_{timestamp}.pt')
-    save_checkpoint(model, optimizer, epochs,
-                   history[-1], final_path)
-
-    print(f"\n{'='*55}")
-    print(f"  Training complete!")
-    print(f"  Best val loss: {best_val_loss:.4f}")
-    print(f"  Best model:    {os.path.join(output_dir, 'best_model.pt')}")
-    print(f"{'='*55}\n")
-
-    return model, history
+    samples = passes * buffer_rows / replay_window
+    return max(1, math.ceil(samples / batch_size))
 
 
-# ---- ENTRY POINT ----
+def run(out_dir, iterations, games, rule_sets=(MVP_RULES,), hidden=(256, 256),
+        lr=1e-3, batch_size=256, steps=None, passes=5.0, replay_window=30,
+        buffer_rows=None, arena_games=60, seed=0, device=None,
+        init_checkpoint=None, backend="auto", threads=0, in_flight=None,
+        td_lambda=0.7, search=PLAIN, arena_search=None, lr_schedule=None,
+        conservative=0.0, aggressive=0.0, persona_bias=0.03,
+        reflect_augment=False):
+    """``search`` is how self-play searches (``self_play.Search``);
+    ``arena_search`` how both sides of the per-iteration matches search
+    (default: the same)."""
+    if arena_search is None:
+        arena_search = arena_search_for(search)
+    """``steps=None`` derives each iteration's steps from ``passes`` and
+    ``replay_window`` (``steps_for_passes``); an integer fixes them, as
+    the pre-window loop did."""
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    log_path = out / "run.jsonl"
+    from .experiment import identity, write_json
+    write_json(out / "run_meta.json", identity(
+        nets={"init": init_checkpoint} if init_checkpoint else None,
+        rule_sets=[str(r) for r in rule_sets], iterations=iterations,
+        games=games, hidden=hidden, lr=lr, lr_schedule=lr_schedule,
+        batch_size=batch_size, steps=steps, passes=passes,
+        replay_window=replay_window, buffer_rows=buffer_rows,
+        td_lambda=td_lambda, search=search, conservative=conservative,
+        aggressive=aggressive, persona_bias=persona_bias,
+        reflect_augment=reflect_augment, seed=seed,
+        note="weights-only warm start: optimizer, replay and RNG restart"
+             if init_checkpoint else "fresh"))
+
+    device = torch.device(device or ("cuda" if torch.cuda.is_available()
+                                     else "cpu"))
+    torch.manual_seed(seed)
+    rng = random.Random(seed)
+    torch_rng = random.Random(seed + 1)
+
+    net = (load_net(init_checkpoint, device=str(device)) if init_checkpoint
+           else CantStopNet(hidden=hidden))
+    net.to(device)
+    save_net(net, out / "iter_0000.pt")
+
+    # The random init is a fixed reference point for the whole run: if the
+    # trained net cannot beat where it started, nothing else in the log
+    # matters.
+    baseline_net = CantStopNet(**net.config())
+    baseline_net.load_state_dict(net.state_dict())
+    baseline = NetEvaluator(baseline_net, device=str(device))
+
+    opt = torch.optim.Adam(net.parameters(), lr=lr)
+    buffer = ReplayBuffer(max_rows=buffer_rows,
+                          window_iterations=replay_window)
+
+    for it in range(1, iterations + 1):
+        it_lr = lr_at(it, lr, lr_schedule)
+        for group in opt.param_groups:
+            group["lr"] = it_lr
+        started = time.time()
+        evaluate = NetEvaluator(net, device=str(device))
+        results = generate(rule_sets, games, evaluate, rng, backend=backend,
+                           threads=threads, in_flight=in_flight,
+                           search=search, conservative=conservative,
+                           aggressive=aggressive, persona_bias=persona_bias)
+        gen_seconds = time.time() - started
+
+        # Targets are fixed when rows enter the buffer, from the net that
+        # played the game -- as TD-Gammon's were, and as 7WD's search targets.
+        x, y = stack_training(results, td_lambda)
+        buffer.add(x, y)
+        it_steps = (steps if steps is not None else
+                    steps_for_passes(len(buffer), passes, replay_window,
+                                     batch_size))
+        loss = train_steps(net, buffer, opt, it_steps, batch_size, device,
+                           torch_rng, reflect=reflect_augment)
+        samples = it_steps * min(batch_size, len(buffer))
+
+        record = {
+            "iteration": it,
+            "loss": loss,
+            "buffer_rows": len(buffer),
+            # 7WD's training-schedule columns: the realised window and how
+            # hard this iteration leaned on the data it has.
+            "window_iterations": buffer.iterations,
+            "td_lambda": td_lambda,
+            "lr": it_lr,
+            "reflect_augment": reflect_augment,
+            "personas": {"conservative": conservative,
+                         "aggressive": aggressive, "bias": persona_bias},
+            "search": vars(search) if hasattr(search, "__dict__") else
+            {f: getattr(search, f) for f in search.__dataclass_fields__},
+            "new_rows": len(x),
+            "train_steps": it_steps,
+            "samples": samples,
+            "samples_per_new_position": round(samples / len(x), 3),
+            "buffer_passes": round(samples / len(buffer), 4),
+            "gen_seconds": round(gen_seconds, 1),
+            "seconds_per_game": round(gen_seconds / max(1, len(results)), 2),
+            **summarize(results),
+        }
+        record["seat_wins"] = {str(k): v for k, v in
+                               record["seat_wins"].items()}
+        save_net(net, out / f"iter_{it:04d}.pt")
+
+        if arena_games:
+            current = NetEvaluator(net, device=str(device))
+            record["vs_random_init"] = compare(
+                rule_sets[0], current, baseline, arena_games, rng,
+                backend=backend, threads=threads, in_flight=in_flight,
+                search=arena_search)
+            record["vs_heuristic"] = compare(
+                rule_sets[0], current, ProgressHeuristic(), arena_games, rng,
+                backend=backend, threads=threads, in_flight=in_flight,
+                search=arena_search)
+
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, default=str) + "\n")
+        print(json.dumps(record, default=str), flush=True)
+
+    return net
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--out", default="runs/cantstop-mvp")
+    p.add_argument("--iterations", type=int, default=10)
+    p.add_argument("--games", type=int, default=20,
+                   help="games per rule set per iteration")
+    p.add_argument("--all-rulesets", action="store_true",
+                   help="train on all 10 rule sets instead of the MVP one")
+    p.add_argument("--hidden", type=int, nargs="+", default=[256, 256])
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--lr-schedule", nargs="+", default=None,
+                   metavar="ITER:LR",
+                   help="step schedule by iteration, e.g. 1:1e-3 60:3e-4 "
+                        "150:1e-4 250:5e-5 (overrides --lr from the first "
+                        "entry on)")
+    p.add_argument("--conservative", type=float, default=0.0,
+                   help="fraction of self-play games with one conservative "
+                        "seat (stops even when rolling on is worth up to "
+                        "--persona-bias more)")
+    p.add_argument("--aggressive", type=float, default=0.0,
+                   help="fraction of self-play games with one aggressive seat")
+    p.add_argument("--persona-bias", type=float, default=0.03,
+                   help="the personas' stop bias, in win probability")
+    p.add_argument("--reflect-augment", action="store_true",
+                   help="mirror half of every training minibatch (columns "
+                        "c <-> 14-c, an exact symmetry of the game)")
+    p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--steps", type=int, default=None,
+                   help="fixed optimizer steps per iteration; overrides "
+                        "--passes")
+    p.add_argument("--passes", type=float, default=5.0,
+                   help="average times each position is sampled over its "
+                        "life in the buffer; sets steps per iteration")
+    p.add_argument("--td-lambda", type=float, default=0.7,
+                   help="value-target lambda-return: 1 = game outcome only "
+                        "(the pre-TD labels), 0 = one-step TD against the "
+                        "next turn's solver value")
+    p.add_argument("--td-target", choices=("sampled", "exact"),
+                   default="sampled",
+                   help="turn value for the TD target: after the opening "
+                        "roll that happened (sampled) or averaged over every "
+                        "opening roll (exact; solves before the roll)")
+    p.add_argument("--lookahead-k", type=int, default=0,
+                   help="selective 2-turn lookahead in self-play and arena: "
+                        "leaves refined per turn (0 = off)")
+    p.add_argument("--no-lookahead-offset", action="store_true",
+                   help="do not shift unrefined leaves by the mean "
+                        "refinement")
+    p.add_argument("--replay-window", type=int, default=30,
+                   help="iterations of self-play kept in the buffer")
+    p.add_argument("--buffer-rows", type=int, default=None,
+                   help="optional hard row cap on top of the window")
+    p.add_argument("--arena-games", type=int, default=60,
+                   help="0 to skip the head-to-head checks")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--device", default=None)
+    p.add_argument("--init-checkpoint", default=None)
+    p.add_argument("--backend", choices=("auto", "rust", "python"),
+                   default="auto",
+                   help="rust = the M3 pool (many games at once, batched "
+                        "forwards); auto = rust when the extension is built")
+    p.add_argument("--threads", type=int, default=0,
+                   help="pool worker threads; 0 = one per logical core")
+    p.add_argument("--in-flight", type=int, default=None,
+                   help="games live at once in the pool (default 64; 128 "
+                        "measured slower on an 8 GB laptop GPU)")
+    args = p.parse_args(argv)
+
+    run(out_dir=args.out,
+        iterations=args.iterations,
+        games=args.games,
+        rule_sets=tuple(ALL_RULESETS) if args.all_rulesets else (MVP_RULES,),
+        hidden=tuple(args.hidden),
+        lr=args.lr,
+        lr_schedule=parse_lr_schedule(args.lr_schedule),
+        conservative=args.conservative,
+        aggressive=args.aggressive,
+        persona_bias=args.persona_bias,
+        reflect_augment=args.reflect_augment,
+        batch_size=args.batch_size,
+        steps=args.steps,
+        passes=args.passes,
+        replay_window=args.replay_window,
+        td_lambda=args.td_lambda,
+        search=Search(exact_root=args.td_target == "exact",
+                      lookahead_k=args.lookahead_k,
+                      lookahead_offset=not args.no_lookahead_offset),
+        buffer_rows=args.buffer_rows,
+        arena_games=args.arena_games,
+        seed=args.seed,
+        device=args.device,
+        init_checkpoint=args.init_checkpoint,
+        backend=args.backend,
+        threads=args.threads,
+        in_flight=args.in_flight)
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train Can't Stop neural network")
-    parser.add_argument("--data",    nargs="+", required=True,
-                        help="Path(s) to .jsonl training data files")
-    parser.add_argument("--epochs",  type=int,   default=20)
-    parser.add_argument("--batch",   type=int,   default=512)
-    parser.add_argument("--lr",      type=float, default=1e-3)
-    parser.add_argument("--val",     type=float, default=0.1,
-                        help="Validation fraction (default 0.1)")
-    parser.add_argument("--records", type=int,   default=None,
-                        help="Max records to load (default: all)")
-    parser.add_argument("--output",  type=str,   default="models/cantstop")
-    parser.add_argument("--resume",  type=str,   default=None,
-                        help="Path to checkpoint to resume from")
-    parser.add_argument("--device",  type=str,   default=None,
-                        help="cuda or cpu (default: auto)")
-    args = parser.parse_args()
-
-    train(
-        data_paths=args.data,
-        output_dir=args.output,
-        epochs=args.epochs,
-        batch_size=args.batch,
-        lr=args.lr,
-        val_fraction=args.val,
-        max_records=args.records,
-        resume=args.resume,
-        device=args.device,
-    )
+    main()

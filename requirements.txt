@@ -15,6 +15,7 @@ torchvision
 
 # Actual runtime / build dependencies:
 numpy>=1.24
+scipy>=1.10       # Student-t quantiles for approximate Cant Stop search intervals
 maturin>=1.5        # builds the kingdomino_rust crate (needs Rust >= 1.85)
 
 # Throughput telemetry (7WD Phase 0). Optional: the benchmarks degrade to
