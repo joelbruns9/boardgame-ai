@@ -94,3 +94,33 @@ def test_loop_runs_with_emphasis_and_random_starts_and_resumes(tmp_path):
     assert rows[1]["games"][str(R3)] > rows[0]["games"][str(R3)]
     assert torch.load(tmp_path / "state.pt", weights_only=False)[
         "config"]["random_start_fraction"] == 0.5
+
+
+MIX = dict(variant_weights={rules_key(R3): 2.0}, random_start_fraction=0.5,
+           random_start_turns=4)
+
+
+def test_resume_without_mix_flags_keeps_the_saved_mix(tmp_path):
+    """Review finding: omitted flags used to reset the mix to defaults.
+    Uninterrupted == resumed with the flags omitted."""
+    a, b = tmp_path / "a", tmp_path / "b"
+    phase4.run(a, iterations=2, **MIX, **KW)
+    phase4.run(b, iterations=1, **MIX, **KW)
+    phase4.run(b, iterations=2, resume=True, **KW)
+    sa = torch.load(a / "iter_0002.pt", weights_only=False)["state_dict"]
+    sb = torch.load(b / "iter_0002.pt", weights_only=False)["state_dict"]
+    assert all(torch.equal(sa[k], sb[k]) for k in sa)
+    strip = lambda r: {k: v for k, v in r.items() if not k.endswith("seconds")}
+    la = [strip(json.loads(l)) for l in open(a / "run.jsonl")]
+    lb = [strip(json.loads(l)) for l in open(b / "run.jsonl")]
+    assert la == lb
+
+
+def test_resume_applies_an_explicit_override_only(tmp_path):
+    phase4.run(tmp_path, iterations=1, **MIX, **KW)
+    phase4.run(tmp_path, iterations=2, resume=True, random_start_fraction=0.0,
+               **KW)
+    config = torch.load(tmp_path / "state.pt", weights_only=False)["config"]
+    assert config["random_start_fraction"] == 0.0
+    assert config["random_start_turns"] == 4
+    assert config["variant_weights"] == {str(rules_key(R3)): 2.0}

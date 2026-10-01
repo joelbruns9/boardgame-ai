@@ -107,13 +107,24 @@ def run(out_dir, iterations, rule_sets=ALL_RULESETS, rows_per_variant=4000,
         exact_from=None, conservative=0.0, aggressive=0.0, persona_bias=0.03,
         personas_from=None,
         reflect_augment=False, variant_weights=None,
-        random_start_fraction=0.0, random_start_turns=8,
+        random_start_fraction=None, random_start_turns=None,
         eval_every=5, eval_games=200,
         reference_iter=40, probes_per_variant=50, probe_alert=0.05, seed=0,
         device=None, init_checkpoint=None, threads=0, in_flight=None,
         resume=False):
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    state_path = out / "state.pt"
+    device = torch.device(device or ("cuda" if torch.cuda.is_available()
+                                     else "cpu"))
+    st = (torch.load(state_path, map_location=device, weights_only=False)
+          if resume else None)
+    # The training mix is not FIXED, so a resume may change it -- but only
+    # when asked. None means "not given": a resume keeps the run's saved
+    # mix, a fresh run takes the defaults (equal weights, no random starts).
+    variant_weights, random_start_fraction, random_start_turns = _training_mix(
+        st["config"] if st else None, variant_weights,
+        random_start_fraction, random_start_turns)
     config = {"rule_sets": [str(r) for r in rule_sets],
               "rows_per_variant": rows_per_variant, "hidden": list(hidden),
               "batch_size": batch_size, "passes": passes,
@@ -127,12 +138,8 @@ def run(out_dir, iterations, rule_sets=ALL_RULESETS, rows_per_variant=4000,
                                   in (variant_weights or {}).items()},
               "random_start_fraction": random_start_fraction,
               "random_start_turns": random_start_turns}
-    device = torch.device(device or ("cuda" if torch.cuda.is_available()
-                                     else "cpu"))
-    state_path = out / "state.pt"
 
     if resume:
-        st = torch.load(state_path, map_location=device, weights_only=False)
         for k in FIXED:
             # .get: runs saved before a key existed had its default (None).
             if st["config"].get(k) != config[k]:
@@ -279,6 +286,21 @@ def parse_variants(items):
     return tuple(out)
 
 
+def _training_mix(saved, variant_weights, fraction, turns):
+    """Resolve the not-FIXED mix: explicit values win, then the resumed
+    run's saved values, then the defaults."""
+    import ast
+    saved = saved or {}
+    if variant_weights is None:
+        variant_weights = {ast.literal_eval(k): w for k, w
+                           in saved.get("variant_weights", {}).items()}
+    if fraction is None:
+        fraction = saved.get("random_start_fraction", 0.0)
+    if turns is None:
+        turns = saved.get("random_start_turns", 8)
+    return variant_weights, fraction, turns
+
+
 def parse_weights(items):
     """``["3:4:b=2"]`` -> {(3, 4, True): 2.0}, keyed like the schedule."""
     from .schedule import rules_key
@@ -326,10 +348,12 @@ def main(argv=None):
     p.add_argument("--variant-weights", nargs="+", default=None,
                    metavar="P:C[:b]=W",
                    help="row emphasis per variant, e.g. 3:4:b=2 (default 1)")
-    p.add_argument("--random-start-fraction", type=float, default=0.0,
-                   help="share of games starting from a random-play prefix")
-    p.add_argument("--random-start-turns", type=int, default=8,
-                   help="prefix length: up to this many turns per player")
+    p.add_argument("--random-start-fraction", type=float, default=None,
+                   help="share of games starting from a random-play prefix "
+                        "(default 0; a resume keeps the run's value)")
+    p.add_argument("--random-start-turns", type=int, default=None,
+                   help="prefix length: up to this many turns per player "
+                        "(default 8; a resume keeps the run's value)")
     p.add_argument("--eval-every", type=int, default=5)
     p.add_argument("--eval-games", type=int, default=200,
                    help="per opponent per variant (rounded up to seat cycles)")
@@ -355,7 +379,8 @@ def main(argv=None):
         aggressive=args.aggressive, persona_bias=args.persona_bias,
         personas_from=args.personas_from,
         reflect_augment=args.reflect_augment,
-        variant_weights=parse_weights(args.variant_weights),
+        variant_weights=(None if args.variant_weights is None
+                         else parse_weights(args.variant_weights)),
         random_start_fraction=args.random_start_fraction,
         random_start_turns=args.random_start_turns,
         eval_every=args.eval_every,
