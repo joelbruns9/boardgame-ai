@@ -37,6 +37,7 @@ from games.welcome_to import encoder as enc
 from games.welcome_to import macro_codec as mc
 from games.welcome_to import mcts
 from games.welcome_to import network as nw
+from games.welcome_to import placement_assist
 from games.welcome_to import rust_search
 from games.welcome_to import snapshot
 from games.welcome_to import training
@@ -57,6 +58,7 @@ _POOL_DOMAIN = 0x5332_504F_4F4C_4153  # "S2POOLAS"
 _POLICY_DOMAIN = 0x5332_504F_4C49_4359  # "S2POLICY"
 _FULL_GAME_DOMAIN = 0x5332_4655_4C4C_474D  # "S2FULLGM"
 _FULL_TURN_DOMAIN = 0x5332_4655_4C4C_5452  # "S2FULLTR"
+_ASSIST_DOMAIN = 0x5332_4153_5349_5354  # "S2ASSIST"
 #: SplitMix64's state step, used to walk a portable stream forward in O(1)
 #: when deriving a per-turn or per-seat sub-stream from a game seed.
 _GAMMA = 0x9E37_79B9_7F4A_7C15
@@ -101,6 +103,10 @@ class SelfPlayTrajectory:
     rng: str = "portable"
     #: Set on a near-completion curriculum game; see :mod:`curriculum`.
     restart: Optional[curriculum.Restart] = None
+    #: Set on a scaffold game: the learner's placements were replaced by
+    #: :mod:`placement_assist` through this turn.  Search targets are still the
+    #: search's own visits.
+    assist_through: Optional[int] = None
     version: int = FORMAT_VERSION
     _sample_source: Any = field(default=None, repr=False, compare=False)
 
@@ -120,6 +126,8 @@ class SelfPlayTrajectory:
             raise ValueError("search targets must be unique and decision-ordered")
         if decisions and decisions[-1] >= len(self.actions):
             raise ValueError("search target points beyond the macro trajectory")
+        if self.restart is not None and self.assist_through is not None:
+            raise ValueError("a curriculum game is never placement-assisted")
         if self.restart is not None:
             if self.restart.at >= len(self.actions):
                 raise ValueError("restart point is beyond the macro trajectory")
@@ -155,6 +163,7 @@ class SelfPlayTrajectory:
             "learner": self.learner,
             "rng": self.rng,
             "restart": None if self.restart is None else asdict(self.restart),
+            "assist_through": self.assist_through,
             "version": self.version,
         }
         return json.dumps(raw, separators=(",", ":"))
@@ -184,6 +193,9 @@ class SelfPlayTrajectory:
                 None
                 if raw.get("restart") is None
                 else curriculum.Restart(**{k: int(v) for k, v in raw["restart"].items()})
+            ),
+            assist_through=(
+                None if raw.get("assist_through") is None else int(raw["assist_through"])
             ),
             version=int(raw.get("version", -1)),
         )
@@ -300,6 +312,9 @@ class _LiveGame:
     searches: list[SearchTarget]
     capture: object
     restart: Optional[curriculum.Restart] = None
+    assist_through: Optional[int] = None
+    assisted_decisions: int = 0
+    assisted_changes: int = 0
     learner_decisions: int = 0
     all_full_search: bool = False
     learner_turn: Optional[int] = None
@@ -799,9 +814,10 @@ def validate_resume(
     trajectories: Sequence[SelfPlayTrajectory],
     config: SelfPlayConfig,
     restarts: Mapping[int, tuple[curriculum.Restart, tuple[int, ...]]] = {},
+    assisted: Mapping[int, int] = {},
 ) -> frozenset[int]:
     """Prove persisted games belong to this exact seed/seat-count schedule,
-    and each is the ordinary or curriculum game the restart plan says."""
+    and each is the ordinary, curriculum or assisted game the plans say."""
     planned = dict(
         zip(
             range(config.seed, config.seed + config.games),
@@ -828,6 +844,10 @@ def validate_resume(
         if trajectory.restart != (None if planned_restart is None else planned_restart[0]):
             raise ValueError(
                 f"resume seed {trajectory.seed} disagrees with the restart plan"
+            )
+        if trajectory.assist_through != assisted.get(trajectory.seed):
+            raise ValueError(
+                f"resume seed {trajectory.seed} disagrees with the assist plan"
             )
     return frozenset(seen)
 
@@ -871,6 +891,7 @@ def run_manifest(
     *,
     opponent_pool: Optional[Sequence[Mapping[str, Any]]] = None,
     curriculum_manifest: Optional[Mapping[str, Any]] = None,
+    assist_manifest: Optional[Mapping[str, Any]] = None,
 ) -> dict:
     """Frozen semantic and scheduler identity for safe shard resume."""
     manifest = {
@@ -896,6 +917,8 @@ def run_manifest(
         manifest["opponent_pool"] = [dict(item) for item in opponent_pool]
     if curriculum_manifest is not None:
         manifest["curriculum"] = dict(curriculum_manifest)
+    if assist_manifest is not None:
+        manifest["placement_assist"] = dict(assist_manifest)
     return manifest
 
 
@@ -1057,6 +1080,28 @@ def iter_rust_training_batches(loader) -> Iterator[dict[str, np.ndarray]]:
         yield _rust_batch_arrays(raw)
 
 
+def assisted_games(
+    config: SelfPlayConfig,
+    fraction: float,
+    through: int,
+    exclude: Collection[int] = (),
+) -> dict[int, int]:
+    """``job seed -> assist_through`` for a deterministic ``fraction`` of the
+    run's games, never one in ``exclude`` (the curriculum restarts).  Keyed by
+    the game seed alone, so resume and dispatch order cannot change it."""
+    if not 0.0 <= fraction <= 1.0:
+        raise ValueError("assist fraction must be in [0, 1]")
+    if fraction == 0.0:
+        return {}
+    excluded = frozenset(exclude)
+    return {
+        seed: through
+        for seed in range(config.seed, config.seed + config.games)
+        if seed not in excluded
+        and PortableRng((seed ^ _ASSIST_DOMAIN) & _MASK64).next_float() < fraction
+    }
+
+
 def derive_seat_stream(game_seed: int, seat: int) -> int:
     """The portable policy stream for one frozen seat of one game.
 
@@ -1080,6 +1125,7 @@ def _new_live(
     *,
     all_full_search: bool = False,
     restart: Optional[tuple[curriculum.Restart, tuple[int, ...]]] = None,
+    assist_through: Optional[int] = None,
 ) -> _LiveGame:
     assignment = PortableRng((seed ^ _POOL_DOMAIN) & _MASK64)
     population = list(range(len(opponents)))
@@ -1130,6 +1176,7 @@ def _new_live(
         searches=[],
         capture=wr.RustTrainingCapture(seed),
         restart=None if restart is None else restart[0],
+        assist_through=assist_through,
         all_full_search=all_full_search,
     )
 
@@ -1278,6 +1325,7 @@ def generate(
     cuda_events: bool = False,
     restarts: Mapping[int, tuple[curriculum.Restart, tuple[int, ...]]] = {},
     move_override: Optional[Callable[[object, int], int]] = None,
+    assisted: Mapping[int, int] = {},
 ) -> tuple[list[SelfPlayTrajectory], dict[str, Any]]:
     """Generate a continuously replenished batch of learner-only S2 games.
 
@@ -1298,6 +1346,11 @@ def generate(
     ``override(state, choice)`` before every real move, learner or opponent,
     it returns the macro actually played.  A learner root's visit target is
     still the search's; never pass it when generating training data.
+
+    ``assisted`` maps a job seed to a turn: in that game the learner's
+    placements through that turn are replaced by :mod:`placement_assist`'s
+    choice -- the phased-out hygiene scaffold.  Its visit targets stay the
+    search's; only the played move, and so the outcome, changes.
     """
     if wr is None:
         raise RuntimeError(
@@ -1344,9 +1397,11 @@ def generate(
     unknown = skip_seeds - requested_seeds
     if unknown:
         raise ValueError(f"skip_seeds contains seeds outside this run: {sorted(unknown)[:8]}")
-    stray = set(restarts) - requested_seeds
+    stray = (set(restarts) | set(assisted)) - requested_seeds
     if stray:
-        raise ValueError(f"restarts name seeds outside this run: {sorted(stray)[:8]}")
+        raise ValueError(f"restarts/assists name seeds outside this run: {sorted(stray)[:8]}")
+    if set(restarts) & set(assisted):
+        raise ValueError("a curriculum game is never placement-assisted")
     jobs = [job for job in jobs if job[0] not in skip_seeds]
     if not jobs:
         raise ValueError("no pending S2 games remain after applying skip_seeds")
@@ -1387,11 +1442,14 @@ def generate(
             opponents,
             all_full_search=seed in all_full_seeds,
             restart=restarts.get(seed),
+            assist_through=assisted.get(seed),
         )
         next_job += 1
 
     trajectories: list[SelfPlayTrajectory] = []
     final_states: list[GameState] = []
+    assisted_decisions = 0
+    assisted_changes = 0
     completed = 0
     full_search_games = 0
     full_search_turns = 0
@@ -1473,6 +1531,15 @@ def generate(
                 choice = int(result["choice"])
                 if move_override is not None:
                     choice = int(move_override(game.state, choice))
+                if (
+                    game.assist_through is not None
+                    and game.state.turn <= game.assist_through
+                    and placement_assist.is_write(choice)
+                ):
+                    picked = placement_assist.assist_rust(game.state, choice)
+                    game.assisted_decisions += 1
+                    game.assisted_changes += picked != choice
+                    choice = picked
                 visits = tuple(int(round(value)) for value in result["visits"])
                 if sum(visits) > 0:
                     if any(float(value) != visit for value, visit in zip(result["visits"], visits)):
@@ -1545,6 +1612,7 @@ def generate(
                 opponents=game.opponent_names,
                 prune_roundabout_pass=search_config.prune_roundabout_pass,
                 restart=game.restart,
+                assist_through=game.assist_through,
             )
             captured = game.capture.finish(
                 game.state,
@@ -1558,6 +1626,8 @@ def generate(
                 on_trajectory(trajectory)
             trajectories.append(trajectory)
             final_states.append(final_state)
+            assisted_decisions += game.assisted_decisions
+            assisted_changes += game.assisted_changes
             completed += 1
             full_search_games += int(game.all_full_search)
             full_scheduler.reset(slot)
@@ -1572,6 +1642,7 @@ def generate(
                     opponents,
                     all_full_search=seed in all_full_seeds,
                     restart=restarts.get(seed),
+                    assist_through=assisted.get(seed),
                 )
                 next_job += 1
             else:
@@ -1595,12 +1666,13 @@ def generate(
         seconds,
     )
     # Strength metrics describe ordinary games only: a curriculum game starts
-    # near a completed plan, and mixing it in would move plans_per_seat_game
-    # by the restart fraction rather than by learning.
+    # near a completed plan and an assisted game plays the rule's placements,
+    # and mixing either in would move plans_per_seat_game by a scaffold share
+    # rather than by learning.
     natural = [
         (trajectory, state)
         for trajectory, state in zip(trajectories, final_states)
-        if trajectory.restart is None
+        if trajectory.restart is None and trajectory.assist_through is None
     ]
     metrics["natural_games"] = float(len(natural))
     if natural and len(natural) != len(trajectories):
@@ -1611,6 +1683,19 @@ def generate(
             if name in ordinary:
                 metrics[name] = ordinary[name]
     metrics.update(curriculum.report(trajectories, final_states))
+    helped = [
+        (trajectory, state)
+        for trajectory, state in zip(trajectories, final_states)
+        if trajectory.assist_through is not None
+    ]
+    metrics["assisted_games"] = float(len(helped))
+    if helped:
+        metrics["assisted_learner_plans_per_game"] = sum(
+            sum(1 for slot in state.plan_turns if 0 in slot) for _, state in helped
+        ) / len(helped)
+        metrics["assisted_learner_score"] = sum(t.scores[0] for t, _ in helped) / len(helped)
+        metrics["assisted_decisions"] = float(assisted_decisions)
+        metrics["assisted_changed_fraction"] = assisted_changes / max(assisted_decisions, 1)
     metrics["batch_width_calls"] = {
         str(width_at_call): float(count)
         for width_at_call, count in sorted(batch_widths.items())
@@ -1724,6 +1809,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
         default=",".join(str(d) for d in curriculum.DEFAULT_DISTANCES),
         help="comma-separated rewind distances in turns",
     )
+    parser.add_argument(
+        "--assist-fraction",
+        type=float,
+        default=0.0,
+        help="share of (non-curriculum) games whose learner placements are "
+        "replaced by placement_assist -- the phased-out hygiene scaffold",
+    )
+    parser.add_argument(
+        "--assist-through",
+        type=int,
+        default=16,
+        help="last turn on which an assisted game's learner placements are assisted",
+    )
     parser.add_argument("--opening-temperature-turns", type=int, default=10)
     parser.add_argument("--opening-temperature", type=float, default=1.0)
     parser.add_argument("--late-temperature", type=float, default=0.0)
@@ -1823,9 +1921,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
             f"curriculum: {len(pool)} rewind points, {len(restarts)} of "
             f"{config.games} games restart"
         )
+    assisted = assisted_games(
+        config, args.assist_fraction, args.assist_through, exclude=restarts
+    )
+    assist_manifest = (
+        {
+            "fraction": args.assist_fraction,
+            "through": args.assist_through,
+            "games": len(assisted),
+        }
+        if assisted
+        else None
+    )
+    if assisted:
+        print(f"placement assist: {len(assisted)} of {config.games} games, through turn {args.assist_through}")
     has_existing = bool(trajectory_sources(args.out) or training_shard_paths(args.out))
     existing = read_trajectories(args.out) if has_existing else []
-    completed_seeds = validate_resume(existing, config, restarts)
+    completed_seeds = validate_resume(existing, config, restarts, assisted)
     existing_games = len(existing)
     existing_searched_roots = sum(len(game.searches) for game in existing)
     ensure_run_manifest(
@@ -1837,6 +1949,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
             opponent_paths,
             opponent_pool=opponent_pool_manifest,
             curriculum_manifest=curriculum_manifest,
+            assist_manifest=assist_manifest,
         ),
         has_existing_games=bool(existing_games),
     )
@@ -1864,6 +1977,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
             on_captured=lambda _trajectory, captured: store.add(captured),
             cuda_events=args.cuda_events,
             restarts=restarts,
+            assisted=assisted,
         )
     finally:
         # Also drain the bounded queue and flush a short final shard on clean

@@ -44,8 +44,9 @@ from pathlib import Path
 from typing import Callable, Optional, Sequence
 
 from games.welcome_to import macro_codec as mc
+from games.welcome_to import placement_assist
 from games.welcome_to import plans as pl
-from games.welcome_to import self_play, snapshot, training
+from games.welcome_to import self_play, training
 from games.welcome_to.game import GameState
 
 ARMS: tuple[str, ...] = ("normal", "focal", "all")
@@ -54,56 +55,11 @@ DEFAULT_ASSIST_THROUGH = 16
 MEASURE_TURN = 16
 
 
-def _is_write(macro: int) -> bool:
-    return mc.M_WRITE <= macro < mc.M_REFUSE
-
-
-def hygiene_key(state: GameState, macro: int) -> tuple[int, int]:
-    """(placement capacity, span) the acting seat is left with after ``macro``."""
-    sheet = mc.step_macro(state, macro).sheets[state.actor]
-    return sum(sheet.placement_capacity()), sheet.total_span()
-
-
-def assisted_choice(state: GameState, choice: int) -> int:
-    """The same-slot write that best preserves hygiene; ``choice`` on ties or
-    when ``choice`` is not a write."""
-    if not _is_write(choice):
-        return choice
-    slot = mc.decode_macro_write(choice)[0]
-    candidates = [
-        macro
-        for macro in mc.legal_macros(state)
-        if _is_write(macro) and mc.decode_macro_write(macro)[0] == slot
-    ]
-    keys = {macro: hygiene_key(state, macro) for macro in candidates}
-    best = max(keys.values())
-    if keys[choice] == best:
-        return choice
-    return min(macro for macro, key in keys.items() if key == best)
-
-
-class Assistant:
-    """``move_override`` for :func:`self_play.generate`; counts interventions."""
-
-    def __init__(self, seats: Optional[frozenset[int]], through: int) -> None:
-        self.seats = seats  # None = every seat
-        self.through = through
-        self.decisions = 0
-        self.changed = 0
-
-    def __call__(self, rust_state, choice: int) -> int:
-        actor = int(rust_state.actor)
-        if (
-            rust_state.turn > self.through
-            or (self.seats is not None and actor not in self.seats)
-            or not _is_write(choice)
-        ):
-            return choice
-        state = snapshot.from_snapshot(rust_state.snapshot())
-        picked = assisted_choice(state, choice)
-        self.decisions += 1
-        self.changed += picked != choice
-        return picked
+# The rule lives in placement_assist, shared with S2 generation.
+_is_write = placement_assist.is_write
+hygiene_key = placement_assist.hygiene_key
+assisted_choice = placement_assist.assisted_choice
+Assistant = placement_assist.Assistant
 
 
 def game_metrics(trajectory: self_play.SelfPlayTrajectory) -> dict[str, float]:

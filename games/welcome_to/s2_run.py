@@ -61,6 +61,8 @@ _GENERATION_FIELDS = (
     "plan_ending_fraction",
     "curriculum_games",
     "curriculum_source_plan_rate",
+    "assisted_games",
+    "assisted_learner_plans_per_game",
     "learner_score",
     "learner_margin_vs_best",
     "roundabouts_per_seat_game",
@@ -107,6 +109,26 @@ def _curriculum_args(run: Path, iteration: int, args: argparse.Namespace) -> lis
     return [
         "--restart-sources", str(source),
         "--restart-fraction", str(args.restart_fraction),
+    ]
+
+
+def assist_fraction(iteration: int, args: argparse.Namespace) -> float:
+    """The placement-assist share for ``iteration``: ``--assist-fraction`` at
+    iteration 1, falling linearly to zero at ``--assist-end-iteration`` and
+    staying there, so the run's last iterations judge play without it."""
+    end = args.assist_end_iteration
+    if args.assist_fraction <= 0.0 or iteration >= end:
+        return 0.0
+    return args.assist_fraction * (end - iteration) / (end - 1)
+
+
+def _assist_args(iteration: int, args: argparse.Namespace) -> list[str]:
+    fraction = assist_fraction(iteration, args)
+    if fraction <= 0.0:
+        return []
+    return [
+        "--assist-fraction", f"{fraction:.6f}",
+        "--assist-through", str(args.assist_through),
     ]
 
 
@@ -160,6 +182,7 @@ def run_iteration(run: Path, iteration: int, args: argparse.Namespace) -> dict[s
             "--seed", str(seed),
             "--out", str(directory / "trajectories.jsonl"),
             *_curriculum_args(run, iteration, args),
+            *_assist_args(iteration, args),
         ])
         if code != 0:
             raise RuntimeError(f"generation for iteration {iteration} exited {code}")
@@ -257,6 +280,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
         help="share of games restarted near a learner plan completion from the "
         "previous iteration (0 disables the curriculum)",
     )
+    parser.add_argument(
+        "--assist-fraction",
+        type=float,
+        default=0.5,
+        help="share of iteration-1 games whose learner placements are assisted "
+        "(placement_assist); decays linearly to 0 at --assist-end-iteration",
+    )
+    parser.add_argument("--assist-end-iteration", type=int, default=6)
+    parser.add_argument("--assist-through", type=int, default=16)
     parser.add_argument("--inflight", type=int, default=256)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--seed", type=int, default=60_000)
@@ -264,6 +296,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
 
     if args.gate_every <= 0:
         parser.error("--gate-every must be positive")
+    if args.assist_end_iteration < 2:
+        parser.error("--assist-end-iteration must be at least 2")
     run = Path(args.run_dir)
     run.mkdir(parents=True, exist_ok=True)
     (run / "driver.json").write_text(
