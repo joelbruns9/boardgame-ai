@@ -59,6 +59,8 @@ from games.welcome_to import s2_promotion, s2_train, self_play
 _GENERATION_FIELDS = (
     "plans_per_seat_game",
     "plan_ending_fraction",
+    "curriculum_games",
+    "curriculum_source_plan_rate",
     "learner_score",
     "learner_margin_vs_best",
     "roundabouts_per_seat_game",
@@ -93,6 +95,19 @@ def _gate_complete(record: Path) -> bool:
     if not record.is_file():
         return False
     return json.loads(record.read_text(encoding="utf-8")).get("status") != "installing"
+
+
+def _curriculum_args(run: Path, iteration: int, args: argparse.Namespace) -> list[str]:
+    """Restart ``--restart-fraction`` of the games near a plan the learner
+    finished in the previous iteration (curriculum.py).  Iteration 1 has no
+    source and plays ordinary games."""
+    source = _iteration_dir(run, iteration - 1) / "trajectories.jsonl"
+    if args.restart_fraction <= 0.0 or iteration <= 1:
+        return []
+    return [
+        "--restart-sources", str(source),
+        "--restart-fraction", str(args.restart_fraction),
+    ]
 
 
 def initialise(run: Path, seed: int) -> Path:
@@ -144,6 +159,7 @@ def run_iteration(run: Path, iteration: int, args: argparse.Namespace) -> dict[s
             "--scheduler-workers", str(args.workers),
             "--seed", str(seed),
             "--out", str(directory / "trajectories.jsonl"),
+            *_curriculum_args(run, iteration, args),
         ])
         if code != 0:
             raise RuntimeError(f"generation for iteration {iteration} exited {code}")
@@ -233,6 +249,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
         type=int,
         default=5,
         help="gate the latest candidate every N iterations, and on the last",
+    )
+    parser.add_argument(
+        "--restart-fraction",
+        type=float,
+        default=0.2,
+        help="share of games restarted near a learner plan completion from the "
+        "previous iteration (0 disables the curriculum)",
     )
     parser.add_argument("--inflight", type=int, default=256)
     parser.add_argument("--workers", type=int, default=8)

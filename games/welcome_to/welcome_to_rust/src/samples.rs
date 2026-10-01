@@ -168,6 +168,11 @@ fn record_plan_deaths(game: &Game, ended: i32, deaths: &mut [[Option<i32>; 3]]) 
     }
 }
 
+/// A curriculum game's departure from its source: `(source_seed, at,
+/// reshuffle_seed)` -- build from `source_seed`, and redeterminize with
+/// `reshuffle_seed` before applying `actions[at]` (`curriculum.Restart`).
+pub type RestartPoint = (u64, usize, u64);
+
 /// Replay `actions` from `seed` and record, per seat, the turn of every forced
 /// refusal (`M_DIRECT_REFUSE`) and the turn each plan died. The terminal state
 /// keeps only the permit count. The replay must reproduce `terminal` exactly,
@@ -176,13 +181,20 @@ fn replay_history(
     seed: u64,
     terminal: &Game,
     actions: &[usize],
+    restart: Option<RestartPoint>,
 ) -> Result<ReplayHistory, EngineError> {
-    let mut game = Game::new(seed, terminal.config)?;
+    let engine_seed = restart.map_or(seed, |(source, _, _)| source);
+    let mut game = Game::new(engine_seed, terminal.config)?;
     let players = terminal.config.players;
     let mut forced_refusals = vec![Vec::new(); players];
     let mut plan_deaths = vec![[None; 3]; players];
     let mut turn = game.turn;
-    for &action in actions {
+    for (decision, &action) in actions.iter().enumerate() {
+        if let Some((_, at, reshuffle)) = restart {
+            if decision == at {
+                game = game.redeterminize(&mut Rng::new(reshuffle));
+            }
+        }
         if game.turn != turn {
             record_plan_deaths(&game, turn, &mut plan_deaths);
             turn = game.turn;
@@ -483,11 +495,13 @@ impl RustTrainingCapture {
         Ok(())
     }
 
+    #[pyo3(signature = (state, trajectory_json, actions, restart=None))]
     fn finish(
         &mut self,
         state: &RustGameState,
         trajectory_json: String,
         actions: Vec<usize>,
+        restart: Option<RestartPoint>,
     ) -> PyResult<RustTrainingGame> {
         if self.finished {
             return Err(PyRuntimeError::new_err(
@@ -497,7 +511,11 @@ impl RustTrainingCapture {
         if trajectory_json.is_empty() {
             return Err(PyValueError::new_err("trajectory JSON cannot be empty"));
         }
-        let history = replay_history(self.seed, &state.inner, &actions).map_err(to_py)?;
+        if restart.is_some_and(|(_, at, _)| at == 0 || at >= actions.len()) {
+            return Err(PyValueError::new_err("restart point is outside the macro list"));
+        }
+        let history =
+            replay_history(self.seed, &state.inner, &actions, restart).map_err(to_py)?;
         let terminal = outcomes(&state.inner, &history).map_err(to_py)?;
         let roots = std::mem::take(&mut self.roots);
         let samples = roots

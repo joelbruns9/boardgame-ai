@@ -31,6 +31,7 @@ from typing import Any, Callable, Collection, Iterator, Mapping, Optional, Seque
 import numpy as np
 import torch
 
+from games.welcome_to import curriculum
 from games.welcome_to import datagen
 from games.welcome_to import encoder as enc
 from games.welcome_to import macro_codec as mc
@@ -47,7 +48,8 @@ try:
 except ImportError:  # pragma: no cover - source checkouts need no Rust toolchain
     wr = None
 
-FORMAT_VERSION = 1
+#: 2: optional curriculum ``restart`` (2026-09-30).  Version 1 is refused.
+FORMAT_VERSION = 2
 LEARNER_SEAT = 0
 SEAT_MIX: tuple[tuple[int, float], ...] = ((2, 0.60), (3, 0.30), (4, 0.10))
 _JOB_ORDER_DOMAIN = 0x5332_4A4F_424F_5244  # "S2JOBORD"
@@ -97,6 +99,8 @@ class SelfPlayTrajectory:
     advanced: bool = True
     learner: int = LEARNER_SEAT
     rng: str = "portable"
+    #: Set on a near-completion curriculum game; see :mod:`curriculum`.
+    restart: Optional[curriculum.Restart] = None
     version: int = FORMAT_VERSION
     _sample_source: Any = field(default=None, repr=False, compare=False)
 
@@ -116,6 +120,23 @@ class SelfPlayTrajectory:
             raise ValueError("search targets must be unique and decision-ordered")
         if decisions and decisions[-1] >= len(self.actions):
             raise ValueError("search target points beyond the macro trajectory")
+        if self.restart is not None:
+            if self.restart.at >= len(self.actions):
+                raise ValueError("restart point is beyond the macro trajectory")
+            if decisions and decisions[0] < self.restart.at:
+                raise ValueError("a curriculum game has a search target in its prefix")
+
+    @property
+    def engine_seed(self) -> int:
+        """The seed the engine is built from: the source game's, for a restart."""
+        return self.seed if self.restart is None else self.restart.source_seed
+
+    @property
+    def rust_restart(self) -> Optional[tuple[int, int, int]]:
+        """``(source_seed, at, reshuffle_seed)`` for the Rust capture's replay."""
+        if self.restart is None:
+            return None
+        return (self.restart.source_seed, self.restart.at, self.restart.reshuffle_seed)
 
     @property
     def config(self) -> GameConfig:
@@ -133,6 +154,7 @@ class SelfPlayTrajectory:
             "advanced": self.advanced,
             "learner": self.learner,
             "rng": self.rng,
+            "restart": None if self.restart is None else asdict(self.restart),
             "version": self.version,
         }
         return json.dumps(raw, separators=(",", ":"))
@@ -158,6 +180,11 @@ class SelfPlayTrajectory:
             advanced=bool(raw.get("advanced", True)),
             learner=int(raw.get("learner", LEARNER_SEAT)),
             rng=str(raw.get("rng", "portable")),
+            restart=(
+                None
+                if raw.get("restart") is None
+                else curriculum.Restart(**{k: int(v) for k, v in raw["restart"].items()})
+            ),
             version=int(raw.get("version", -1)),
         )
 
@@ -272,6 +299,7 @@ class _LiveGame:
     actions: list[int]
     searches: list[SearchTarget]
     capture: object
+    restart: Optional[curriculum.Restart] = None
     learner_decisions: int = 0
     all_full_search: bool = False
     learner_turn: Optional[int] = None
@@ -361,14 +389,19 @@ def replay(trajectory: SelfPlayTrajectory) -> Iterator[datagen.Sample]:
         yield from trajectory._sample_source.samples()
         return
     state = GameState.new(
-        seed=trajectory.seed,
+        seed=trajectory.engine_seed,
         config=trajectory.config,
         rng_kind=trajectory.rng,
     )
     targets = {target.decision: target for target in trajectory.searches}
     visits = []
     log = training.ReplayLog(state)
+    restart_at = None if trajectory.restart is None else trajectory.restart.at
     for decision, action in enumerate(trajectory.actions):
+        if decision == restart_at:
+            # Bit-identical to the Rust generator's redeterminize(seed): the
+            # rust_equiv gate checks exactly this pairing.
+            state = state.redeterminize(PortableRng(trajectory.restart.reshuffle_seed))
         target = targets.get(decision)
         if target is not None:
             if state.actor != trajectory.learner:
@@ -763,9 +796,12 @@ class TrajectoryShardWriter:
 
 
 def validate_resume(
-    trajectories: Sequence[SelfPlayTrajectory], config: SelfPlayConfig
+    trajectories: Sequence[SelfPlayTrajectory],
+    config: SelfPlayConfig,
+    restarts: Mapping[int, tuple[curriculum.Restart, tuple[int, ...]]] = {},
 ) -> frozenset[int]:
-    """Prove persisted games belong to this exact seed/seat-count schedule."""
+    """Prove persisted games belong to this exact seed/seat-count schedule,
+    and each is the ordinary or curriculum game the restart plan says."""
     planned = dict(
         zip(
             range(config.seed, config.seed + config.games),
@@ -787,6 +823,11 @@ def validate_resume(
             raise ValueError(
                 f"resume seed {trajectory.seed} has {trajectory.players} players, "
                 f"expected {expected_players}"
+            )
+        planned_restart = restarts.get(trajectory.seed)
+        if trajectory.restart != (None if planned_restart is None else planned_restart[0]):
+            raise ValueError(
+                f"resume seed {trajectory.seed} disagrees with the restart plan"
             )
     return frozenset(seen)
 
@@ -829,6 +870,7 @@ def run_manifest(
     opponent_checkpoints: Sequence[str | Path],
     *,
     opponent_pool: Optional[Sequence[Mapping[str, Any]]] = None,
+    curriculum_manifest: Optional[Mapping[str, Any]] = None,
 ) -> dict:
     """Frozen semantic and scheduler identity for safe shard resume."""
     manifest = {
@@ -852,6 +894,8 @@ def run_manifest(
     }
     if opponent_pool is not None:
         manifest["opponent_pool"] = [dict(item) for item in opponent_pool]
+    if curriculum_manifest is not None:
+        manifest["curriculum"] = dict(curriculum_manifest)
     return manifest
 
 
@@ -1035,6 +1079,7 @@ def _new_live(
     opponents: Sequence[Opponent],
     *,
     all_full_search: bool = False,
+    restart: Optional[tuple[curriculum.Restart, tuple[int, ...]]] = None,
 ) -> _LiveGame:
     assignment = PortableRng((seed ^ _POOL_DOMAIN) & _MASK64)
     population = list(range(len(opponents)))
@@ -1055,25 +1100,58 @@ def _new_live(
         # says the whole divergence problem lives. Same repair as
         # ``portable_rng.derive_search_seed``: one draw of the stream itself.
         rngs.append(PortableRng(derive_seat_stream(seed, seat)))
+    state = wr.RustGameState(
+        seed if restart is None else restart[0].source_seed,
+        players=players,
+        advanced=True,
+        expert=False,
+        solo_rules=False,
+    )
+    actions: list[int] = []
+    if restart is not None:
+        point, prefix = restart
+        if len(prefix) != point.at:
+            raise ValueError("restart prefix length disagrees with its restart point")
+        for action in prefix:
+            state.apply_macro(action)
+        if state.actor != LEARNER_SEAT or state.is_terminal:
+            raise ValueError(f"restart for seed {seed} does not land on a learner turn")
+        state, _ = state.redeterminize(point.reshuffle_seed)
+        actions = list(prefix)
     return _LiveGame(
         slot=slot,
         seed=seed,
         players=players,
-        state=wr.RustGameState(
-            seed,
-            players=players,
-            advanced=True,
-            expert=False,
-            solo_rules=False,
-        ),
+        state=state,
         opponent_indices=tuple(indices),
         opponent_names=tuple(names),
         policy_rngs=tuple(rngs),
-        actions=[],
+        actions=actions,
         searches=[],
         capture=wr.RustTrainingCapture(seed),
+        restart=None if restart is None else restart[0],
         all_full_search=all_full_search,
     )
+
+
+#: :func:`_summary` fields that measure play rather than throughput; reported
+#: over ordinary games only when curriculum games are mixed in.
+_STRENGTH_METRICS: tuple[str, ...] = (
+    "mean_decisions_per_game",
+    "learner_score",
+    "learner_margin_vs_best",
+    "permits_per_seat_game",
+    "plans_per_seat_game",
+    "plan_ending_fraction",
+    "roundabouts_per_seat_game",
+    "bis_writes_per_seat_game",
+    "estates_size_7plus_per_seat_game",
+    "temps_per_seat_game",
+    "mean_sheet_divergence",
+    "identical_games",
+    "mean_first_divergence_turn",
+    "mean_score_spread",
+)
 
 
 def _summary(
@@ -1198,6 +1276,7 @@ def generate(
     on_captured: Optional[Callable[[SelfPlayTrajectory, object], None]] = None,
     search_policy_net: Optional[nw.WelcomeToNet] = None,
     cuda_events: bool = False,
+    restarts: Mapping[int, tuple[curriculum.Restart, tuple[int, ...]]] = {},
 ) -> tuple[list[SelfPlayTrajectory], dict[str, Any]]:
     """Generate a continuously replenished batch of learner-only S2 games.
 
@@ -1208,6 +1287,11 @@ def generate(
     ``search_policy_net`` is a gate-only seam: when supplied, simulated-opponent
     POLICY requests use that frozen model while learner LEAF requests continue
     to use ``learner``. Actual opponent moves still use ``opponents``.
+
+    ``restarts`` maps a job seed to a curriculum restart and its prefix
+    (:func:`curriculum.plan_restarts`); that job starts mid-game.  Strength
+    metrics are reported over ordinary games only, so they stay comparable
+    across iterations; the curriculum games get their own ``curriculum_*``.
     """
     if wr is None:
         raise RuntimeError(
@@ -1254,6 +1338,9 @@ def generate(
     unknown = skip_seeds - requested_seeds
     if unknown:
         raise ValueError(f"skip_seeds contains seeds outside this run: {sorted(unknown)[:8]}")
+    stray = set(restarts) - requested_seeds
+    if stray:
+        raise ValueError(f"restarts name seeds outside this run: {sorted(stray)[:8]}")
     jobs = [job for job in jobs if job[0] not in skip_seeds]
     if not jobs:
         raise ValueError("no pending S2 games remain after applying skip_seeds")
@@ -1293,6 +1380,7 @@ def generate(
             players,
             opponents,
             all_full_search=seed in all_full_seeds,
+            restart=restarts.get(seed),
         )
         next_job += 1
 
@@ -1446,9 +1534,13 @@ def generate(
                 scores=tuple(final_state.scores()),
                 opponents=game.opponent_names,
                 prune_roundabout_pass=search_config.prune_roundabout_pass,
+                restart=game.restart,
             )
             captured = game.capture.finish(
-                game.state, trajectory.to_json(), list(game.actions)
+                game.state,
+                trajectory.to_json(),
+                list(game.actions),
+                trajectory.rust_restart,
             )
             if on_captured is not None:
                 on_captured(trajectory, captured)
@@ -1469,6 +1561,7 @@ def generate(
                     players,
                     opponents,
                     all_full_search=seed in all_full_seeds,
+                    restart=restarts.get(seed),
                 )
                 next_job += 1
             else:
@@ -1491,6 +1584,23 @@ def generate(
         config.max_batch,
         seconds,
     )
+    # Strength metrics describe ordinary games only: a curriculum game starts
+    # near a completed plan, and mixing it in would move plans_per_seat_game
+    # by the restart fraction rather than by learning.
+    natural = [
+        (trajectory, state)
+        for trajectory, state in zip(trajectories, final_states)
+        if trajectory.restart is None
+    ]
+    metrics["natural_games"] = float(len(natural))
+    if natural and len(natural) != len(trajectories):
+        ordinary = _summary(
+            [t for t, _ in natural], [s for _, s in natural], 0, 0, {}, config.max_batch, seconds
+        )
+        for name in _STRENGTH_METRICS:
+            if name in ordinary:
+                metrics[name] = ordinary[name]
+    metrics.update(curriculum.report(trajectories, final_states))
     metrics["batch_width_calls"] = {
         str(width_at_call): float(count)
         for width_at_call, count in sorted(batch_widths.items())
@@ -1586,6 +1696,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
         help="exact quota of games whose learner turns all use full search",
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--restart-sources",
+        action="append",
+        default=[],
+        help="trajectory prefix whose learner plan completions seed curriculum "
+        "restarts; repeatable (curriculum.py)",
+    )
+    parser.add_argument(
+        "--restart-fraction",
+        type=float,
+        default=0.0,
+        help="share of games that restart near a learner plan completion",
+    )
+    parser.add_argument(
+        "--restart-distances",
+        default=",".join(str(d) for d in curriculum.DEFAULT_DISTANCES),
+        help="comma-separated rewind distances in turns",
+    )
     parser.add_argument("--opening-temperature-turns", type=int, default=10)
     parser.add_argument("--opening-temperature", type=float, default=1.0)
     parser.add_argument("--late-temperature", type=float, default=0.0)
@@ -1660,9 +1788,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
             )
             for path in opponent_paths
         ]
+    restarts: dict = {}
+    curriculum_manifest = None
+    if args.restart_fraction > 0.0 and args.restart_sources:
+        distances = tuple(int(item) for item in args.restart_distances.split(",") if item)
+        pool = []
+        for source in args.restart_sources:
+            pool.extend(curriculum.candidates(read_trajectories(source), distances))
+        restarts = curriculum.plan_restarts(
+            list(zip(range(config.seed, config.seed + config.games), seat_counts(config.games))),
+            pool,
+            fraction=args.restart_fraction,
+            seed=config.seed,
+        )
+        curriculum_manifest = {
+            "fraction": args.restart_fraction,
+            "distances": list(distances),
+            "sources": [str(Path(source).resolve()) for source in args.restart_sources],
+            "candidates": len(pool),
+            "restarts": len(restarts),
+            "plan_sha256": curriculum.plan_digest(restarts),
+        }
+        print(
+            f"curriculum: {len(pool)} rewind points, {len(restarts)} of "
+            f"{config.games} games restart"
+        )
     has_existing = bool(trajectory_sources(args.out) or training_shard_paths(args.out))
     existing = read_trajectories(args.out) if has_existing else []
-    completed_seeds = validate_resume(existing, config)
+    completed_seeds = validate_resume(existing, config, restarts)
     existing_games = len(existing)
     existing_searched_roots = sum(len(game.searches) for game in existing)
     ensure_run_manifest(
@@ -1673,6 +1826,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
             args.checkpoint,
             opponent_paths,
             opponent_pool=opponent_pool_manifest,
+            curriculum_manifest=curriculum_manifest,
         ),
         has_existing_games=bool(existing_games),
     )
@@ -1699,6 +1853,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
             skip_seeds=completed_seeds,
             on_captured=lambda _trajectory, captured: store.add(captured),
             cuda_events=args.cuda_events,
+            restarts=restarts,
         )
     finally:
         # Also drain the bounded queue and flush a short final shard on clean
