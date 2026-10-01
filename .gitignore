@@ -75,3 +75,6 @@ tmp/
 
 # Model checkpoints staged into an extension folder for local testing.
 extension_*/*.pt
+
+# Per-worker pytest logs from parallel test runs
+.pytest_run_logs/
