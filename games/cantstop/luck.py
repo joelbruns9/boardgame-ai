@@ -98,6 +98,7 @@ class Game:
     captures: list
     names: dict = field(default_factory=dict)
     skipped: int = 0
+    source: str = "captures"    # or "packets": replayed from BGA's own stream
 
 
 def is_stale(prev, cap):
@@ -156,6 +157,7 @@ class Step:
     then: str | None = None     # 'roll' | 'stop' | None (not observed)
     candidates: list | None = None  # moves it could have been, before a bust
     p_range: tuple | None = None    # bust odds over those moves (set by the ledger)
+    bust_dice: tuple | None = None  # the busting roll, when the log saw it
 
 
 @dataclass
@@ -165,6 +167,25 @@ class Turn:
     steps: list
     link: str                   # 'first' | 'adjacent' | 'gap' (to the previous turn)
     end: str = ""               # 'stop' | 'bust' | 'win' | 'gap' | 'log_end'
+
+
+def read_turns(path, game):
+    """The game's turns: replayed from BGA's packet stream when the log holds
+    all of it (every roll, move and stop observed), else reconstructed from
+    the board captures with the inference above."""
+    from .bga_packets import PacketMismatch, packet_events, replay, starts_at_game_start
+    rows = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+    events = packet_events(rows)
+    if starts_at_game_start(events):
+        try:
+            turns, _ = replay(events, game.captures[0].state.rules, game.player_ids)
+        except PacketMismatch as exc:
+            game.source = f"captures (packets did not replay: {exc})"
+        else:
+            game.source, game.opponents_logged = "packets", True
+            return turns
+    return reconstruct(game)
 
 
 def turn_start(state):
@@ -338,7 +359,7 @@ def build_ledger(game, turns, evaluate, solver_cls=None):
             if step.dice is None:
                 post = solver.bust_value
                 add("luck", post - pre, turn.seat, busted=True, **roll,
-                    p_bust_range=step.p_range)
+                    p_bust_range=step.p_range, bust_dice=step.bust_dice)
                 cursor = post
                 continue
             post = np.asarray(solver.value(at(board, K, Phase.AWAIT_MOVE, step.dice)))
@@ -417,7 +438,8 @@ def report(ledgers):
     lines = []
     lines.append("Per game, viewer's seat (win-probability points; luck own/others, "
                  "decisions own/others, residual, gap):")
-    lines.append(f"{'table':>10} {'p':>2} {'opp':>3} {'start':>6} {'result':>6} "
+    lines.append("(log: pkt = replayed from BGA's packets; yes/no = board captures with/without opponents)")
+    lines.append(f"{'table':>10} {'p':>2} {'log':>3} {'start':>6} {'result':>6} "
                  f"{'luck':>13} {'decisions':>13} {'resid':>6} {'gap':>6}  "
                  f"busts (expected, z)")
     rows = []
@@ -427,7 +449,7 @@ def report(ledgers):
         rows.append((L, s))
         result = "?" if L.outcome is None else ("WIN" if L.outcome[g.viewer_seat] > .5 else "loss")
         lines.append(
-            f"{g.table_id:>10} {len(g.player_ids):>2} {'yes' if g.opponents_logged else 'no':>3} "
+            f"{g.table_id:>10} {len(g.player_ids):>2} {'pkt' if g.source == 'packets' else 'yes' if g.opponents_logged else 'no':>3} "
             f"{100 * s['start']:6.1f} {result:>6} "
             f"{pct(s['luck_own']):>6}/{pct(s['luck_others']):>6} "
             f"{pct(s['decision_own']):>6}/{pct(s['decision_others']):>6} "
@@ -492,7 +514,9 @@ def main(argv=None):
     ledgers = []
     for path in sorted(args.log_dir.glob("table_*.jsonl")):
         game = load_game(path, args.viewer)
-        turns = reconstruct(game)
+        turns = read_turns(path, game)
+        if game.source.startswith("captures ("):
+            print(f"{game.table_id}: {game.source}")
         ledgers.append(build_ledger(game, turns, evaluate))
     print(report(ledgers))
     if args.json:
