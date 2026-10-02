@@ -15,7 +15,7 @@ function createCantStopTiming(w, limit = 3000) {
   const now = () => (w.performance?.now ? w.performance.now() : Date.now());
   const t0 = now(), wall = Date.now();
   let notifHooked = false, stateHooked = false, observer = null;
-  const restore = [];
+  const restore = [], stateListeners = new Set();
   function record(kind, detail) {
     events.push({t: Math.round((now() - t0) * 10) / 10, kind, ...detail});
     if (events.length > limit) events.splice(0, events.length - limit);
@@ -47,7 +47,10 @@ function createCantStopTiming(w, limit = 3000) {
       const original = ui.onEnteringState;
       ui.onEnteringState = function (stateName) {
         try { record("state", {name: String(stateName), active: String(ui.gamedatas?.gamestate?.active_player || "")}); } catch {}
-        return original.apply(this, arguments);
+        const result = original.apply(this, arguments);
+        // Listeners run after BGA's own handler, so its DOM work is done.
+        for (const fn of stateListeners) { try { fn(String(stateName)); } catch {} }
+        return result;
       };
       restore.push(() => { ui.onEnteringState = original; });
       stateHooked = true;
@@ -65,14 +68,17 @@ function createCantStopTiming(w, limit = 3000) {
           if (tokens || dice) record("board", {tokens, dice});
         } catch {}
       });
+      // Not "style": BGA restyles markers every frame for a cosmetic
+      // animation (measured 2026-10-01), which drowned real board changes.
       observer.observe(w.document.body, {subtree: true, childList: true, attributes: true,
-        attributeFilter: ["class", "data-column", "data-height", "style"]});
+        attributeFilter: ["class", "data-column", "data-height"]});
       restore.push(() => observer.disconnect());
     }
     return notifHooked && stateHooked;
   }
   return {
     install, record,
+    onState(fn) { stateListeners.add(fn); return () => stateListeners.delete(fn); },
     dump: () => ({wall_start: wall, hooks: {notif: notifHooked, state: stateHooked, board: !!observer},
                   events: events.slice()}),
     dispose() { while (restore.length) { try { restore.pop()(); } catch {} } observer = null; },

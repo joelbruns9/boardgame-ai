@@ -126,6 +126,17 @@ The panel's Refresh button retries without reloading BGA. Export capture now
 includes the last 30 request errors (endpoint, status, attempt, time, message).
 Run node extension_cantstop/test_requests.cjs for recovery checks.
 
+Board reads are event-driven: when BGA enters a decision state
+(gameui.onEnteringState, hooked by the timing probe), the bridge reads the
+board at once and every 16 ms after, and sends it as soon as two reads in a
+row match and show that state -- typically one frame after the state change.
+Measured on a live game (2026-10-01): BGA applies every marker move before it
+enters the next decision state, and the board then stays put. The 100 ms
+polling with its 200 ms / 1.2 s settle waits remains as the fallback (for
+example if the hook is unavailable or a capture never settles within 12
+reads). Background tabs are throttled by the browser, which delays both paths.
+Regression: node extension_cantstop/test_event_capture.cjs.
+
 Export capture also includes `page_timing` from the timing probe
 (timing_probe.js): when BGA enters each state, when board markers or dice
 change, and when the bridge first saw and finally read each board. It records

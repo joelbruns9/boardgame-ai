@@ -28,36 +28,79 @@
     return validated.runners.has(runnerKey(state));
   }
   const turnIdentity = createCantStopTurnTracker(Date.now() + "-" + Math.random().toString(36).slice(2));
+  const testUser = () => new URL(location.href).searchParams.has("testuser");
+  function read() {
+    const gd = window.gameui?.gamedatas;
+    const turn = turnIdentity({
+      table_id: new URL(location.href).searchParams.get("table") || String(gd?.table_id || "unknown"),
+      active_player: String(gd?.gamestate?.active_player || ""),
+      phase: String(gd?.gamestate?.name || "")
+    });
+    const state = captureCantStop(window, true);
+    if (state) state.turn_id = turn;
+    return {state, signature: state ? JSON.stringify(state) : null};
+  }
+  // ``trigger`` "event": the board was read twice, one frame apart, after BGA
+  // entered the decision state, and matched -- send now. Otherwise (polling)
+  // wait for a still board: 200 ms if the solve predicted it, else 1.2 s.
+  function consider({state, signature}, trigger = null) {
+    if (signature !== pending) {
+      timing.record("sig", {phase: state?.phase || null, active: state?.active_player || null});
+      pending = signature; since = Date.now(); sent = null;
+      post("idle", null); // invalidate old advice immediately, before settling
+    }
+    const fast = !!signature && fastPosition(state);
+    const ready = trigger === "event" || Date.now()-since >= (fast ? 200 : 1200);
+    if (signature && signature !== sent && ready) {
+      sent = signature;
+      timing.record("sent", {phase: state.phase, active: state.active_player, fast,
+        trigger: trigger || "poll", waited: Date.now() - since});
+      post("position", {state, signature});
+    }
+  }
   function tick() {
     try {
-      if (new URL(location.href).searchParams.has("testuser")) return;
+      if (testUser()) return;
       try { timing.install(); } catch {}
-      const gd = window.gameui?.gamedatas;
-      const turn = turnIdentity({
-        table_id: new URL(location.href).searchParams.get("table") || String(gd?.table_id || "unknown"),
-        active_player: String(gd?.gamestate?.active_player || ""),
-        phase: String(gd?.gamestate?.name || "")
-      });
-      const state = captureCantStop(window, true);
-      if (state) state.turn_id = turn;
-      const signature = state ? JSON.stringify(state) : null;
-      if (signature !== pending) {
-        timing.record("sig", {phase: state?.phase || null, active: state?.active_player || null});
-        pending = signature; since = Date.now(); sent = null;
-        post("idle", null); // invalidate old advice immediately, before settling
-      }
-      const fast = !!signature && fastPosition(state);
-      if (signature && signature !== sent && Date.now()-since >= (fast ? 200 : 1200)) {
-        sent = signature;
-        timing.record("sent", {phase: state.phase, active: state.active_player, fast,
-          waited: Date.now() - since});
-        post("position", {state, signature});
-      }
+      consider(read());
     } catch (e) {
       pending = sent = null;
       post("capture_error", {message: String(e.message || e)});
     }
   }
+  // Event path (measured 2026-10-01: BGA applies every marker move before it
+  // enters the next decision state, and the board then stays put). Read at
+  // entry and every frame after; send once two reads in a row match and
+  // show the state just entered. A newer state entry cancels an older run;
+  // polling above stays as the fallback if this ever gives up.
+  const FRAME_MS = 16, MAX_READS = 12;
+  let eventRun = 0;
+  function onDecisionState(name) {
+    if (testUser()) return;
+    const run = ++eventRun, entered = Date.now();
+    let previous = null, reads = 0;
+    const step = () => {
+      if (run !== eventRun) return;
+      try {
+        const current = read();
+        reads++;
+        const matches = current.state?.phase === name;
+        if (matches && previous !== null && current.signature === previous) {
+          consider(current, "event");
+          timing.record("event_read", {name, reads, ms: Date.now() - entered});
+          return;
+        }
+        if (current.state) consider(current);
+        previous = matches ? current.signature : null;
+        if (reads < MAX_READS) setTimeout(step, FRAME_MS);
+        else timing.record("event_giveup", {name, reads});
+      } catch {} // polling reports capture errors
+    };
+    setTimeout(step, 0);
+  }
+  const stopListening = timing.onState?.(name => {
+    if (name === "diceChoice" || name === "continueChoice") onDecisionState(name);
+  });
   function onMessage(e) {
     // Firefox extension-originated postMessage can have source=null.
     // Still require this document's origin and the narrow recapture message.
@@ -89,6 +132,8 @@
   const interval = setInterval(tick, 100);
   window.__cantstopBridge = {dispose() {
     clearInterval(interval);
+    eventRun++;
+    try { stopListening?.(); } catch {}
     window.removeEventListener("message", onMessage);
   }};
   tick();

@@ -48,6 +48,7 @@ def analyse(events):
         last_move = moves[-1] if moves else None
         rows.append({
             "phase": e.get("phase"), "fast": bool(e.get("fast")),
+            "trigger": e.get("trigger", "poll"),
             "waited": e.get("waited"),
             "read_after_state_ms": e["t"] - entered,
             "still_before_read_ms": None if last_move is None else e["t"] - last_move,
@@ -59,12 +60,13 @@ def analyse(events):
 
 def summarise(rows):
     out = {"reads": len(rows), "groups": {}, "state_entry_rule": {}}
-    for key in sorted({(r["phase"], r["fast"]) for r in rows}):
-        g = [r for r in rows if (r["phase"], r["fast"]) == key]
+    for key in sorted({(r["phase"], r["fast"], r["trigger"]) for r in rows}):
+        g = [r for r in rows if (r["phase"], r["fast"], r["trigger"]) == key]
         def stats(field):
             xs = [r[field] for r in g if r[field] is not None]
             return {"median": median(xs) if xs else None, "p95": _pct(xs, .95), "n": len(xs)}
-        out["groups"][f"{key[0]} {'fast' if key[1] else 'slow'}"] = {
+        label = "event" if key[2] == "event" else ("fast" if key[1] else "slow")
+        out["groups"][f"{key[0]} {label}"] = {
             "reads": len(g),
             "read_after_state_ms": stats("read_after_state_ms"),
             "still_before_read_ms": stats("still_before_read_ms"),
