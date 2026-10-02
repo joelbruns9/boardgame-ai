@@ -64,9 +64,33 @@ def test_outcomes_are_complete_and_reproducible(setup):
         assert np.all(np.abs(root.blend) <= 1.0)
         assert len(root.afterstates) == n
     again = [sp.Root(**{**r.__dict__, "scores": None, "ranks": None, "seat_ranks": None, "blend": None, "afterstates": []}) for r in roots]
-    sp.rollout_roots(again, packed, cfg, futures=3, seed=9)
+    sp.rollout_roots(again, packed, cfg, futures=3, seed=9, chunk_roots=1)
     for first, second in zip(roots, again):
         np.testing.assert_array_equal(first.scores, second.scores)
+
+
+def test_saved_chunks_resume_identically_and_refuse_other_roots(setup, tmp_path):
+    _net, cfg, packed, _games, roots = setup
+    blank = lambda: [sp.Root(**{**r.__dict__, "scores": None, "ranks": None, "seat_ranks": None, "blend": None, "afterstates": []}) for r in roots]
+    first = blank()
+    sp.rollout_roots(first, packed, cfg, futures=3, seed=9, chunk_roots=2, checkpoint_dir=tmp_path)
+    assert len(list(tmp_path.glob("chunk_*.pt"))) == (len(roots) + 1) // 2
+    resumed = blank()
+    calls = []
+    original = sp._rollout_chunk
+    sp._rollout_chunk = lambda *a, **k: calls.append(1)
+    try:
+        sp.rollout_roots(resumed, packed, cfg, futures=3, seed=9, chunk_roots=2, checkpoint_dir=tmp_path)
+    finally:
+        sp._rollout_chunk = original
+    assert not calls, "a saved chunk was rolled out again"
+    for a, b in zip(first, resumed):
+        np.testing.assert_array_equal(a.scores, b.scores)
+        np.testing.assert_array_equal(a.blend, b.blend)
+    other = blank()
+    other[0].candidates = list(reversed(other[0].candidates))
+    with pytest.raises(ValueError, match="different roots"):
+        sp.rollout_roots(other, packed, cfg, futures=3, seed=9, chunk_roots=2, checkpoint_dir=tmp_path)
 
 
 def test_candidates_in_one_future_share_the_reshuffled_deck(setup):
@@ -84,7 +108,9 @@ def test_candidates_in_one_future_share_the_reshuffled_deck(setup):
 
 def test_decision_metrics_on_synthetic_truth():
     truth = np.array([[0.1] * 4 + [0.1] * 4, [0.5] * 4 + [0.5] * 4, [0.3] * 4 + [0.3] * 4])
-    root = {"blend": truth}
+    scores = np.zeros((3, 8, 2), dtype=np.float32)
+    scores[:, :, 0] = np.array([10.0, 30.0, 20.0])[:, None]
+    root = {"blend": truth, "scores": scores}
     perfect = sp.score_decisions([np.array([0.0, 2.0, 1.0])], [root], fit=4)
     assert perfect["regret"]["n"] == 1
     worst = sp.score_decisions([np.array([2.0, 0.0, 1.0])], [root], fit=4)
@@ -93,3 +119,6 @@ def test_decision_metrics_on_synthetic_truth():
     assert best["regret"]["mean"] == 0.0
     assert best["pair_sign_accuracy"]["mean"] == 1.0
     assert best["regret_played"]["mean"] == pytest.approx(0.4)
+    assert best["score_regret"]["mean"] == 0.0
+    assert best["score_regret_played"]["mean"] == pytest.approx(20.0)
+    assert best["regret_fit_oracle"]["mean"] == 0.0

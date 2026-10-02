@@ -198,14 +198,61 @@ def _finish_all(states: list, players: list[int], packed, chunk: int = 4096) -> 
         live = still
 
 
+_OUTCOME_FIELDS = ("scores", "ranks", "seat_ranks", "blend", "afterstates")
+
+
+def _root_key(root: Root) -> tuple:
+    return (root.game_seed, root.turn, tuple(root.candidates))
+
+
 def rollout_roots(
-    roots: list[Root], packed, cfg: mcts.SearchConfig, futures: int, seed: int
+    roots: list[Root],
+    packed,
+    cfg: mcts.SearchConfig,
+    futures: int,
+    seed: int,
+    chunk_roots: int = 50,
+    checkpoint_dir: Optional[Path] = None,
 ) -> None:
-    """Fill each root's outcome arrays: candidates x futures, paired draws."""
+    """Fill each root's outcome arrays: candidates x futures, paired draws.
+
+    Works through ``chunk_roots`` roots at a time so live game states stay
+    bounded; seeds are keyed by the root's index, so chunking cannot change
+    any outcome. With ``checkpoint_dir`` each finished chunk is saved and a
+    rerun loads it instead of replaying it -- after checking the chunk holds
+    exactly these roots.
+    """
+    for start in range(0, len(roots), chunk_roots):
+        ids = range(start, min(start + chunk_roots, len(roots)))
+        path = None if checkpoint_dir is None else checkpoint_dir / f"chunk_{start:06d}.pt"
+        if path is not None and path.exists():
+            saved = torch.load(path, weights_only=False)
+            if saved["keys"] != [_root_key(roots[i]) for i in ids] or saved["futures"] != futures:
+                raise ValueError(f"{path} was written for different roots; use a new --out")
+            for i, outcome in zip(ids, saved["outcomes"]):
+                for name in _OUTCOME_FIELDS:
+                    setattr(roots[i], name, outcome[name])
+            continue
+        _rollout_chunk(roots, ids, packed, cfg, futures, seed)
+        if path is not None:
+            temporary = path.with_suffix(".tmp")
+            torch.save(
+                {
+                    "keys": [_root_key(roots[i]) for i in ids],
+                    "futures": futures,
+                    "outcomes": [{name: getattr(roots[i], name) for name in _OUTCOME_FIELDS} for i in ids],
+                },
+                temporary,
+            )
+            temporary.replace(path)
+
+
+def _rollout_chunk(roots, ids, packed, cfg, futures, seed) -> None:
     import welcome_to_rust as wr
 
     states, players, index = [], [], []
-    for r_id, root in enumerate(roots):
+    for r_id in ids:
+        root = roots[r_id]
         base = wr.RustGameState.from_snapshot(root.snapshot)
         root.afterstates = [_encode(base.step_macro(c)) for c in root.candidates]
         for f in range(futures):
@@ -215,7 +262,8 @@ def rollout_roots(
                 players.append(root.players)
                 index.append((r_id, c_id, f))
     _finish_all(states, players, packed)
-    for root in roots:
+    for r_id in ids:
+        root = roots[r_id]
         n = len(root.candidates)
         root.scores = np.zeros((n, futures, root.players), dtype=np.float32)
         root.ranks = np.zeros((n, futures, training.MAX_RANKS), dtype=np.float32)
@@ -232,35 +280,80 @@ def rollout_roots(
 
 
 def collect(args) -> None:
+    """Resumable: games are appended to ``games.jsonl`` as they finish and
+    rollouts are saved per chunk under ``chunks/``. Rerunning the same command
+    skips both; a rerun with different settings is refused."""
     from games.welcome_to import s2_promotion, s2_train
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    settings = {
+        "checkpoint": str(Path(args.checkpoint).resolve()),
+        "games": args.games,
+        "simulations": args.simulations,
+        "candidates": args.candidates,
+        "fit_futures": args.fit_futures,
+        "eval_futures": args.eval_futures,
+        "seed": args.seed,
+    }
+    manifest = out / "collect_manifest.json"
+    if manifest.exists():
+        if json.loads(manifest.read_text(encoding="utf-8")) != settings:
+            raise ValueError(f"{out} was collected with different settings; use a new --out")
+    else:
+        manifest.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+
     net, _ = s2_train.load_training_checkpoint(args.checkpoint, args.device)
     net.eval()
     cfg = s2_promotion.gate_search_config(args.simulations)
+
+    games_path = out / "games.jsonl"
+    games: list[self_play.SelfPlayTrajectory] = []
+    if games_path.exists():
+        for line in games_path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                games.append(self_play.SelfPlayTrajectory.from_json(line))
     started = time.perf_counter()
-    games, _ = self_play.generate(
-        net,
-        config=self_play.SelfPlayConfig(
-            games=args.games,
-            inflight=min(256, args.games),
-            max_batch=min(256, args.games),
-            seed=args.seed,
-        ),
-        search_config=self_play.default_search_config(args.simulations),
-        device=args.device,
-    )
+    if len(games) < args.games:
+        with games_path.open("a", encoding="utf-8") as handle:
+
+            def keep(trajectory):
+                handle.write(trajectory.to_json() + "\n")
+                handle.flush()
+
+            new, _ = self_play.generate(
+                net,
+                config=self_play.SelfPlayConfig(
+                    games=args.games,
+                    inflight=min(256, args.games),
+                    max_batch=min(256, args.games),
+                    seed=args.seed,
+                ),
+                search_config=self_play.default_search_config(args.simulations),
+                device=args.device,
+                skip_seeds={game.seed for game in games},
+                on_trajectory=keep,
+            )
+        games.extend(new)
     generation = time.perf_counter() - started
+    games.sort(key=lambda game: game.seed)   # root selection must not depend on finish order
+    print(f"{len(games)} games", flush=True)
+
     packed = rust_search.PackedNetEvaluator(net, torch.device(args.device), cfg)
     roots = select_roots(games, packed, max_candidates=args.candidates, seed=args.seed)
+    print(f"{len(roots)} roots", flush=True)
+    chunks = out / "chunks"
+    chunks.mkdir(exist_ok=True)
     started = time.perf_counter()
-    rollout_roots(roots, packed, cfg, args.fit_futures + args.eval_futures, args.seed)
+    rollout_roots(
+        roots, packed, cfg, args.fit_futures + args.eval_futures, args.seed,
+        chunk_roots=args.chunk_roots, checkpoint_dir=chunks,
+    )
     rollouts = time.perf_counter() - started
     terminals = sum(len(r.candidates) for r in roots) * (args.fit_futures + args.eval_futures)
     torch.save(
         {
-            "checkpoint": str(Path(args.checkpoint).resolve()),
+            "checkpoint": settings["checkpoint"],
             "fit_futures": args.fit_futures,
             "eval_futures": args.eval_futures,
             "simulations": args.simulations,
@@ -274,9 +367,8 @@ def collect(args) -> None:
         "roots": len(roots),
         "candidates_per_root": statistics.fmean(len(r.candidates) for r in roots),
         "terminals": terminals,
-        "generation_seconds": generation,
-        "rollout_seconds": rollouts,
-        "ms_per_terminal": 1000 * rollouts / max(terminals, 1),
+        "generation_seconds_this_process": generation,
+        "rollout_seconds_this_process": rollouts,
     }
     (out / "collect.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
     print(json.dumps(info, indent=2))
@@ -309,9 +401,13 @@ def _rank_mask(players: Sequence[int], device) -> torch.Tensor:
 
 
 @torch.no_grad()
-def model_values(net, root: dict, cfg, device) -> np.ndarray:
-    """The search's leaf value for each candidate afterstate."""
+def model_values(net, root: dict, cfg, device, choose_by: str = "blend") -> np.ndarray:
+    """The search's leaf value for each candidate afterstate, or (``margin``)
+    the predicted learner score minus the best predicted opponent score."""
     out = net(*_stack(root["afterstates"], device))
+    if choose_by == "margin":
+        scores = out["score"][:, : root["players"]].cpu().numpy()
+        return scores[:, 0] - scores[:, 1:].max(axis=1)
     players = [root["players"]] * len(root["candidates"])
     probs = nw.rank_probabilities(out["rank_logits"], _rank_mask(players, device)).cpu().numpy()
     scores = out["score"].cpu().numpy()
@@ -323,7 +419,8 @@ def model_values(net, root: dict, cfg, device) -> np.ndarray:
 def score_decisions(values_by_root: list[np.ndarray], roots: list[dict], fit: int) -> dict:
     """Decision metrics on eval futures (independent of the fit labels)."""
     regrets, played_regrets, uniform_regrets, signs, spearmans = [], [], [], [], []
-    resolved_signs = []
+    resolved_signs, oracle_regrets = [], []
+    score_regrets, score_played, score_oracle = [], [], []
     for values, root in zip(values_by_root, roots):
         truth = root["blend"][:, fit:]                     # (C, F_eval)
         mean = truth.mean(axis=1)
@@ -331,6 +428,13 @@ def score_decisions(values_by_root: list[np.ndarray], roots: list[dict], fit: in
         regrets.append(best - mean[int(np.argmax(values))])
         played_regrets.append(best - mean[0])
         uniform_regrets.append(best - mean.mean())
+        # The ceiling: choose by the fit futures' own mean (labels, not a model).
+        oracle_regrets.append(best - mean[int(np.argmax(root["blend"][:, :fit].mean(axis=1)))])
+        # The learner's final score: a steadier yardstick than the blend.
+        score = root["scores"][:, fit:, 0].mean(axis=1)
+        score_regrets.append(score.max() - score[int(np.argmax(values))])
+        score_played.append(score.max() - score[0])
+        score_oracle.append(score.max() - score[int(np.argmax(root["scores"][:, :fit, 0].mean(axis=1)))])
         for a, b in itertools.combinations(range(len(values)), 2):
             diff = truth[a] - truth[b]
             empirical = diff.mean()
@@ -354,6 +458,10 @@ def score_decisions(values_by_root: list[np.ndarray], roots: list[dict], fit: in
         "regret": ci(regrets),
         "regret_played": ci(played_regrets),
         "regret_uniform": ci(uniform_regrets),
+        "regret_fit_oracle": ci(oracle_regrets),
+        "score_regret": ci(score_regrets),
+        "score_regret_played": ci(score_played),
+        "score_regret_fit_oracle": ci(score_oracle),
         "pair_sign_accuracy": ci(signs),
         "resolved_pair_sign_accuracy": ci(resolved_signs),
         "spearman_within_root": ci(spearmans),
@@ -374,8 +482,9 @@ def _targets(root: dict, fit: int, shuffle: Optional[random.Random]) -> tuple[np
     return padded, ranks
 
 
-def sibling_loss(net, roots: list[dict], fit: int, pair_weight: float, device, shuffle=None):
-    """Absolute score/rank anchors plus the paired score difference, per root."""
+def sibling_loss(net, roots: list[dict], fit: int, pair_weight: float, device, shuffle=None, rank_weight: float = 1.0):
+    """Absolute score/rank anchors plus the paired score difference, per root.
+    ``rank_weight=0`` trains on scores only (the steadier label)."""
     total = None
     for root in roots:
         out = net(*_stack(root["afterstates"], device))
@@ -386,7 +495,7 @@ def sibling_loss(net, roots: list[dict], fit: int, pair_weight: float, device, s
         ps = out["score"][:, :n_seats]
         mask = _rank_mask([n_seats] * len(ts), device)
         log_p = nw.masked_log_softmax(out["rank_logits"], mask)
-        absolute = ((ps - ts) ** 2).mean() + (-(tr * log_p * mask).sum(-1)).mean()
+        absolute = ((ps - ts) ** 2).mean() + rank_weight * (-(tr * log_p * mask).sum(-1)).mean()
         # every ordered pair once: (s_a - s_b) - (t_a - t_b), all seats
         dp = ps[:, None, :] - ps[None, :, :]
         dt = ts[:, None, :] - ts[None, :, :]
@@ -397,7 +506,7 @@ def sibling_loss(net, roots: list[dict], fit: int, pair_weight: float, device, s
     return total / len(roots)
 
 
-def train_arm(net, data, fit, *, mode, pair_weight, steps, lr, device, replay=None, shuffle_seed=None):
+def train_arm(net, data, fit, *, mode, pair_weight, steps, lr, device, replay=None, shuffle_seed=None, rank_weight=1.0):
     if mode == "readout":
         for name, param in net.named_parameters():
             param.requires_grad = name.startswith(("per_seat_head", "global_head"))
@@ -410,7 +519,7 @@ def train_arm(net, data, fit, *, mode, pair_weight, steps, lr, device, replay=No
     for step in range(steps):
         net.train()
         batch = rng.sample(train, min(32, len(train)))
-        loss = sibling_loss(net, batch, fit, pair_weight, device, shuffle)
+        loss = sibling_loss(net, batch, fit, pair_weight, device, shuffle, rank_weight)
         if replay is not None:
             raw = next(replay)
             replay_loss, _ = nw.losses(net(*[nw.to_tensors(raw, device)[k] for k in ("sheet_planes", "sheet_scalars", "viewer_plane", "global_scalars")]), nw.to_tensors(raw, device))
@@ -422,7 +531,7 @@ def train_arm(net, data, fit, *, mode, pair_weight, steps, lr, device, replay=No
         if (step + 1) % 50 == 0 or step + 1 == steps:
             net.eval()
             with torch.no_grad():
-                val = float(sibling_loss(net, data["val"], fit, pair_weight, device))
+                val = float(sibling_loss(net, data["val"], fit, pair_weight, device, None, rank_weight))
             if val < best[0]:
                 best = (val, {k: v.detach().clone() for k, v in net.state_dict().items()})
     if best[1] is not None:
@@ -445,13 +554,15 @@ def probe(args) -> None:
 
     def evaluate(net, name):
         result = {
-            split: score_decisions([model_values(net, r, cfg, device) for r in data[split]], data[split], fit)
+            split: score_decisions([model_values(net, r, cfg, device, args.choose_by) for r in data[split]], data[split], fit)
             for split in ("train", "test")
         }
         reg = result["test"]["regret"]
         print(
             f"{name:12s} test regret {reg['mean']:.4f} ± {reg['se']:.4f}  "
             f"played {result['test']['regret_played']['mean']:.4f}  uniform {result['test']['regret_uniform']['mean']:.4f}  "
+            f"oracle {result['test']['regret_fit_oracle']['mean']:.4f}  "
+            f"score regret {result['test']['score_regret']['mean']:.2f} (played {result['test']['score_regret_played']['mean']:.2f}, oracle {result['test']['score_regret_fit_oracle']['mean']:.2f})  "
             f"sign acc {result['test']['pair_sign_accuracy']['mean']:.3f}  "
             f"resolved {result['test']['resolved_pair_sign_accuracy']['mean']:.3f} "
             f"(n={result['test']['resolved_pair_sign_accuracy']['n']})  "
@@ -478,21 +589,23 @@ def probe(args) -> None:
         return stream()
 
     results = {"checkpoint": evaluate(fresh(), "checkpoint")}
+    rank_weight = 0.0 if args.score_only else 1.0
     for weight in args.pair_weights:
         results[f"readout_w{weight:g}"] = evaluate(
-            train_arm(fresh(), data, fit, mode="readout", pair_weight=weight, steps=args.steps, lr=args.lr, device=device),
+            train_arm(fresh(), data, fit, mode="readout", pair_weight=weight, steps=args.steps, lr=args.lr, device=device, rank_weight=rank_weight),
             f"readout w{weight:g}",
         )
         results[f"finetune_w{weight:g}"] = evaluate(
-            train_arm(fresh(), data, fit, mode="finetune", pair_weight=weight, steps=args.steps, lr=args.lr / 3, device=device, replay=replay_stream()),
+            train_arm(fresh(), data, fit, mode="finetune", pair_weight=weight, steps=args.steps, lr=args.lr / 3, device=device, replay=replay_stream(), rank_weight=rank_weight),
             f"finetune w{weight:g}",
         )
     weight = max(args.pair_weights)
     results["shuffled"] = evaluate(
-        train_arm(fresh(), data, fit, mode="finetune", pair_weight=weight, steps=args.steps, lr=args.lr / 3, device=device, replay=replay_stream(), shuffle_seed=args.seed),
+        train_arm(fresh(), data, fit, mode="finetune", pair_weight=weight, steps=args.steps, lr=args.lr / 3, device=device, replay=replay_stream(), shuffle_seed=args.seed, rank_weight=rank_weight),
         "shuffled",
     )
-    (out / "probe.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
+    name = f"probe_{args.choose_by}{'_score_only' if args.score_only else ''}.json"
+    (out / name).write_text(json.dumps(results, indent=2), encoding="utf-8")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
@@ -507,6 +620,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
     c.add_argument("--fit-futures", type=int, default=12)
     c.add_argument("--eval-futures", type=int, default=12)
     c.add_argument("--seed", type=int, default=7_100_000)
+    c.add_argument("--chunk-roots", type=int, default=50, help="roots rolled out (and saved) per chunk")
     c.add_argument("--device", default="cuda")
     p = sub.add_parser("probe")
     p.add_argument("--checkpoint", required=True)
@@ -516,6 +630,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
     p.add_argument("--pair-weights", type=float, nargs="+", default=[0.0, 25.0, 100.0])
     p.add_argument("--replay", action="append", default=[])
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--score-only", action="store_true", help="train on score targets only (no rank loss)")
+    p.add_argument("--choose-by", choices=("blend", "margin"), default="blend")
     p.add_argument("--device", default="cuda")
     args = parser.parse_args(argv)
     collect(args) if args.command == "collect" else probe(args)
