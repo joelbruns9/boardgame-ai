@@ -70,12 +70,12 @@ class LiveLuck:
 
     def _solver(self, start, evaluate):
         """Turn-start solves, cached by board (under ``self._lock``)."""
-        from .rust_solver import RustTurnSolver
+        from .advisor_adapter import build_solver
         key = json.dumps(snapshot(start))
         solver = self._solvers.get(key)
         if solver is None:
             if len(self._solvers) >= self.max_solvers:
                 self._solvers.pop(next(iter(self._solvers)))
             with self.advisor._lock:          # the GPU evaluator is shared
-                solver = self._solvers[key] = RustTurnSolver(start, evaluate)
+                solver = self._solvers[key] = build_solver(start, evaluate)
         return solver

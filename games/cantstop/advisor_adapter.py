@@ -1,4 +1,5 @@
 """Can't Stop serving adapter for games.advisor; no alternate search policy."""
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -13,6 +14,22 @@ from .snapshot import snapshot
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CHECKPOINT = ROOT / "extension_cantstop/models/cantstop_generalist_iter0154.pt"
 PHASES = {"diceChoice": Phase.AWAIT_MOVE, "continueChoice": Phase.AWAIT_DECISION}
+
+
+# Torch on CPU keeps ~8 MB per distinct thread that runs a forward pass and
+# never returns it when the thread exits (memory torch_thread_per_job_leak;
+# measured for this net 2026-10-02: 8.2 MB per fresh thread on CPU, nothing
+# on CUDA). FastAPI runs sync routes on worker threads it retires after 10 s
+# idle, so fresh threads keep coming; every net evaluation goes through this
+# one long-lived thread instead. Never call build_solver from that thread.
+_NET_THREAD = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cantstop-net")
+
+
+def build_solver(state, evaluate, **kwargs):
+    """A RustTurnSolver (whose construction runs the net), built on the net
+    thread."""
+    from .rust_solver import RustTurnSolver
+    return _NET_THREAD.submit(RustTurnSolver, state, evaluate, **kwargs).result()
 
 
 def wins_on_stop(state):
@@ -184,7 +201,6 @@ class CantStopAdvisor:
 
     def solver_for(self, state, req):
         """Called under the adapter lock; no network work occurs on a cache hit."""
-        from .rust_solver import RustTurnSolver
         table, turn = req.options.get("table_id"), req.options.get("turn_id")
         scope = (table, turn) if all(isinstance(x, str) and 0 < len(x) <= 256 for x in (table, turn)) else None
         if req.engine == "heuristic":
@@ -204,7 +220,7 @@ class CantStopAdvisor:
         solver = self.turn_cache.get(key, state) if key else None
         if solver is not None:
             return solver, True
-        solver = RustTurnSolver(state, self.evaluator(req))
+        solver = build_solver(state, self.evaluator(req))
         self.turn_cache.put(key, state, solver)
         return solver, False
 
