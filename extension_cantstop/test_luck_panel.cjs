@@ -35,8 +35,8 @@ class El {
  send("position",{state:raw});await drain();
  const answer=(c,r)=>c.resolve({ok:true,status:200,body:JSON.stringify(r)});
  const ok={available:true,players:[
-  {player_id:"me",name:"Me",busts:5,busts_expected:1.75,dice_pts:-23.7},
-  {player_id:"op",name:"Opp",busts:1,busts_expected:0.35,dice_pts:23.7}]};
+  {player_id:"me",name:"Me",busts:5,busts_expected:1.75,dice_pts:-23.7,own_rolls_pts:-9.6,progress_cols:-0.44},
+  {player_id:"op",name:"Opp",busts:1,busts_expected:0.35,dice_pts:23.7,own_rolls_pts:54.6,progress_cols:1.56}]};
 
  send("packets",{table_id:"t9",packets:[{move_id:1}]});await drain();
  assert.equal(logs.at(-1).kind,"bga_packets");assert.equal(logs.at(-1).table_id,"t9");
@@ -51,10 +51,10 @@ class El {
  const panel=body.children.find(e=>e.id==="cantstop-advisor-panel");
  const luck=panel.querySelector('[data-role="luck"]');
  const text=luck.textContent;
- assert.match(text,/Dice luck so far/);
+ assert.match(text,/Dice luck so far \(own rolls\)/);
  assert.ok(text.indexOf("Opp")<text.indexOf("Me (you)"),"turn order: seat no 1 first");
- assert.match(text,/Me \(you\)\|−23\.7 pts\|5 busts \/ 1\.8 exp/);
- assert.match(text,/Opp\|\+23\.7 pts\|1 busts \/ 0\.3 exp|Opp\|\+23\.7 pts\|1 busts \/ 0\.4 exp/);
+ assert.match(text,/Me \(you\)\|−9\.6 pts\|5 busts \/ 1\.8 exp\|progress −0\.4 columns vs average dice/,"own rolls, not all dice");
+ assert.match(text,/Opp\|\+54\.6 pts\|1 busts \/ 0\.[34] exp\|progress \+1\.6 columns/);
  answer(calls[1],{available:false,reason:"the game record does not reach back to the first roll"});await drain();
  assert.match(luck.textContent,/Dice luck: the game record does not reach back/);
  assert.equal(calls.length,2,"no extra request without new packets");

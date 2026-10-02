@@ -53,8 +53,8 @@ from pathlib import Path
 import numpy as np
 
 from .advisor_adapter import DEFAULT_CHECKPOINT, parse_state, wins_on_stop
-from .engine import (COLUMNS, GameState, Phase, apply_move, bust, can_stop,
-                     legal_moves, stop)
+from .engine import (COLUMN_HEIGHTS, COLUMNS, GameState, Phase, apply_move,
+                     bust, can_stop, legal_moves, stop)
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_LOG_DIR = ROOT / "runs/cantstop/bga_game_log"
@@ -67,21 +67,61 @@ TOL = 1e-9
 
 # ---- dice arithmetic (no model) ----
 
-_BUST_CACHE = {}
+_ODDS_CACHE = {}
+
+
+def dice_potential(board, runners, dice):
+    """The most progress ``dice`` allow, in columns (a step on a column is
+    1/height of it, so a step on 2 counts as much as 4.3 steps on 7).
+    The dice's offer, not the player's choice: 0 for a bust."""
+    s = board.clone()
+    s.runners = dict(runners)
+    return max((sum(1 / COLUMN_HEIGHTS[c] for c in m) for m in legal_moves(s, dice)),
+               default=0.0)
+
+
+def roll_odds(board, runners):
+    """(bust probability, expected dice potential) for the next roll by
+    ``board``'s seat to move holding ``runners``. Exact over all 1296 rolls."""
+    key = (board_key(board), tuple(sorted(runners.items())))
+    odds = _ODDS_CACHE.get(key)
+    if odds is None:
+        if len(_ODDS_CACHE) > 200_000:
+            _ODDS_CACHE.clear()
+        s = board.clone()
+        s.runners = dict(runners)
+        bust_w = pot = 0.0
+        for d, w in DICE:
+            moves = legal_moves(s, d)
+            if not moves:
+                bust_w += w
+            else:
+                pot += w * max(sum(1 / COLUMN_HEIGHTS[c] for c in m) for m in moves)
+        odds = _ODDS_CACHE[key] = (bust_w / 1296, pot / 1296)
+    return odds
 
 
 def bust_probability(board, runners):
     """Chance the next roll busts, for ``board``'s seat to move holding
     ``runners``. Exact over all 1296 rolls."""
-    key = (board_key(board), tuple(sorted(runners.items())))
-    p = _BUST_CACHE.get(key)
-    if p is None:
-        if len(_BUST_CACHE) > 200_000:
-            _BUST_CACHE.clear()
-        s = board.clone()
-        s.runners = dict(runners)
-        p = _BUST_CACHE[key] = sum(w for d, w in DICE if not legal_moves(s, d)) / 1296
-    return p
+    return roll_odds(board, runners)[0]
+
+
+def risk_columns(board, runners):
+    """Progress a bust would lose, in columns."""
+    saved = board.progress[board.active_player]
+    return sum((pos - saved[c]) / COLUMN_HEIGHTS[c] for c, pos in runners.items())
+
+
+def progress_luck(board, runners, dice):
+    """Model-free luck of one roll, in columns: the dice's potential minus
+    its average, less any bust loss beyond its expected size. ``dice`` None
+    for a bust. Averages exactly zero over all 1296 rolls."""
+    p, expected = roll_odds(board, runners)
+    risk = risk_columns(board, runners)
+    if dice is None:
+        return -expected - (1 - p) * risk
+    return dice_potential(board, runners, dice) - expected + p * risk
 
 
 def at_risk(board, runners):
@@ -368,11 +408,13 @@ def build_ledger(game, turns, evaluate, solver_cls=None):
             if step.dice is None:
                 post = solver.bust_value
                 add("luck", post - pre, turn.seat, busted=True, **roll,
-                    p_bust_range=step.p_range, bust_dice=step.bust_dice)
+                    p_bust_range=step.p_range, bust_dice=step.bust_dice,
+                    progress_luck=progress_luck(board, K, None))
                 cursor = post
                 continue
             post = np.asarray(solver.value(at(board, K, Phase.AWAIT_MOVE, step.dice)))
-            add("luck", post - pre, turn.seat, busted=False, dice=step.dice, **roll)
+            add("luck", post - pre, turn.seat, busted=False, dice=step.dice, **roll,
+                progress_luck=progress_luck(board, K, step.dice))
             cursor, known = post, False
             if step.move is not None and step.then is not None:
                 child = after_move(at(board, K, Phase.AWAIT_MOVE, step.dice), step.move).runners
@@ -417,6 +459,7 @@ def seat_summary(ledger, seat):
             out["squares_lost"] += r * e["busted"]
             out["squares_expected"] += p * r
             out["squares_var"] += p * (1 - p) * r * r
+            out["progress_luck"] += e["progress_luck"]
             rng = e.get("p_bust_range")
             if rng and rng[1] - rng[0] > 0.01:
                 out["ambiguous_busts"] += 1

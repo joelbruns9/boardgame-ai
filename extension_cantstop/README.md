@@ -159,15 +159,26 @@ Regression: node extension_cantstop/test_packet_recorder.cjs.
 
 ## Dice luck so far
 
-Under the win chances, each player's dice luck this game: **points** = win
-chance gained (+) or lost (-) to all dice, every roll measured against the
-exact average over all 1296 rolls; **busts / exp** = actual busts vs the
-exact bust odds of each roll that player took (no model involved). Served by
-`/api/cantstop/luck` (games/cantstop/live_luck.py), which replays the table's
-logged packet record, so it needs that record from the first roll: if the
-tab was opened mid-game the block says so (a reload makes BGA re-send the
-history). Refreshed after each logged packet batch, at most one request in
-flight plus one queued. Regression: node extension_cantstop/test_luck_panel.cjs.
+Under the win chances, each player's luck on their OWN rolls this game, so
+"my dice were average, theirs were hot" reads directly (in a 2-player game
+the effect on you is your number minus theirs):
+
+- **pts**: win chance their dice gained (+) or lost (-), each roll measured
+  against the exact average over all 1296 rolls (uses the net to weigh how
+  much each roll mattered).
+- **busts / exp**: actual busts vs the exact bust odds of each roll taken.
+  No model.
+- **progress**: the most progress their dice offered (best pairing, in
+  columns: a step is 1/height of its column) minus the average, less bust
+  losses beyond their expected size. No model; it does not know which
+  columns matter, which the pts do.
+
+Served by `/api/cantstop/luck` (games/cantstop/live_luck.py), which replays
+the table's logged packet record, so it needs that record from the first
+roll: if the tab was opened mid-game the block says so (a reload makes BGA
+re-send the history). Refreshed after each logged packet batch, at most one
+request in flight plus one queued. Regression:
+node extension_cantstop/test_luck_panel.cjs.
 
 ## Player win chances
 

@@ -10,7 +10,12 @@ turn so far (games/cantstop/luck.py). Per player:
                              lost to ALL dice (their rolls and everyone
                              else's), each roll measured against the exact
                              average over the 1296 possible rolls
-    own_rolls_pts            the part from their own rolls
+    own_rolls_pts            the part from their own rolls (what the panel
+                             shows: "were MY dice good", apart from theirs)
+    progress_cols            model-free: progress the player's dice offered
+                             (best pairing, in columns: a step is 1/height
+                             of its column) minus the average, less bust
+                             losses beyond their expected size
 
 Only a stream that covers the game from its first roll is used: a partial
 one cannot place the board, and guessing would put wrong numbers in front of
@@ -64,7 +69,8 @@ class LiveLuck:
                 "busts_expected": round(s["busts_expected"], 2),
                 "busts_z": round(z(s["busts"], s["busts_expected"], s["busts_var"]), 2),
                 "dice_pts": round(100 * (s["luck_own"] + s["luck_others"]), 1),
-                "own_rolls_pts": round(100 * s["luck_own"], 1)})
+                "own_rolls_pts": round(100 * s["luck_own"], 1),
+                "progress_cols": round(s["progress_luck"], 2)})
         return {"available": True, "turns": len(turns),
                 "game_over": bool(turns and turns[-1].end == "win"), "players": players}
 

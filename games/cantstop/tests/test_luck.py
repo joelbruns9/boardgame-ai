@@ -231,3 +231,20 @@ def test_every_roll_is_judged_against_the_exact_dice_average():
             if legal_moves(at(start, K, Phase.AWAIT_MOVE), d):
                 avg = avg + w / 1296 * np.asarray(solver.value(at(start, K, Phase.AWAIT_MOVE, d)))
         np.testing.assert_allclose(e["pre"], avg, atol=1e-12)
+
+
+def test_progress_luck_averages_zero_over_every_roll():
+    """Model-free, so it must be fair by construction: summed over all 1296
+    rolls (busts included) each position's progress luck is zero."""
+    from games.cantstop.luck import progress_luck, risk_columns
+    checked = 0
+    for rules in RULES:
+        for s in sample_positions(rules, 13, 12):
+            if s.phase == Phase.AWAIT_MOVE:
+                continue
+            total = 0.0
+            for d, w in DICE:
+                total += w * progress_luck(s, s.runners, d if legal_moves(s, d) else None)
+            assert total / 1296 == pytest.approx(0.0, abs=1e-12)
+            checked += bool(risk_columns(s, s.runners))
+    assert checked          # some positions had progress at risk

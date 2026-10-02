@@ -319,11 +319,13 @@
     }
     const head = document.createElement("div");
     head.className = "advisor-luck-head";
-    head.textContent = "Dice luck so far";
+    head.textContent = "Dice luck so far (own rolls)";
     luck.appendChild(head);
-    luck.title = "Points: win chance gained (+) or lost (−) to all dice this game, each roll " +
-      "measured against the average over every possible roll. Busts: actual vs expected from " +
-      "the exact bust odds of each roll that player took (no model involved).";
+    luck.title = "Each player's OWN rolls only. Points: win chance their dice gained (+) or " +
+      "lost (−), each roll vs the average over every possible roll. Busts: actual vs expected " +
+      "from the exact bust odds of each roll (no model). Progress: the most progress their dice " +
+      "offered, in columns (a step = 1/height of its column), vs average dice, less bust losses " +
+      "beyond their expected size (no model).";
     const raw = lastCapture;
     const byId = new Map(result.players.map(p => [String(p.player_id), p]));
     const order = raw?.playerorder && raw?.players ? turnOrder(raw).map(String) : [...byId.keys()];
@@ -339,14 +341,19 @@
       const name = document.createElement("span");
       name.className = "advisor-player-name";
       name.textContent = (raw?.players?.[pid]?.name || p.name) + (raw && pid === raw.viewer_player ? " (you)" : "");
+      const signed = (x, digits) => (x > 0 ? "+" : x < 0 ? "−" : "") + Math.abs(x).toFixed(digits);
       const pts = document.createElement("span");
       pts.className = "advisor-player-pct";
-      pts.textContent = (p.dice_pts > 0 ? "+" : p.dice_pts < 0 ? "−" : "") + Math.abs(p.dice_pts).toFixed(1) + " pts";
+      pts.textContent = signed(p.own_rolls_pts, 1) + " pts";
       const busts = document.createElement("span");
       busts.className = "advisor-luck-busts";
       busts.textContent = p.busts + " busts / " + p.busts_expected.toFixed(1) + " exp";
       row.append(swatch); row.append(name); row.append(pts); row.append(busts);
       luck.appendChild(row);
+      const progress = document.createElement("div");
+      progress.className = "advisor-luck-progress";
+      progress.textContent = "progress " + signed(p.progress_cols, 1) + " columns vs average dice";
+      luck.appendChild(progress);
     }
   }
   // BGA's packets go to the game log as "bga_packets" rows. Undelivered ones
