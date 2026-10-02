@@ -61,6 +61,55 @@ minutes against any checkpoint.
 Deliverable: `tactical_suite.py` + frozen suite file + baseline table for
 iter 20, iter 60, and the latest checkpoint.
 
+## Failure-mode diagnosis (2026-10-02)
+
+**Root cause is the value head (and tail priors) on rare decisive positions;
+search is the amplifier.** Search corrects a bad leaf value wherever it funds
+the node -- the RICCP retrieval node reads 3.9% raw and Q=100% after 764 sims.
+Games are lost where the wrong value/prior sits BEHIND A CHANCE NODE, so the
+correcting visits are split 10-70 ways:
+
+| case | value / prior error | search corrects? |
+|---|---|---|
+| RICCP retrieval node | 3.9% on a 100% win | yes (764 sims) |
+| RICCP before Great Library | same values, one level down | no: Q frozen 6.94% from 4k to 16k sims, 70-way split |
+| 908370787 ToA refutation | prior .012-.077, value 36 pts wrong | no: ~160 visits/world vs 165-400 needed; ~8 corrects once funded |
+| science threat prior | opponent science -.4 to -.77, worst early | only near the end |
+| BGA Port | revealing move ~25 pts optimistic | no: fan-out |
+| W11 | 2 plies of forced line recover 19% | value is fixed by real search depth |
+
+Fixing values makes the fan-out matter less; fixing the fan-out lets search
+correct values. Both are attacked (G1-G3 values, G8/G9 fan-out, G11 labels).
+Caveat: three games and one buffer audit. Frequencies are unmeasured -> G0b.
+
+Working taxonomy:
+
+- **F1** own decisive win misvalued (Mausoleum retrieval, sixth symbol) -- value.
+- **F2** opponent decisive threat under-predicted (science threat) -- value/prior.
+- **F3** refutation unfunded behind a chance node -- prior x search allocation.
+- **F4** cheap-move label contamination -- data (G11).
+- **F5** strategic: not fixed by exact leaves or a known reveal.
+
+## G0b -- Oracle-swap attribution study (scope first, with G0)
+
+On positions where the model played a losing move, rerun the decision four ways:
+
+| | NN leaf values | exact leaf values (solver / engine) |
+|---|---|---|
+| normal chance fan-out | baseline | fixed here -> value failure (F1/F2) |
+| actual reveal known in advance | fixed here -> fan-out failure (F3) | fixed only here -> both |
+
+None fixes it -> F5. Sources of decisive mistakes:
+
+- endgame-solver proofs in the run07 buffers (~8.5k solved positions per
+  iteration; a played move that changes a proven result is a labelled blunder;
+  endgame-biased);
+- run07 gate games (`results.jsonl`, if detailed enough);
+- BGA losses via `bga_review` (separates luck from play).
+
+Output: frequency table over F1-F5 that sets the effort split between G1-G3,
+G8/G9 and G11. Solver-proof source alone should be a laptop day.
+
 ## G1 -- Keep decisive positions (data coverage)
 
 Always emit training examples for positions with an available immediate win,
@@ -178,6 +227,66 @@ Instrument: G0's chance-node class plus the reference case. Success = the
 refutation is promoted at a simulation budget comparable to the same reply with
 no chance node in front of it (WORLD_CLASS "definition of success").
 
+## Owner decisions 2026-10-01
+
+1. **Mausoleum: correct, then seed.** Re-derive the 101 run07 buffers with
+   G1/G2 rules (decisive positions kept, proven positions get exact targets)
+   BEFORE any seeding or oversampling, so the added volume carries correct
+   labels. Then seed: G3 oversampling plus self-play starts from decisive
+   positions (KataGo side positions; BGA log restarts).
+2. **Great Library: 5 token afterstates (G8.0, exact).** The returned tokens go
+   to the box and nothing draws from it again, so the post-pick state is the
+   same whichever offer contained the token: V(offer) = max of its three token
+   values, offer probabilities analytic. Library goes 7 x 10 = 70 outcomes ->
+   7 reveals x 5 shared token subtrees (each ~6x the visits). Check that
+   `unused_progress_tokens` does not make post-pick encodings offer-dependent;
+   if it does, key the transposition on value-relevant state.
+3. **Grouped action statistics, individual values kept (G9).** Two-level
+   selection: a group node per idea (`Wonder X`, `discard`) aggregates visits
+   and Q; children are the individual burial/discard cards with their own
+   statistics. Card BUILDS stay ungrouped (the card matters). Mausoleum caution:
+   discarded cards are revivable, buried ones are not, so the within-group
+   choice can decide games -- the group only allocates visits to the idea, it
+   never replaces the per-card value. Test specifically on Mausoleum-live
+   positions: rate of wrong within-group choice vs ungrouped. Retest with G8.0
+   on the corpus, not one reference case (W9 m2 was judged on one).
+4. **W5b re-explored (G10).** Unbuilt features, first two prioritised:
+   immediate effect (wins / completes science pair / military zone),
+   extra-turn has a legal follow-up, ends-the-age, Wonder ordinal and
+   retirement, pending-choice target token, affordability/payment/chain,
+   W1/W2/W3 outputs into the scorer. Target is the TAIL prior on refutations
+   (0.012-0.077 measured), not average CE. Test: prior on the exact refutation
+   vs a flat-policy control on the same data.
+5. **Random-init run comes AFTER the buffer correction** (1), as an offline
+   comparison: random init vs fine-tune of candidate_0060 on the corrected
+   buffers, scored on G0. Down-weight or drop early iterations.
+6. **Fast/full search re-opened (G11).** The bias runs BOTH ways, and the
+   optimistic direction is the dangerous one: when a cheap-searched opponent
+   misses the killer reply (Mausoleum science build, extra-turn Wonder), the
+   earlier position is labelled good, so the value head learns that allowing
+   rare refutations is safe -- self-reinforcing with the blind spot. Policy is
+   protected (cheap moves carry no policy target); value targets are not.
+   Current mix: 25% full at 1600, 75% cheap at 100 -> mean ~519 sims/move;
+   all-full is ~3x cost per game. At the performance edge the throughput hit
+   may be worth it, but measure first: reanalyse a buffer sample of cheap
+   moves at full budget, count decision changes, split by reveal / threat /
+   quiet. Options by cost: raise cheap sims (100 -> 300 ~ +20%); triggered
+   upgrades; all-full.
+7. **Triggered full budget, not "reveals always full".** Most boards have a
+   revealing move, so a reveal trigger is ~all-full. Narrower triggers: a top-k
+   candidate reveals AND an opponent threat is live (science pair or five
+   symbols, military near a zone, Mausoleum with a live discard, extra-turn
+   Wonder available); or the root's chance children disagree widely in value.
+   Progressive widening is orthogonal (allocation within a budget, not the
+   budget) and helps cheap moves most (100 sims over 10 worlds = 10 each), but
+   it drops unexpanded worlds -- use the hybrid (expand every world once for
+   its NN value, deepen a risk-weighted few, probability-weighted backup).
+   Order: exact restructurings (G8.0, G9) first, then the G11 measurement, then
+   choose triggers / widening.
+8. **W3 board-control check on targeted positions.** candidate_0060 on the
+   907773062 ladder + threat corpus with real / zeroed / shuffled control
+   channels. Measures reliance, not benefit.
+
 ## Review of WORLD_CLASS_MODEL_EVOLUTION_PLAN workstreams (2026-09-30)
 
 | WS | What | Status | Verdict for this plan |
@@ -203,24 +312,34 @@ under-learned when kept. That is this plan's G0-G3.
 
 ## Deprioritised
 
-- More sims / bigger search budgets (16k sims left the Library edge frozen).
-- New search bookkeeping mechanisms (four W9 nulls).
-- Further W5 / representation arms, per-discard sixth-symbol feature (net can
-  derive it from card identity; revisit only if G1-G3 fail to close the gap).
+- More sims / bigger search budgets (16k sims left the Library edge frozen) --
+  except G11's targeted full-budget upgrades, which are a label-quality change.
+- New heuristic search bookkeeping (four W9 nulls). The exact restructurings
+  G8.0 and G9 are not in this class.
+- Per-discard sixth-symbol feature (net can derive it from card identity;
+  revisit only if G1-G3 fail to close the gap). W5b itself is re-opened as G10.
 - Capacity increase -- revisit only if G1-G3 improve the suite but not the gates.
 
 ## Sequencing
 
-1. G0 suite + baselines (laptop).
+0. run07 ENDED 2026-09-30 at iter 100 (revert_reset; best = iter 60). All 101
+   buffers, candidates 0-100 and logs are local in
+   `runs/seven_wonders_duel/run07_bundle` (main folder; no `learner_*.pt`).
+1. G0 suite + baselines and G0b attribution study (laptop).
 2. G1 coverage measurement, then G1 + G2 build (laptop, unit + buffer audit).
 3. G4 build + tree measurement (laptop).
 4. Box run: G1+G2+G4 vs control, G0 tracked per promotion. G5 folds in here if
    the box budget allows a third arm.
 5. G3, then G7, each as its own arm.
 6. G6 at the next fresh run.
-7. G8: (4) root verification and (1) progressive widening on the laptop in
-   parallel with 1-3 (reference case + corpus); (2) reanalysis as a box arm
-   after G1-G3; (3) only after (2).
+7. Fan-out, per owner decisions: exact restructurings first (G8.0 Library
+   afterstates, G9 grouped Wonder/discard statistics), measured on the corpus
+   and G0 chance class; then G11's cheap-move measurement; then choose
+   triggered full budget and/or hybrid widening (G8.1). G8.4 root verification
+   any time for the advisor. G8.2 reanalysis as a box arm after G1-G3; G8.3
+   afterstate head only after G8.2.
+8. G10 (W5b features) and the W3 control-reliance check can run alongside on
+   the laptop; random-init vs fine-tune on the corrected buffers after step 2.
 
 ## References
 
