@@ -43,15 +43,15 @@ from .snapshot import snapshot
 class SolverCache:
     """Turn-start solves shared by play and ledger (the same tables)."""
 
-    def __init__(self, evaluate):
-        self.evaluate, self.cache = evaluate, {}
+    def __init__(self, evaluate, max_size=2000):
+        self.evaluate, self.cache, self.max_size = evaluate, {}, max_size
 
     def __call__(self, start, evaluate=None):
         from .rust_solver import RustTurnSolver
         key = json.dumps(snapshot(start))
         if key not in self.cache:
-            if len(self.cache) > 2000:
-                self.cache.clear()
+            if len(self.cache) >= self.max_size:
+                self.cache.pop(next(iter(self.cache)))
             self.cache[key] = RustTurnSolver(start, self.evaluate)
         return self.cache[key]
 

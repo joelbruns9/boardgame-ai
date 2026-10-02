@@ -177,42 +177,64 @@ def main(argv=None):
     ap.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     ap.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR)
     ap.add_argument("--selfplay", type=int, default=150)
-    ap.add_argument("--budget", type=int, default=20_000, help="levels per game's end game")
+    ap.add_argument("--budget", type=int, default=10_000, help="levels per game's end game")
     ap.add_argument("--seed", type=int, default=2026100203)
     ap.add_argument("--device", default="cuda")
-    ap.add_argument("--out", type=Path)
+    ap.add_argument("--out", type=Path, required=True,
+                    help="results so far are saved here as the study runs; rerunning with the "
+                         "same --out resumes, skipping finished games")
     args = ap.parse_args(argv)
     from .model import NetEvaluator, load_net
     evaluate = NetEvaluator(load_net(args.checkpoint, device=args.device), device=args.device)
-    solvers = SolverCache(evaluate)
-    boards, decisions, t0 = [], [], time.time()
-    for path in sorted(args.log_dir.glob("table_*.jsonl")):
-        try:
-            game = load_game(path)
-        except ValueError:
-            continue
-        if game.captures[0].state.rules != RULES:
-            continue
-        turns = read_turns(path, game)
-        b, d = score_game(turns, solvers, evaluate, "BGA (your seat)", game.table_id,
-                          game.viewer_seat, args.budget)
-        boards += b
-        decisions += d
-    print(f"BGA done in {time.time() - t0:.0f} s", flush=True)
-    rng = random.Random(args.seed)
+    # Reuse is within one game (play, then score its last turns), so a
+    # small cache suffices; each entry is ~8 MB (measured: 128 entries held
+    # 1.56 GB; the old cap of 2000 grew until the system ran out of memory).
+    solvers = SolverCache(evaluate, max_size=48)
+    saved = json.loads(args.out.read_text()) if args.out.exists() else {}
+    boards, decisions = saved.get("boards", []), saved.get("decisions", [])
+    done = set(saved.get("done", []))
+    t0 = time.time()
+
+    def save():
+        text = report(boards, decisions)
+        tmp = args.out.with_name(args.out.name + ".tmp")
+        tmp.write_text(json.dumps({"boards": boards, "decisions": decisions, "done": sorted(done),
+                                   "budget": args.budget, "seed": args.seed}))
+        tmp.replace(args.out)
+        args.out.with_suffix(".md").write_text(
+            f"# End-game study (exact solver)\n\n{len(done)} games done.\n```\n{text}\n```\n",
+            encoding="utf-8")
+        return text
+
+    if "bga" not in done:
+        for path in sorted(args.log_dir.glob("table_*.jsonl")):
+            try:
+                game = load_game(path)
+            except ValueError:
+                continue
+            if game.captures[0].state.rules != RULES:
+                continue
+            turns = read_turns(path, game)
+            b, d = score_game(turns, solvers, evaluate, "BGA (your seat)", game.table_id,
+                              game.viewer_seat, args.budget)
+            boards += b
+            decisions += d
+        done.add("bga")
+        save()
+        print(f"BGA done in {time.time() - t0:.0f} s", flush=True)
     for g in range(args.selfplay):
-        turns = selfplay_turns(solvers, rng)
+        if f"sp{g}" in done:
+            continue
+        # One seed per game, so a resumed run plays the same games.
+        turns = selfplay_turns(solvers, random.Random(args.seed * 1_000_003 + g))
         b, d = score_game(turns, solvers, evaluate, "self-play (both seats)", f"sp{g}", None, args.budget)
         boards += b
         decisions += d
-        if (g + 1) % 25 == 0:
+        done.add(f"sp{g}")
+        if (g + 1) % 10 == 0:
+            save()
             print(f"self-play {g + 1}/{args.selfplay}, {time.time() - t0:.0f} s", flush=True)
-    text = report(boards, decisions)
-    print(text)
-    if args.out:
-        args.out.write_text(json.dumps({"boards": boards, "decisions": decisions}))
-        args.out.with_suffix(".md").write_text("# End-game study (exact solver)\n```\n" + text + "\n```\n",
-                                               encoding="utf-8")
+    print(save())
 
 
 if __name__ == "__main__":

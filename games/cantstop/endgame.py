@@ -54,17 +54,24 @@ def level_state(key, active):
 
 
 class _Placeholder:
-    """Evaluator used only to construct a turn table; values come later."""
+    """Evaluator used only to construct a turn table; values come later.
+    ``evaluate_features`` puts the solver on its fast path, so no Python
+    board objects are built for the leaves."""
 
     def __call__(self, boards):
         n = boards[0].rules.num_players
         return np.full((len(boards), n), 1.0 / n)
+
+    def evaluate_features(self, features, reference):
+        n = reference.rules.num_players
+        return np.full((len(features), n), 1.0 / n)
 
 
 class ExactEndgame:
     def __init__(self, budget=20_000, tol=1e-12, max_sweeps=10_000):
         self.budget, self.tol, self.max_sweeps = budget, tol, max_sweeps
         self.values = {}        # level key -> (n, n) array: row = seat to move
+        self._pending = {}      # level key -> successor level keys (not yet solved)
         self.sweeps = 0
 
     # ---- solving ----
@@ -90,39 +97,39 @@ class ExactEndgame:
             if key in self.values:
                 stack.pop()
                 continue
-            tables = self._tables(key)
-            missing = [k for k in tables["successors"] if k not in self.values]
+            missing = [k for k in self._successors(key) if k not in self.values]
             if missing:
                 stack.extend(missing)
                 continue
             stack.pop()
-            self._solve_level(key, tables)
+            self._solve_level(key)
 
-    def _tables(self, key):
-        cached = getattr(self, "_pending", {}).get(key)
-        if cached is not None:
-            return cached
+    def _seat_tables(self, key):
+        """Each seat's turn table at this level, with its stop leaves as
+        (level key, seat to move). Leaf 0 is the bust board: this level,
+        next seat to move."""
         from .rust_solver import RustTurnSolver
-        n = key[0][0]
-        seats = []
-        successors = set()
-        for active in range(n):
+        out = []
+        for active in range(key[0][0]):
             solver = RustTurnSolver(level_state(key, active), _Placeholder())
-            leaves = solver._s.leaf_snapshots()
-            # leaf 0 is the bust board: this level, next seat to move
-            stops = [(level_key(s), s[1]) for s in leaves[1:]]
-            successors.update(k for k, _ in stops)
-            seats.append((solver, stops))
-        if len(self.values) + len(getattr(self, "_pending", {})) >= self.budget:
-            raise TooLarge(f"more than {self.budget} levels")
-        tables = {"seats": seats, "successors": successors - {key}}
-        self._pending = getattr(self, "_pending", {})
-        self._pending[key] = tables
-        return tables
+            out.append((solver, [(level_key(s), s[1]) for s in solver._s.leaf_snapshots()[1:]]))
+        return out
 
-    def _solve_level(self, key, tables):
+    def _successors(self, key):
+        """Levels a stop can reach from ``key``. Only these small sets are
+        kept while waiting; turn tables are rebuilt when the level is solved
+        (cheap), so memory holds no tables for the levels on the stack."""
+        succ = self._pending.get(key)
+        if succ is None:
+            if len(self.values) + len(self._pending) >= self.budget:
+                raise TooLarge(f"more than {self.budget} levels")
+            succ = {k for _, stops in self._seat_tables(key) for k, _ in stops} - {key}
+            self._pending[key] = succ
+        return succ
+
+    def _solve_level(self, key):
         n = key[0][0]
-        seats = tables["seats"]
+        seats = self._seat_tables(key)
         fixed = [np.array([self.values[k][a] for k, a in stops]).reshape(-1, n)
                  for _, stops in seats]
         x = np.full((n, n), 1.0 / n)               # current values, row = seat to move
@@ -140,7 +147,7 @@ class ExactEndgame:
         else:
             raise RuntimeError(f"level did not converge in {self.max_sweeps} sweeps")
         self.values[key] = x
-        del self._pending[key]
+        self._pending.pop(key, None)
 
     # ---- queries ----
 
