@@ -283,12 +283,33 @@
       }
     }
   }
+  // BGA's packets go to the game log as "bga_packets" rows. Undelivered ones
+  // stay queued and are retried on a timer: the batch most likely to fail is
+  // the game's last (host closed), and no later drain would carry it.
+  let pendingPackets = [], postingPackets = false, packetTable = null;
+  async function logPackets(table, packets) {
+    if (table) packetTable = table;
+    pendingPackets = pendingPackets.concat(packets);
+    if (postingPackets || !pendingPackets.length) return;
+    postingPackets = true;
+    const batch = pendingPackets;
+    try {
+      await requestOnce("/api/game_log", {table_id: packetTable || batch[0]?.table_id,
+        kind: "bga_packets", extra: {packets: batch}});
+      pendingPackets = pendingPackets.slice(batch.length);
+    } catch {
+      setTimeout(() => logPackets(null, []), 5000);
+    } finally {
+      postingPackets = false;
+    }
+  }
   window.addEventListener("message", e => {
     if (e.source !== window || e.origin !== location.origin || e.data?.advisor !== TAG) return;
     const {type, payload} = e.data;
     if (type === "capture_ack" && payload?.request_id === bridgeRequest) {
       clearTimeout(bridgeTimer); bridgeTimer = null;
     }
+    if (type === "packets") logPackets(payload?.table_id, payload?.packets || []);
     if (type === "position") {
       ensurePanel();
       updateWinProbs(payload.state);
@@ -299,7 +320,7 @@
   });
   // External extension assets avoid the legacy inline-script injection.
   async function loadBridge() {
-    for (const file of ["bga_snippet.js", "turn_identity.js", "timing_probe.js", "page_bridge.js"]) {
+    for (const file of ["bga_snippet.js", "turn_identity.js", "timing_probe.js", "packet_recorder.js", "page_bridge.js"]) {
       await new Promise((resolve, reject) => {
         const el = document.createElement("script"); el.src = api.runtime.getURL(file);
         const timeout = setTimeout(() => { el.remove(); reject(new Error("Page bridge load timed out")); }, 5000);

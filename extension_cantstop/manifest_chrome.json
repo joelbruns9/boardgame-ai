@@ -33,6 +33,7 @@
         "bga_snippet.js",
         "turn_identity.js",
         "timing_probe.js",
+        "packet_recorder.js",
         "page_bridge.js"
       ],
       "matches": [

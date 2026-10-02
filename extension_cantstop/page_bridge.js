@@ -58,7 +58,20 @@
       post("position", {state, signature});
     }
   }
+  // BGA's packet stream (packet_recorder.js), forwarded for the game log.
+  function pumpPackets() {
+    try {
+      if (typeof installCantStopPacketRecorder !== "function") return;
+      const store = installCantStopPacketRecorder(window);
+      const packets = drainCantStopPackets(window);
+      if (packets.length) post("packets", {table_id: store.tableId, packets});
+    } catch {} // never let logging disturb the advice path
+  }
+  // Hook as early as this file runs: packets before the hook are lost (a
+  // reload's "resend" history backfills, but only then).
+  try { if (typeof installCantStopPacketRecorder === "function") installCantStopPacketRecorder(window); } catch {}
   function tick() {
+    pumpPackets();
     try {
       if (testUser()) return;
       try { timing.install(); } catch {}

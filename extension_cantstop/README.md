@@ -145,6 +145,18 @@ more exports with `python -m games.cantstop.timing_report <export.json>...` to
 size capture delays from measurement. Probe regression:
 node extension_cantstop/test_timing_probe.cjs.
 
+## Game record (BGA packets)
+
+`packet_recorder.js` hooks `gameui.notifqueue.onNotification` and forwards
+this table's notification packets (never chat, never other tables) to
+`/api/game_log` as `bga_packets` rows in the same per-table JSONL. Board
+captures only see decision screens; the packets are BGA's own ordered record
+of every roll -- busts included -- every pairing, stop, and the game end, so
+`games/cantstop/luck.py` can read a game instead of inferring it. A page
+reload re-sends the history (packet type "resend"), so opening the tab
+mid-game backfills. Undelivered batches are retried every 5 s.
+Regression: node extension_cantstop/test_packet_recorder.cjs.
+
 ## Player win chances
 
 The top of the panel lists every player, starting player first (by BGA seat
