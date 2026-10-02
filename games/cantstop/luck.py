@@ -67,12 +67,21 @@ TOL = 1e-9
 
 # ---- dice arithmetic (no model) ----
 
+_BUST_CACHE = {}
+
+
 def bust_probability(board, runners):
     """Chance the next roll busts, for ``board``'s seat to move holding
     ``runners``. Exact over all 1296 rolls."""
-    s = board.clone()
-    s.runners = dict(runners)
-    return sum(w for d, w in DICE if not legal_moves(s, d)) / 1296
+    key = (board_key(board), tuple(sorted(runners.items())))
+    p = _BUST_CACHE.get(key)
+    if p is None:
+        if len(_BUST_CACHE) > 200_000:
+            _BUST_CACHE.clear()
+        s = board.clone()
+        s.runners = dict(runners)
+        p = _BUST_CACHE[key] = sum(w for d, w in DICE if not legal_moves(s, d)) / 1296
+    return p
 
 
 def at_risk(board, runners):
@@ -365,7 +374,7 @@ def build_ledger(game, turns, evaluate, solver_cls=None):
             post = np.asarray(solver.value(at(board, K, Phase.AWAIT_MOVE, step.dice)))
             add("luck", post - pre, turn.seat, busted=False, dice=step.dice, **roll)
             cursor, known = post, False
-            if step.move is not None:
+            if step.move is not None and step.then is not None:
                 child = after_move(at(board, K, Phase.AWAIT_MOVE, step.dice), step.move).runners
                 chosen = stop_value(child) if step.then == "stop" else roll_value(child)
                 add("decision", chosen - post, turn.seat, turn=ti, then=step.then)

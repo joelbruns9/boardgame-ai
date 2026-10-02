@@ -19,6 +19,17 @@ def build_app(advisor=None, **kwargs):
         except (KeyError, TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    from .live_luck import LiveLuck
+    live_luck = LiveLuck(advisor, kwargs.get("log_dir"))
+
+    @app.post("/api/cantstop/luck")
+    def luck(body: dict = Body(...)):
+        """Dice luck so far this game, every player, from the packet record."""
+        try:
+            return live_luck.summary(str(body["table_id"]), body.get("device", "cuda"))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     return app
 
 

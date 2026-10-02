@@ -2,7 +2,7 @@
 const api = typeof chrome !== "undefined" && chrome.runtime ? chrome : browser;
 const routes = new Set(["/health", "/api/state", "/api/recommend", "/api/recommend/start",
   "/api/recommend/poll", "/api/recommend/stop", "/api/game_log",
-  "/api/cantstop/win_probabilities"]);
+  "/api/cantstop/win_probabilities", "/api/cantstop/luck"]);
 api.runtime.onMessage.addListener((msg, sender, reply) => {
   if (msg?.kind !== "advisor-fetch") return false;
   (async () => {

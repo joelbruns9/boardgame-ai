@@ -154,3 +154,23 @@ def test_simulated_games_replay_to_the_truth(rules):
     assert [(s, m, then) for s, m, then in got] == [
         (s, None if then == "bust" else m, then) for s, m, then in truth]
     assert final.winner == winner
+
+
+def test_live_luck_summary_from_a_game_log(tmp_path):
+    from games.cantstop.advisor_adapter import CantStopAdvisor
+    from games.cantstop.live_luck import LiveLuck
+    live = LiveLuck(CantStopAdvisor(evaluator=HEURISTIC), tmp_path)
+    assert not live.summary("925113041")["available"]          # nothing logged
+    log = tmp_path / "table_925113041.jsonl"
+    lines = FIXTURE.read_text(encoding="utf-8").splitlines()
+    # board captures only: no packet record, so no numbers
+    log.write_text("\n".join(l for l in lines if '"bga_packets"' not in l) + "\n", encoding="utf-8")
+    assert not live.summary("925113041")["available"]
+    log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    r = live.summary("925113041")
+    assert r["available"] and r["game_over"] and r["turns"] == 29
+    by = {p["player_id"]: p for p in r["players"]}
+    assert sum(p["busts"] for p in by.values()) == 14
+    assert by["89146710"]["dice_pts"] == pytest.approx(-by["96364907"]["dice_pts"], abs=0.11)
+    again = live.summary("925113041")                            # cached solves
+    assert again == r

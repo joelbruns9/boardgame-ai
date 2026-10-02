@@ -11,7 +11,7 @@
   const diagnostics = [];
   let captureRetryTimer = null, captureKey = null, captureRetries = 0;
   let lastCapture = null, bridgeRequest = 0, bridgeTimer = null;
-  let panel, current, epoch = 0, status, rows, facts, players;
+  let panel, current, epoch = 0, status, rows, facts, players, luck;
   // Player win probabilities: their own sequence so a late answer for an old
   // roll never overwrites a newer one, and independent of the advice epoch.
   let winSeq = 0, winShownTurn = null;
@@ -75,7 +75,7 @@
   function ensurePanel() {
     if (panel) return;
     panel = document.createElement("section"); panel.id = "cantstop-advisor-panel";
-    panel.innerHTML = '<header>Can’t Stop Advisor</header><div data-role="players"></div><div data-role="facts"></div>' +
+    panel.innerHTML = '<header>Can’t Stop Advisor</header><div data-role="players"></div><div data-role="luck"></div><div data-role="facts"></div>' +
       '<label><input type="checkbox" data-role="opponents"> Show opponents’ decisions</label>' +
       '<p data-role="status"></p><div data-role="rows"></div><footer><button data-action="retry">Refresh</button> <button data-action="export">Export capture</button></footer>';
     document.body.appendChild(panel);
@@ -89,6 +89,7 @@
     status = panel.querySelector('[data-role="status"]');
     rows = panel.querySelector('[data-role="rows"]'); facts = panel.querySelector('[data-role="facts"]');
     players = panel.querySelector('[data-role="players"]');
+    luck = panel.querySelector('[data-role="luck"]');
     panel.querySelector('[data-action="retry"]').onclick = () => { serverHealth = null; stopOld(); recapture(); };
     panel.querySelector('[data-action="export"]').onclick = async () => {
       // Page timing (timing_probe.js) lives in the page; ask the bridge for it.
@@ -283,6 +284,71 @@
       }
     }
   }
+  // Dice luck so far (games/cantstop/live_luck.py), refreshed after each
+  // logged packet batch: one request in flight, one more queued if packets
+  // arrived meanwhile, so a burst of rolls costs at most two requests.
+  let luckBusy = false, luckAgain = false;
+  async function updateLuck() {
+    if (!packetTable) return;
+    if (luckBusy) { luckAgain = true; return; }
+    luckBusy = true;
+    try {
+      const result = await requestOnce("/api/cantstop/luck", {table_id: packetTable, device: "cuda"});
+      ensurePanel();
+      renderLuck(result);
+    } catch (e) {
+      ensurePanel();
+      luck.textContent = "";
+      luck.title = "Dice luck not updated: " + (e.status === 404
+        ? "the advisor server is an older version; restart it from the updated folder"
+        : String(e.message || e));
+    } finally {
+      luckBusy = false;
+      if (luckAgain) { luckAgain = false; updateLuck(); }
+    }
+  }
+  function renderLuck(result) {
+    luck.textContent = "";
+    if (!result.available) {
+      luck.title = "";
+      const note = document.createElement("div");
+      note.className = "advisor-luck-note";
+      note.textContent = "Dice luck: " + result.reason;
+      luck.appendChild(note);
+      return;
+    }
+    const head = document.createElement("div");
+    head.className = "advisor-luck-head";
+    head.textContent = "Dice luck so far";
+    luck.appendChild(head);
+    luck.title = "Points: win chance gained (+) or lost (−) to all dice this game, each roll " +
+      "measured against the average over every possible roll. Busts: actual vs expected from " +
+      "the exact bust odds of each roll that player took (no model involved).";
+    const raw = lastCapture;
+    const byId = new Map(result.players.map(p => [String(p.player_id), p]));
+    const order = raw?.playerorder && raw?.players ? turnOrder(raw).map(String) : [...byId.keys()];
+    for (const pid of order) {
+      const p = byId.get(pid);
+      if (!p) continue;
+      const row = document.createElement("div");
+      row.className = "advisor-player advisor-luck-row";
+      const swatch = document.createElement("span");
+      swatch.className = "advisor-swatch";
+      const color = raw?.players?.[pid]?.color;
+      if (color) swatch.style.background = "#" + String(color).replace(/^#/, "");
+      const name = document.createElement("span");
+      name.className = "advisor-player-name";
+      name.textContent = (raw?.players?.[pid]?.name || p.name) + (raw && pid === raw.viewer_player ? " (you)" : "");
+      const pts = document.createElement("span");
+      pts.className = "advisor-player-pct";
+      pts.textContent = (p.dice_pts > 0 ? "+" : p.dice_pts < 0 ? "−" : "") + Math.abs(p.dice_pts).toFixed(1) + " pts";
+      const busts = document.createElement("span");
+      busts.className = "advisor-luck-busts";
+      busts.textContent = p.busts + " busts / " + p.busts_expected.toFixed(1) + " exp";
+      row.append(swatch); row.append(name); row.append(pts); row.append(busts);
+      luck.appendChild(row);
+    }
+  }
   // BGA's packets go to the game log as "bga_packets" rows. Undelivered ones
   // stay queued and are retried on a timer: the batch most likely to fail is
   // the game's last (host closed), and no later drain would carry it.
@@ -297,6 +363,7 @@
       await requestOnce("/api/game_log", {table_id: packetTable || batch[0]?.table_id,
         kind: "bga_packets", extra: {packets: batch}});
       pendingPackets = pendingPackets.slice(batch.length);
+      updateLuck();
     } catch {
       setTimeout(() => logPackets(null, []), 5000);
     } finally {

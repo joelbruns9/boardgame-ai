@@ -157,6 +157,18 @@ reload re-sends the history (packet type "resend"), so opening the tab
 mid-game backfills. Undelivered batches are retried every 5 s.
 Regression: node extension_cantstop/test_packet_recorder.cjs.
 
+## Dice luck so far
+
+Under the win chances, each player's dice luck this game: **points** = win
+chance gained (+) or lost (-) to all dice, every roll measured against the
+exact average over all 1296 rolls; **busts / exp** = actual busts vs the
+exact bust odds of each roll that player took (no model involved). Served by
+`/api/cantstop/luck` (games/cantstop/live_luck.py), which replays the table's
+logged packet record, so it needs that record from the first roll: if the
+tab was opened mid-game the block says so (a reload makes BGA re-send the
+history). Refreshed after each logged packet batch, at most one request in
+flight plus one queued. Regression: node extension_cantstop/test_luck_panel.cjs.
+
 ## Player win chances
 
 The top of the panel lists every player, starting player first (by BGA seat
