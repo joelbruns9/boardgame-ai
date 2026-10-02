@@ -28,11 +28,34 @@ def _net() -> nw.WelcomeToNet:
     return nw.WelcomeToNet(_SMALL).eval()
 
 
-def test_normalized_rank_averages_ties():
-    assert s2_promotion.normalized_rank([10, 5], 0) == 1.0
-    assert s2_promotion.normalized_rank([5, 10], 0) == 0.0
-    assert s2_promotion.normalized_rank([10, 10], 0) == 0.5
-    assert s2_promotion.normalized_rank([20, 10, 10, 0], 1) == pytest.approx(0.5)
+def _finished(players: int, seed: int, mirrored: bool = False):
+    import random
+
+    from games.welcome_to.bots import GreedyBot, play_match
+    from games.welcome_to.game import GameConfig
+
+    bots = [GreedyBot(random.Random(seed if mirrored else seed * 100 + i)) for i in range(players)]
+    return play_match(bots, seed=seed, config=GameConfig(players=players))
+
+
+def test_normalized_rank_matches_the_training_targets_and_the_engine_winners():
+    """Review 2026-10-02 §2.6: the gate's rank must use the estate tiebreak."""
+    from games.welcome_to import training
+
+    for players in (2, 3, 4):
+        for seed in range(6):
+            state = _finished(players, seed)
+            for seat in range(players):
+                rank = s2_promotion.normalized_rank(state, seat)
+                assert rank == pytest.approx(
+                    (training.rank_value(training.rank_distributions(state)[seat], players) + 1) / 2
+                )
+                assert 0.0 <= rank <= 1.0
+            winners = set(state.winners())
+            best = max(s2_promotion.normalized_rank(state, seat) for seat in range(players))
+            assert {s for s in range(players) if s2_promotion.normalized_rank(state, s) == best} == winners
+    mirrored = _finished(2, 3, mirrored=True)
+    assert s2_promotion.normalized_rank(mirrored, 0) == 0.5
 
 
 def test_identical_candidate_and_incumbent_are_paired_null():
@@ -50,7 +73,7 @@ def test_identical_candidate_and_incumbent_are_paired_null():
     assert report.primary_margin_delta.mean == 0.0
     assert report.secondary_rank_delta.mean == 0.0
     assert not report.primary_significant
-    assert report.secondary_not_regressed
+    assert report.rank_regression_not_established
     assert report.candidate == report.incumbent
 
 
@@ -68,8 +91,8 @@ def test_gate_search_is_noiseless_and_secondary_requires_evidence_to_reject():
     established_regression = s2_promotion.Estimate(
         mean=-0.08, stderr=0.01, lower=-0.10, upper=-0.06
     )
-    assert s2_promotion.secondary_not_regressed(uncertain_negative, 0.0)
-    assert not s2_promotion.secondary_not_regressed(established_regression, 0.0)
+    assert s2_promotion.rank_regression_not_established(uncertain_negative, 0.0)
+    assert not s2_promotion.rank_regression_not_established(established_regression, 0.0)
 
 
 def test_promotion_archives_then_atomically_replaces_current_best(tmp_path):
@@ -87,7 +110,7 @@ def test_promotion_archives_then_atomically_replaces_current_best(tmp_path):
         primary_margin_delta=replace(null, mean=1.0, lower=0.1, upper=1.9),
         secondary_rank_delta=null,
         primary_significant=True,
-        secondary_not_regressed=True,
+        rank_regression_not_established=True,
         candidate=arm,
         incumbent=arm,
         diagnostics={},
@@ -130,7 +153,7 @@ def test_rejected_candidate_never_changes_current_best(tmp_path):
         primary_margin_delta=zero,
         secondary_rank_delta=zero,
         primary_significant=False,
-        secondary_not_regressed=True,
+        rank_regression_not_established=True,
         candidate=arm,
         incumbent=arm,
         diagnostics={},
@@ -164,7 +187,7 @@ def test_crash_after_install_recovers_from_durable_intent(tmp_path, monkeypatch)
         primary_margin_delta=replace(null, mean=1.0, lower=0.1, upper=1.9),
         secondary_rank_delta=null,
         primary_significant=True,
-        secondary_not_regressed=True,
+        rank_regression_not_established=True,
         candidate=arm,
         incumbent=arm,
         diagnostics={},

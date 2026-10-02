@@ -23,7 +23,7 @@ import torch
 
 from games.az_loop import atomic_copy
 from games.welcome_to import macro_codec as mc
-from games.welcome_to import s2_league, s2_train, self_play
+from games.welcome_to import s2_league, s2_train, self_play, training
 from games.welcome_to.game import GameState
 
 
@@ -85,7 +85,7 @@ class PromotionReport:
     primary_margin_delta: Estimate
     secondary_rank_delta: Estimate
     primary_significant: bool
-    secondary_not_regressed: bool
+    rank_regression_not_established: bool
     candidate: ArmSummary
     incumbent: ArmSummary
     diagnostics: Mapping[str, Estimate]
@@ -122,25 +122,37 @@ def _estimate(values: Sequence[float], z: float) -> Estimate:
     )
 
 
-def secondary_not_regressed(estimate: Estimate, tolerance: float) -> bool:
-    """Pass unless the interval establishes a material rank regression."""
+def rank_regression_not_established(estimate: Estimate, tolerance: float) -> bool:
+    """True unless the interval *establishes* a material rank regression.
+
+    ⚠ This is not a non-inferiority test (review 2026-10-02 §2.6): it passes
+    whenever the upper bound reaches ``-tolerance``, i.e. when a regression
+    has not been shown. Non-inferiority would require the *lower* bound above
+    ``-tolerance``. Kept deliberately -- a mean-at-zero or non-inferiority
+    check rejects a truly neutral candidate often -- and named for what it is.
+    """
     return estimate.upper >= -tolerance
 
 
-def normalized_rank(scores: Sequence[int], seat: int = 0) -> float:
-    """Linear rank utility with average ranks for ties, in [0, 1]."""
-    if len(scores) < 2 or not 0 <= seat < len(scores):
+def normalized_rank(state: GameState, seat: int) -> float:
+    """Expected linear rank utility of ``seat`` in a finished game, in [0, 1].
+
+    Uses the training targets' rank distribution
+    (:func:`training.rank_distributions`), so ties are first broken by the
+    engine's estate tiebreak and only genuinely tied seats share positions.
+    The gate used to compare scores alone (review 2026-10-02 §2.6), which
+    disagreed with both the engine's winners and the rank head's targets.
+    """
+    seats = state.config.players
+    if seats < 2 or not 0 <= seat < seats:
         raise ValueError("normalized rank needs a valid seat in a multiplayer game")
-    own = scores[seat]
-    better = sum(score > own for score in scores)
-    tied = sum(score == own for score in scores)
-    rank = better + (tied - 1) / 2.0
-    return (len(scores) - 1 - rank) / (len(scores) - 1)
+    distribution = training.rank_distributions(state)[seat]
+    return sum(p * u for p, u in zip(distribution, training.rank_utility(seats)))
 
 
 def _game_metrics(trajectory: self_play.SelfPlayTrajectory) -> _GameMetrics:
     state = GameState.new(
-        seed=trajectory.seed,
+        seed=trajectory.engine_seed,
         config=trajectory.config,
         rng_kind=trajectory.rng,
     )
@@ -158,7 +170,7 @@ def _game_metrics(trajectory: self_play.SelfPlayTrajectory) -> _GameMetrics:
     reason = state.end_of_game_reason() or ""
     return _GameMetrics(
         margin=float(own - max(opponents)),
-        rank=normalized_rank(state.scores(), trajectory.learner),
+        rank=normalized_rank(state, trajectory.learner),
         score=float(own),
         win=float(trajectory.learner in state.winners()),
         plans=float(plans),
@@ -220,7 +232,7 @@ def compare_trajectories(
     primary_significant = primary.lower > 0.0
     # Reject on the secondary only when the data show a significant regression.
     # A bare mean-at-zero check rejects a truly neutral candidate half the time.
-    secondary_passed = secondary_not_regressed(
+    secondary_passed = rank_regression_not_established(
         secondary, config.secondary_tolerance
     )
     diagnostics = {
@@ -239,7 +251,7 @@ def compare_trajectories(
         primary_margin_delta=primary,
         secondary_rank_delta=secondary,
         primary_significant=primary_significant,
-        secondary_not_regressed=secondary_passed,
+        rank_regression_not_established=secondary_passed,
         candidate=arm(candidate_rows),
         incumbent=arm(incumbent_rows),
         diagnostics=diagnostics,

@@ -86,15 +86,29 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
-def stable_is_validation(
-    iteration: int, game_seed: int, val_fraction: float, salt: str
+def split_family(game: self_play.SelfPlayTrajectory) -> int:
+    """The lineage a game belongs to for the train/validation split.
+
+    A curriculum restart shares its source game's prefix and board, so it
+    belongs to the source's family (review 2026-10-02 §2.3: 211 of 1,200
+    restarts in one replay window sat on the opposite side from their source).
+    Restarts never seed restarts, so one level is the whole lineage.
+    """
+    return game.seed if game.restart is None else game.restart.source_seed
+
+
+def stable_family_is_validation(
+    family: int, val_fraction: float, salt: str
 ) -> tuple[bool, int]:
-    """Return a durable game-level holdout assignment and its hash value."""
+    """Durable holdout assignment for a whole game family.
+
+    Keyed by the family seed alone, not the iteration: a restart is generated
+    an iteration after its source, and both must hash identically. S2 seeds
+    are unique within a run (``s2_run`` offsets each iteration by 100,000).
+    """
     if not 0.0 < val_fraction < 1.0:
         raise ValueError("val_fraction must be in (0, 1)")
-    digest = hashlib.blake2b(
-        f"{salt}|{iteration}|{game_seed}".encode(), digest_size=8
-    ).digest()
+    digest = hashlib.blake2b(f"{salt}|family|{family}".encode(), digest_size=8).digest()
     value = struct.unpack("<Q", digest)[0]
     return value / 2.0**64 < val_fraction, value
 
@@ -107,11 +121,16 @@ def split_trajectories(
     iterations: Optional[Sequence[int]] = None,
     salt: Optional[str] = None,
 ) -> tuple[list[self_play.SelfPlayTrajectory], list[self_play.SelfPlayTrajectory]]:
-    """Stably split whole games so replay-window changes cannot leak rows.
+    """Stably split whole game families so replay-window changes cannot leak rows.
 
-    The assignment is a hash of ``(salt, iteration, game seed)`` rather than a
-    shuffle of the current list. Thus a game remains validation-only for its
-    entire lifetime in the durable replay window and across process resumes.
+    The assignment is a hash of ``(salt, family)`` (:func:`split_family`)
+    rather than a shuffle of the current list. Thus a game -- and every
+    curriculum restart of it -- remains on one side for its entire lifetime in
+    the durable replay window and across process resumes.
+
+    ⚠ Changed 2026-10-02 from ``(salt, iteration, game seed)``: a run resumed
+    across this change re-splits its window, so compare held-out losses only
+    within one side of it.
     """
     if len(trajectories) < 2:
         raise ValueError("S2 training needs at least two complete trajectories")
@@ -123,8 +142,8 @@ def split_trajectories(
         raise ValueError("trajectory iterations must align with trajectories")
     split_salt = salt if salt is not None else str(seed)
     assigned = [
-        stable_is_validation(iteration, game.seed, val_fraction, split_salt)
-        for game, iteration in zip(trajectories, iterations)
+        stable_family_is_validation(split_family(game), val_fraction, split_salt)
+        for game in trajectories
     ]
     validation = [
         game for game, (held, _digest) in zip(trajectories, assigned) if held
@@ -369,6 +388,8 @@ def evaluate(
                 metrics[f"brier_{name}"] = float("nan")
                 metrics[f"accuracy_{name}"] = float("nan")
                 metrics[f"positive_rate_{name}"] = float("nan")
+                metrics[f"brier_skill_{name}"] = float("nan")
+                metrics[f"bce_skill_{name}"] = float("nan")
             else:
                 metrics[f"r2_{name}"] = float("nan")
             continue
@@ -381,6 +402,16 @@ def evaluate(
             metrics[f"brier_{name}"] = sq_err[name] / count
             metrics[f"accuracy_{name}"] = binary_correct[name] / count
             metrics[f"positive_rate_{name}"] = target_mean
+            # Skill against the constant predictor at the evaluated positive
+            # rate. Accuracy is the wrong yardstick for a rare event: a head
+            # can sit at "1 - positive rate" accuracy and still carry real
+            # signal (review 2026-10-02 §2.2: plan_1_dies_soon, +24% Brier
+            # skill at base-rate accuracy).
+            p = min(max(target_mean, 1e-12), 1.0 - 1e-12)
+            base_brier = p * (1.0 - p)
+            base_bce = -(p * math.log(p) + (1.0 - p) * math.log(1.0 - p))
+            metrics[f"brier_skill_{name}"] = 1.0 - metrics[f"brier_{name}"] / base_brier
+            metrics[f"bce_skill_{name}"] = 1.0 - metrics[f"bce_{name}"] / base_bce
             continue
         mse = sq_err[name] / count
         metrics[f"r2_{name}"] = 1.0 - mse / variance if variance > 0.0 else float("nan")

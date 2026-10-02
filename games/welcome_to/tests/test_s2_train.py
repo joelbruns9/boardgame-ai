@@ -63,16 +63,42 @@ def test_s2_split_is_by_complete_game_and_reproducible(trajectories):
     )
     assert {game.seed for game in reversed_train} == {game.seed for game in train}
     assert {game.seed for game in reversed_val} == {game.seed for game in val}
-    held, digest = s2_train.stable_is_validation(12, trajectories[0].seed, 0.25, "x")
-    assert (held, digest) == s2_train.stable_is_validation(
-        12, trajectories[0].seed, 0.25, "x"
+    held, digest = s2_train.stable_family_is_validation(trajectories[0].seed, 0.25, "x")
+    assert (held, digest) == s2_train.stable_family_is_validation(
+        trajectories[0].seed, 0.25, "x"
     )
-    assert digest != s2_train.stable_is_validation(
-        13, trajectories[0].seed, 0.25, "x"
+    assert digest != s2_train.stable_family_is_validation(
+        trajectories[0].seed + 1, 0.25, "x"
     )[1]
     with pytest.raises(ValueError, match="at least two"):
         s2_train.split_trajectories(trajectories[:1], 0.1, seed=0)
     assert s2_train._json_safe({"missing": float("nan")}) == {"missing": None}
+
+
+def test_a_curriculum_restart_shares_its_source_game_s_split(trajectories):
+    """Review 2026-10-02 §2.3: a restart and its source must sit on one side."""
+    from dataclasses import replace
+
+    from games.welcome_to import curriculum
+
+    sources = list(trajectories)
+    restarts = [
+        replace(
+            source,
+            seed=900_000 + index,
+            searches=(),
+            restart=curriculum.Restart(
+                source_seed=source.seed, at=1, reshuffle_seed=index, distance=1, slot=0
+            ),
+        )
+        for index, source in enumerate(sources)
+    ]
+    for salt in ("a", "b", "c", "d", "e"):
+        train, val = s2_train.split_trajectories(sources + restarts, 0.4, seed=0, salt=salt)
+        held = {s2_train.split_family(game) for game in val}
+        trained = {s2_train.split_family(game) for game in train}
+        assert held.isdisjoint(trained)
+        assert all(s2_train.split_family(r) == r.restart.source_seed for r in restarts)
 
 
 def test_diagnostic_evaluation_set_is_bounded_and_order_independent(trajectories):
@@ -123,6 +149,13 @@ def test_s2_evaluation_uses_the_visit_distribution(trajectories):
         assert f"accuracy_{name}" in metrics
         assert f"positive_rate_{name}" in metrics
         assert f"r2_{name}" not in metrics
+        p = metrics[f"positive_rate_{name}"]
+        if 0.0 < p < 1.0:
+            # skill is measured against the constant predictor at that rate
+            assert metrics[f"brier_skill_{name}"] == pytest.approx(
+                1.0 - metrics[f"brier_{name}"] / (p * (1.0 - p))
+            )
+            assert f"bce_skill_{name}" in metrics
 
     # Recompute the soft-target cross entropy directly. The sampled action is
     # intentionally absent from this expression.
