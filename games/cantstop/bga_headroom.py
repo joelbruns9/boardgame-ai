@@ -40,17 +40,21 @@ from .luck import DEFAULT_LOG_DIR, after_move, at, load_game, read_turns
 from .snapshot import from_snapshot, snapshot
 
 AFTER_OPP_STOP, OTHER = "after_opponent_stop", "other_turns"
+ROLLED_AHEAD = "rolled_while_ahead"
 
 
-def collect_bga(log_dir, rules):
-    """Every viewer decision with a real choice, from fully logged games."""
+def collect_bga(log_dir, rules, viewer_only_logs=False):
+    """Every viewer decision with a real choice, from fully logged games
+    (and, with ``viewer_only_logs``, from logs without opponent turns: the
+    viewer's own turns are still exact there; only the category is not)."""
     rows = []
     for path in sorted(Path(log_dir).glob("table_*.jsonl")):
         try:
             game = load_game(path)
         except ValueError:
             continue
-        if not game.opponents_logged or game.captures[0].state.rules != rules:
+        if (not (game.opponents_logged or viewer_only_logs)
+                or game.captures[0].state.rules != rules):
             continue
         turns = read_turns(path, game)
         v = game.viewer_seat
@@ -80,12 +84,33 @@ def collect_bga(log_dir, rules):
     return rows
 
 
+def rolled_while_ahead(rows, evaluator, min_win=0.70, min_bust=0.15):
+    """Stop/roll decisions where the advisor rolled while the viewer was at
+    ``min_win`` or better and the next roll busts ``min_bust`` or more."""
+    from .luck import bust_probability
+    from .residual_control import SolverCache
+    solvers, out = SolverCache(evaluator), []
+    for r in rows:
+        if r["phase"] != "stop_roll":
+            continue
+        state = from_snapshot(r["snapshot"])
+        start = state.clone()
+        start.runners, start.phase = {}, Phase.AWAIT_ROLL
+        sv, rv = solvers(start).stop_roll(state)
+        if sv is None or rv is None:
+            continue
+        me, p = state.active_player, bust_probability(start, state.runners)
+        if rv[me] > sv[me] and rv[me] >= min_win and p >= min_bust:
+            out.append({**r, "category": ROLLED_AHEAD, "win": float(rv[me]), "bust_odds": p})
+    return out
+
+
 def pick(rows, seed, per_category):
     rng = random.Random(seed)
     out = []
-    for cat in (AFTER_OPP_STOP, OTHER):
+    for cat, n in per_category.items():
         pool = [r for r in rows if r["category"] == cat]
-        out += rng.sample(pool, min(per_category[cat], len(pool)))
+        out += rng.sample(pool, min(n, len(pool)))
     return out
 
 
@@ -93,7 +118,7 @@ def category_summary(positions):
     lines = ["| Turns | Decisions | Choice changed | Mean held-out gain (pp) | +/- (95%) |",
              "|---|---:|---:|---:|---:|"]
     out = {}
-    for cat in (AFTER_OPP_STOP, OTHER, "all"):
+    for cat in sorted({r["category"] for r in positions}) + ["all"]:
         rs = [r for r in positions if "result" in r and (cat == "all" or r["category"] == cat)]
         if not rs:
             continue
@@ -123,6 +148,10 @@ def main(argv=None):
     p.add_argument("--seed", type=int, default=2026100202)
     p.add_argument("--after-opponent-stop", type=int, default=50)
     p.add_argument("--other", type=int, default=30)
+    p.add_argument("--focus", choices=("categories", "rolled-ahead"), default="categories",
+                   help="rolled-ahead: only stop/roll decisions where the advisor rolled while "
+                        "the viewer was at 70%%+ and the next roll busts 15%%+")
+    p.add_argument("--rolled-ahead", type=int, default=60)
     p.add_argument("--samples", type=int, default=256)
     p.add_argument("--batch", type=int, default=128)
     p.add_argument("--threads", type=int, default=0)
@@ -149,12 +178,17 @@ def main(argv=None):
     from .model import NetEvaluator, load_net
     evaluator = NetEvaluator(load_net(args.checkpoint, device=args.device), device=args.device)
     if report is None:
-        rows = collect_bga(args.log_dir, rules)
+        if args.focus == "rolled-ahead":
+            rows = rolled_while_ahead(collect_bga(args.log_dir, rules, viewer_only_logs=True), evaluator)
+            per_category = {ROLLED_AHEAD: args.rolled_ahead}
+        else:
+            rows = collect_bga(args.log_dir, rules)
+            per_category = {AFTER_OPP_STOP: args.after_opponent_stop, OTHER: args.other}
         counts = defaultdict(int)
         for r in rows:
             counts[r["category"]] += 1
         print(f"collected {len(rows)} decisions: {dict(counts)}", flush=True)
-        chosen = pick(rows, args.seed, {AFTER_OPP_STOP: args.after_opponent_stop, OTHER: args.other})
+        chosen = pick(rows, args.seed, per_category)
         report = {"format": "cantstop-bga-headroom-v1", "status": "running", "signature": signature,
                   "configuration": cfg, "meta": identity(nets={"shared": args.checkpoint}, source_sha256=sources),
                   "collected": dict(counts), "positions": [], "turn_starts": [],
