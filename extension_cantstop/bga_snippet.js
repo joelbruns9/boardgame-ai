@@ -18,7 +18,10 @@ function captureCantStop(w = window, includeOpponents = false) {
   const players = {};
   for (const p of order) {
     const x = gd.players[p];
-    players[p] = {color: x.color, score: Number(x.score), name: String(x.name || p)};
+    // ``no`` is BGA's seat number (1 = starting player); playerorder is
+    // rotated to start at the viewer, so it cannot give the turn order's start.
+    players[p] = {color: x.color, score: Number(x.score), name: String(x.name || p),
+      no: Number(x.no ?? x.player_no ?? 0)};
   }
   const markers = [];
   for (const el of w.document.querySelectorAll(".tokenspace.token")) {

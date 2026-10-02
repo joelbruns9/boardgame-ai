@@ -219,3 +219,68 @@ def test_live_capture_stale_metadata_scores():
     for player in raw["players"].values():
         player.pop("score")
     assert adapter.state_key(parse_state(raw)) == adapter.state_key(state)
+
+
+# ---- every player's win probability (panel player list) ----
+
+@pytest.mark.parametrize("n", [2, 3, 4])
+@pytest.mark.parametrize("phase", ["diceChoice", "continueChoice"])
+def test_win_probabilities_match_the_turn_solver_for_every_seat(n, phase):
+    adapter = CantStopAdvisor(evaluator=ProgressHeuristic())
+    out = adapter.win_probabilities(wire(n, phase))
+    state = parse_state(wire(n, phase))
+    expected = RustTurnSolver(state, ProgressHeuristic()).value(state)
+    assert out["seats"] == pytest.approx(list(expected))
+    assert len(out["seats"]) == n and sum(out["seats"]) == pytest.approx(1.0)
+    assert out["active_seat"] == n - 1 and "player_ids" not in out
+
+
+def test_win_probabilities_share_the_advice_turn_solve():
+    adapter = CantStopAdvisor(evaluator=ProgressHeuristic())
+    options = {"table_id": "t1", "turn_id": "s:1"}
+    state = parse_state(wire())
+    adapter.open_search(state, RecommendRequest(max_sims=1, options=options)).advance(
+        1, threading.Event())
+    out = adapter.win_probabilities(wire(), options)
+    assert out["cache_hit"] and adapter.turn_cache.builds == 1
+
+
+def test_win_probabilities_name_the_bga_players_by_seat():
+    out = CantStopAdvisor(evaluator=ProgressHeuristic()).win_probabilities(capture())
+    assert out["player_ids"] == ["10", "20", "30"] and out["active_seat"] == 2
+    assert sum(out["seats"]) == pytest.approx(1.0)
+
+
+def test_win_probability_route(tmp_path):
+    import socket
+    import time
+    import urllib.error
+    import urllib.request
+    import uvicorn
+    from games.cantstop.web_app import build_app
+    app = build_app(CantStopAdvisor(evaluator=ProgressHeuristic()), log_dir=tmp_path)
+    sock = socket.socket(); sock.bind(('127.0.0.1', 0))
+    port = sock.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(app, log_level='error'))
+    worker = threading.Thread(target=server.run, kwargs={'sockets': [sock]}, daemon=True)
+    worker.start()
+    def post(body):
+        req = urllib.request.Request(f'http://127.0.0.1:{port}/api/cantstop/win_probabilities',
+                                     data=json.dumps(body).encode(),
+                                     headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return json.load(response)
+    try:
+        deadline = time.monotonic() + 10
+        while not server.started and time.monotonic() < deadline:
+            time.sleep(.02)
+        r = post({'state': capture(), 'options': {'table_id': 'a', 'turn_id': 'b'}})
+        assert r['player_ids'] == ['10', '20', '30'] and len(r['seats']) == 3
+        bad = capture(); bad['phase'] = 'endTurn'
+        with pytest.raises(urllib.error.HTTPError) as error:
+            post({'state': bad})
+        assert error.value.code == 400
+    finally:
+        server.should_exit = True
+        worker.join(timeout=10)
+        sock.close()

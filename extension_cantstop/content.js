@@ -8,7 +8,10 @@
   const diagnostics = [];
   let captureRetryTimer = null, captureKey = null, captureRetries = 0;
   let lastCapture = null, bridgeRequest = 0, bridgeTimer = null;
-  let panel, current, epoch = 0, status, rows, facts;
+  let panel, current, epoch = 0, status, rows, facts, players;
+  // Player win probabilities: their own sequence so a late answer for an old
+  // roll never overwrites a newer one, and independent of the advice epoch.
+  let winSeq = 0, winShownTurn = null;
   async function requestOnce(path, body) {
     let reply;
     let timer;
@@ -69,7 +72,7 @@
   function ensurePanel() {
     if (panel) return;
     panel = document.createElement("section"); panel.id = "cantstop-advisor-panel";
-    panel.innerHTML = '<header>Can’t Stop Advisor</header><div data-role="facts"></div>' +
+    panel.innerHTML = '<header>Can’t Stop Advisor</header><div data-role="players"></div><div data-role="facts"></div>' +
       '<label><input type="checkbox" data-role="opponents"> Evaluate opponents too</label>' +
       '<p data-role="status"></p><div data-role="rows"></div><footer><button data-action="retry">Refresh</button> <button data-action="export">Export capture</button></footer>';
     document.body.appendChild(panel);
@@ -82,6 +85,7 @@
     };
     status = panel.querySelector('[data-role="status"]');
     rows = panel.querySelector('[data-role="rows"]'); facts = panel.querySelector('[data-role="facts"]');
+    players = panel.querySelector('[data-role="players"]');
     panel.querySelector('[data-action="retry"]').onclick = () => { serverHealth = null; stopOld(); recapture(); };
     panel.querySelector('[data-action="export"]').onclick = () => {
       const report = JSON.stringify({...(current || lastCapture || {}),
@@ -139,6 +143,58 @@
       rows.appendChild(row);
     }
     status.textContent = "Estimated chance for the active player to win · " + snap.search_ms + " ms";
+  }
+  // Starting player first: BGA seat number when every player has one,
+  // otherwise the captured order.
+  function turnOrder(raw) {
+    const order = [...raw.playerorder];
+    if (order.every(p => Number(raw.players[p]?.no) > 0))
+      order.sort((a, b) => raw.players[a].no - raw.players[b].no);
+    return order;
+  }
+  function renderPlayers(raw, result) {
+    players.textContent = "";
+    for (const p of turnOrder(raw)) {
+      const seat = result.player_ids.indexOf(String(p));
+      const row = document.createElement("div");
+      row.className = "advisor-player" + (p === raw.active_player ? " advisor-player-active" : "");
+      const swatch = document.createElement("span");
+      swatch.className = "advisor-swatch";
+      swatch.style.background = "#" + String(raw.players[p]?.color || "888").replace(/^#/, "");
+      const name = document.createElement("span");
+      name.className = "advisor-player-name";
+      name.textContent = (raw.players[p]?.name || p) + (p === raw.viewer_player ? " (you)" : "");
+      const pct = document.createElement("span");
+      pct.className = "advisor-player-pct";
+      pct.textContent = seat < 0 ? "—" : (100 * result.seats[seat]).toFixed(1) + "%";
+      row.append(swatch); row.append(name); row.append(pct);
+      players.appendChild(row);
+    }
+    players.title = "Win chances " + (result.basis || "with best play assumed") +
+      " for everyone. Updates on each roll.";
+  }
+  // Every player's chances: refreshed on each roll (dice showing). A
+  // stop/roll decision keeps the roll's numbers, which already assumed the
+  // best choice -- unless nothing is shown yet for this turn.
+  async function updateWinProbs(raw) {
+    const turn = raw.table_id + "|" + raw.turn_id;
+    if (raw.phase !== "diceChoice" && winShownTurn === turn) return;
+    const seq = ++winSeq;
+    try {
+      const result = await requestOnce("/api/cantstop/win_probabilities", {state:raw,
+        options:{table_id:raw.table_id, turn_id:raw.turn_id}, device:"cuda"});
+      if (seq !== winSeq) return;
+      winShownTurn = turn;
+      renderPlayers(raw, result);
+    } catch (e) {
+      if (seq !== winSeq) return;
+      const why = e.status === 404
+        ? "the advisor server is an older version without this feature; restart it from the updated folder"
+        : String(e.message || e);
+      players.title = "Win chances not updated: " + why;
+      // Nothing shown yet: say so in the panel, not only in a tooltip.
+      if (!players.children.length) players.textContent = "Win chances unavailable — " + why;
+    }
   }
   function confirmPosition(raw, result) {
     window.postMessage({advisor:TAG, type:"validated_position", payload:{state:raw,
@@ -214,7 +270,11 @@
     if (type === "capture_ack" && payload?.request_id === bridgeRequest) {
       clearTimeout(bridgeTimer); bridgeTimer = null;
     }
-    if (type === "position") recommend(payload.state);
+    if (type === "position") {
+      ensurePanel();
+      updateWinProbs(payload.state);
+      recommend(payload.state);
+    }
     if (type === "idle") { stopOld(); current = null; if (status) status.textContent = "Previous options shown · waiting for a settled decision…"; }
     if (type === "capture_error") { stopOld(); ensurePanel(); status.textContent = payload.message; }
   });

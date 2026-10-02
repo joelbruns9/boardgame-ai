@@ -214,6 +214,33 @@ class CantStopAdvisor:
     def annotators(self):
         return []
 
+    def win_probabilities(self, payload, options=None, device="cuda"):
+        """Every seat's win probability at a captured decision, best play assumed.
+
+        After a roll (``diceChoice``) the value assumes the mover takes the best
+        pairing and then plays the rest of the turn optimally; at a
+        ``continueChoice`` it is the better of stopping and rolling on. Uses the
+        same per-turn cached solve as the move advice, so a recommendation for
+        the same table/turn costs no second solve. Seats are absolute engine
+        seats; a raw BGA capture also gets ``player_ids`` in that seat order.
+        """
+        from games.advisor.contract import RecommendRequest
+        state = parse_state(payload)
+        req = RecommendRequest(engine="auto", device=device,
+                               options=dict(options or {}))
+        with self._lock:
+            solver, cache_hit = self.solver_for(state, req)
+            values = solver.value(state)
+        out = {"seats": [float(v) for v in values],
+               "active_seat": state.active_player,
+               "cache_hit": cache_hit,
+               "basis": ("after roll, best play assumed"
+                         if state.phase == Phase.AWAIT_MOVE else
+                         "at the stop/roll decision, best play assumed")}
+        if payload.get("format") == "bga-cantstop-v1":
+            out["player_ids"] = [str(p) for p in payload["playerorder"]]
+        return out
+
     def contract(self):
         from .experiment import file_sha256
         return {"game_id": self.game_id, "wire_version": 1,
