@@ -43,7 +43,7 @@ class El {
   assert.match(p.textContent,/Win chances unavailable.*older version.*restart/);}
  winCalls.shift();
 
- // 1. An opponent's roll updates the list even with opponent advice off.
+ // 1. An opponent's roll updates the list.
  send("position",{state:raw});await drain();
  assert.equal(winCalls.length,1,"win request on an opponent's roll");
  assert.deepEqual(winCalls[0].body.options,{table_id:"t",turn_id:"s:1"});

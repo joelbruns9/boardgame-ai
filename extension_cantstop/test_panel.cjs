@@ -47,10 +47,23 @@ class El {
  assert.equal(rows.children.length,before,"full dice comparison remains visible");
  const group=rows.children[0];assert.equal(group.children.length,3);
  assert.match(group.children[0].textContent,/selected/);
- send("position",{state:{...raw,active_player:"other"}});await drain();assert.equal(nn,1);
- const toggle=panel.querySelector('[data-role="opponents"]');toggle.checked=true;toggle.onchange();
+ // Opponents are always evaluated and logged; the toggle (default on) only
+ // decides whether their options are displayed.
+ const logs=()=>requests.filter(r=>r.path==="/api/game_log").length;
+ const logged=logs();
+ send("position",{state:{...raw,active_player:"other"}});await drain();
+ assert.equal(nn,2,"opponent decision evaluated");
+ assert.equal(rows.children.length,1,"shown by default");
+ assert.equal(logs(),logged+1,"and logged");
+ const toggle=panel.querySelector('[data-role="opponents"]');
+ assert.equal(toggle.checked,true,"display option defaults on");
+ toggle.checked=false;toggle.onchange();
  normalized={phase:"diceChoice",active_player:1};
- send("position",{state:{...raw,active_player:"other"}});await drain();assert.equal(nn,2);
+ send("position",{state:{...raw,active_player:"other",turn_id:"opp-hidden"}});await drain();
+ assert.equal(nn,3,"still evaluated when hidden");
+ assert.equal(logs(),logged+2,"still logged when hidden");
+ assert.equal(rows.children.length,0,"hidden by the display option");
+ assert.match(panel.querySelector('[data-role="status"]').textContent,/hidden/);
  // A winning selection displays the guaranteed bank without a roll option.
  recs.splice(0, recs.length, {label:"Advance 8",kind:"move",rank:1,q_value:1,
   fields:{columns:[8],after_move:after,decision:"stop",wins_game:true}});
@@ -75,5 +88,5 @@ class El {
  send("position",{state:{...raw,turn_id:"refreshed",phase:"continueChoice"}});await drain();
  assert.equal(requests.filter(r=>r.path==="/health").length,2,"manual Refresh rechecks the server");
  send("capture_ack",{request_id:2});
- console.log("Panel integration passed: all branches retained, zero post-pick NN calls, opponent toggle");
+ console.log("Panel integration passed: all branches retained, zero post-pick NN calls, opponents always evaluated, display toggle");
 })().catch(e=>{console.error(e);process.exitCode=1;});

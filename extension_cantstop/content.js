@@ -4,7 +4,10 @@
   const api = typeof browser !== "undefined" ? browser : chrome;
   const TAG = "cantstop-advisor", HOST = "http://127.0.0.1:8765";
   let lastResult = null, lastResultTable = null, lastResultTurn = null;
-  let includeOpponents = false, serverHealth = null;
+  // Display option only: opponents' decisions are always evaluated (the win
+  // probabilities need their turn solve anyway) and logged; this decides
+  // whether their options are shown. Default on.
+  let showOpponents = true, serverHealth = null;
   const diagnostics = [];
   let captureRetryTimer = null, captureKey = null, captureRetries = 0;
   let lastCapture = null, bridgeRequest = 0, bridgeTimer = null;
@@ -73,14 +76,14 @@
     if (panel) return;
     panel = document.createElement("section"); panel.id = "cantstop-advisor-panel";
     panel.innerHTML = '<header>Can’t Stop Advisor</header><div data-role="players"></div><div data-role="facts"></div>' +
-      '<label><input type="checkbox" data-role="opponents"> Evaluate opponents too</label>' +
+      '<label><input type="checkbox" data-role="opponents"> Show opponents’ decisions</label>' +
       '<p data-role="status"></p><div data-role="rows"></div><footer><button data-action="retry">Refresh</button> <button data-action="export">Export capture</button></footer>';
     document.body.appendChild(panel);
     const opponents = panel.querySelector('[data-role="opponents"]');
-    opponents.checked = includeOpponents;
+    opponents.checked = showOpponents;
     opponents.onchange = () => {
-      includeOpponents = opponents.checked;
-      api.storage.local.set({cantstopEvaluateOpponents:includeOpponents}).catch(()=>{});
+      showOpponents = opponents.checked;
+      api.storage.local.set({cantstopShowOpponentDecisions:showOpponents}).catch(()=>{});
       stopOld(); recapture();
     };
     status = panel.querySelector('[data-role="status"]');
@@ -196,6 +199,19 @@
       if (!players.children.length) players.textContent = "Win chances unavailable — " + why;
     }
   }
+  function opponentHidden(raw) {
+    return !showOpponents && raw.viewer_player && raw.active_player !== raw.viewer_player;
+  }
+  // Render a result unless the display option hides this opponent decision.
+  function show(raw, result, selectedState = null) {
+    if (opponentHidden(raw)) {
+      rows.textContent = "";
+      status.textContent = "Opponent’s decision evaluated and logged · hidden (Show opponents’ decisions is off)";
+      return false;
+    }
+    render(result, selectedState);
+    return true;
+  }
   function confirmPosition(raw, result) {
     window.postMessage({advisor:TAG, type:"validated_position", payload:{state:raw,
       runners:(result.recommendations || []).filter(r => r.fields?.after_move)
@@ -205,13 +221,6 @@
     ensurePanel();
     current = raw; lastCapture = raw;
     const actor = raw.players[raw.active_player]?.name || raw.active_player;
-    if (!includeOpponents && raw.viewer_player && raw.active_player !== raw.viewer_player) {
-      stopOld();
-      facts.textContent = "Opponent’s turn · " + actor;
-      rows.textContent = "";
-      status.textContent = "Enable Evaluate opponents too to see this decision.";
-      return;
-    }
     const key = JSON.stringify(raw);
     if (key !== captureKey) { captureKey = key; captureRetries = 0; }
     const token = stopOld();
@@ -233,8 +242,8 @@
       const cached = lastResultTurn === raw.turn_id && findAdvisorContinuation(lastResult, lastResultTable, raw.table_id, normalized);
       if (cached) {
         confirmPosition(raw, lastResult);
-        render(lastResult, normalized);
-        status.textContent = "Dice selection marked above · all options retained from the same solve";
+        if (show(raw, lastResult, normalized))
+          status.textContent = "Dice selection marked above · all options retained from the same solve";
         return;
       }
       status.textContent = "Solving current turn…";
@@ -245,7 +254,7 @@
       if (!result.ok) throw new Error(result.error || "Advisor search failed");
       lastResult = result; lastResultTable = raw.table_id; lastResultTurn = raw.turn_id;
       confirmPosition(raw, result);
-      render(result);
+      show(raw, result);
       call("/api/game_log", {table_id:raw.table_id, state:normalized,
         extra:{capture:state, recommendation:result, contract:health.contract}}).catch(()=>{});
 
@@ -292,8 +301,8 @@
   }
   (async () => {
     try {
-      const stored = await api.storage.local.get("cantstopEvaluateOpponents");
-      includeOpponents = stored.cantstopEvaluateOpponents === true;
+      const stored = await api.storage.local.get("cantstopShowOpponentDecisions");
+      showOpponents = stored.cantstopShowOpponentDecisions !== false;
     } catch {}
     await loadBridge();
   })().catch(e => { ensurePanel(); status.textContent = e.message; });

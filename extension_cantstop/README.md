@@ -126,11 +126,27 @@ The panel's Refresh button retries without reloading BGA. Export capture now
 includes the last 30 request errors (endpoint, status, attempt, time, message).
 Run node extension_cantstop/test_requests.cjs for recovery checks.
 
+## Player win chances
+
+The top of the panel lists every player, starting player first (by BGA seat
+number), with their colour and chance to win; the player to move is
+highlighted. The numbers update on every roll by any player: the turn
+solver's value after the roll, assuming best play for the dice choice and the
+rest of the turn. A stop/roll decision keeps the roll's numbers. They assume
+everyone plays like the model from here, so against human tables they are
+"chances with best play", not a forecast of this table. Served by
+`/api/cantstop/win_probabilities`, sharing the turn solve the move advice uses.
+If the server lacks that route (an older advisor still running), the panel
+says so. Regression: node extension_cantstop/test_win_probs.cjs.
+
 ## Opponents and full choice comparisons
 
-Enable **Evaluate opponents too** to analyze the active opponent's decisions.
-This preference is remembered by the extension. Names identify whose decision
-is being evaluated; percentages always mean that active player's chance to win.
+Every player's decisions are always evaluated and logged: the player list at
+the top needs each opponent's turn solve anyway, and the BGA game log then
+holds every decision for later review. **Show opponents’ decisions** (on by
+default, remembered by the extension) only controls whether an opponent's
+options are displayed. Names identify whose decision is shown; percentages in
+the options always mean that active player's chance to win.
 Every distinct legal column selection is listed with separate Stop and Roll
 values. Equivalent dice pairings leading to the same column move are combined.
 An illegal stop is labeled blocked, never offered as a legal recommendation.
@@ -146,8 +162,7 @@ The first recommendation solves the reachable remainder of the active turn.
 Later dice rolls query that same server-side solution without evaluating the
 model again. HTTP requests still validate each new board and retrieve its choices;
 selecting dice continues to reuse the already displayed result in the browser.
-The bridge tags turns while observing every player's phases, even when opponent
-advice is disabled. Table, turn, saved board, rules, active player, and model
+The bridge tags turns while observing every player's phases. Table, turn, saved board, rules, active player, and model
 identity must match; runner regression or an unreachable position forces a new
 solve. Legacy requests without table_id and turn_id options remain uncached.
 The cache retains at most four turns and 100,000 positions, with a fixed 15-minute
