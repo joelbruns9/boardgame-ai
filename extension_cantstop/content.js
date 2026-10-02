@@ -90,10 +90,20 @@
     rows = panel.querySelector('[data-role="rows"]'); facts = panel.querySelector('[data-role="facts"]');
     players = panel.querySelector('[data-role="players"]');
     panel.querySelector('[data-action="retry"]').onclick = () => { serverHealth = null; stopOld(); recapture(); };
-    panel.querySelector('[data-action="export"]').onclick = () => {
+    panel.querySelector('[data-action="export"]').onclick = async () => {
+      // Page timing (timing_probe.js) lives in the page; ask the bridge for it.
+      const timing = await new Promise(resolve => {
+        const done = t => { window.removeEventListener("message", onDump); clearTimeout(timer); resolve(t); };
+        const onDump = e => {
+          if (e.source === window && e.data?.advisor === TAG && e.data.type === "timing_dump") done(e.data.payload);
+        };
+        const timer = setTimeout(() => done(null), 1000);
+        window.addEventListener("message", onDump);
+        window.postMessage({advisor:TAG, type:"timing_request"}, location.origin);
+      });
       const report = JSON.stringify({...(current || lastCapture || {}),
         advisor_diagnostics:diagnostics, advisor_status:status.textContent,
-        capture_is_current:!!current}, null, 2);
+        capture_is_current:!!current, page_timing:timing}, null, 2);
       let text = panel.querySelector("textarea");
       if (!text) {
         text = document.createElement("textarea");
@@ -289,7 +299,7 @@
   });
   // External extension assets avoid the legacy inline-script injection.
   async function loadBridge() {
-    for (const file of ["bga_snippet.js", "turn_identity.js", "page_bridge.js"]) {
+    for (const file of ["bga_snippet.js", "turn_identity.js", "timing_probe.js", "page_bridge.js"]) {
       await new Promise((resolve, reject) => {
         const el = document.createElement("script"); el.src = api.runtime.getURL(file);
         const timeout = setTimeout(() => { el.remove(); reject(new Error("Page bridge load timed out")); }, 5000);

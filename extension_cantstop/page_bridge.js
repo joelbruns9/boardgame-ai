@@ -2,6 +2,10 @@
 (() => {
   if (window.__cantstopBridge?.dispose) window.__cantstopBridge.dispose();
   const tag = "cantstop-advisor";
+  // One probe per page, surviving bridge reloads (see timing_probe.js).
+  // A probe that failed to load (or cannot run) must never stop capture.
+  const timing = window.__cantstopTiming ||= (typeof createCantStopTiming === "function"
+    ? createCantStopTiming(window, 20000) : {install() {}, record() {}, dump: () => null});
   const post = (type, payload) => window.postMessage({advisor: tag, type, payload}, location.origin);
   let pending = null, sent = null, since = 0, validated = null;
   const color = m => String(m.color).toLowerCase().replace(/^#/, "");
@@ -27,6 +31,7 @@
   function tick() {
     try {
       if (new URL(location.href).searchParams.has("testuser")) return;
+      try { timing.install(); } catch {}
       const gd = window.gameui?.gamedatas;
       const turn = turnIdentity({
         table_id: new URL(location.href).searchParams.get("table") || String(gd?.table_id || "unknown"),
@@ -37,11 +42,15 @@
       if (state) state.turn_id = turn;
       const signature = state ? JSON.stringify(state) : null;
       if (signature !== pending) {
+        timing.record("sig", {phase: state?.phase || null, active: state?.active_player || null});
         pending = signature; since = Date.now(); sent = null;
         post("idle", null); // invalidate old advice immediately, before settling
       }
-      if (signature && signature !== sent && Date.now()-since >= (fastPosition(state) ? 200 : 1200)) {
+      const fast = !!signature && fastPosition(state);
+      if (signature && signature !== sent && Date.now()-since >= (fast ? 200 : 1200)) {
         sent = signature;
+        timing.record("sent", {phase: state.phase, active: state.active_player, fast,
+          waited: Date.now() - since});
         post("position", {state, signature});
       }
     } catch (e) {
@@ -55,6 +64,7 @@
     if ((e.source !== window && e.source !== null) || e.origin !== location.origin) return;
     if (e.data?.advisor !== tag) return;
     if (e.data.type === "capture_unsettled") validated = null;
+    if (e.data.type === "timing_request") post("timing_dump", timing.dump());
     if (e.data.type === "validated_position") {
       const state = e.data.payload?.state;
       // Ignore late responses for a position the page has already left.

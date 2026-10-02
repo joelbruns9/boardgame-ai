@@ -126,6 +126,14 @@ The panel's Refresh button retries without reloading BGA. Export capture now
 includes the last 30 request errors (endpoint, status, attempt, time, message).
 Run node extension_cantstop/test_requests.cjs for recovery checks.
 
+Export capture also includes `page_timing` from the timing probe
+(timing_probe.js): when BGA enters each state, when board markers or dice
+change, and when the bridge first saw and finally read each board. It records
+only event names and times, never packet contents or chat. Summarise one or
+more exports with `python -m games.cantstop.timing_report <export.json>...` to
+size capture delays from measurement. Probe regression:
+node extension_cantstop/test_timing_probe.cjs.
+
 ## Player win chances
 
 The top of the panel lists every player, starting player first (by BGA seat

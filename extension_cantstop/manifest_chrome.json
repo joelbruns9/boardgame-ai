@@ -32,6 +32,7 @@
       "resources": [
         "bga_snippet.js",
         "turn_identity.js",
+        "timing_probe.js",
         "page_bridge.js"
       ],
       "matches": [
