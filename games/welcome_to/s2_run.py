@@ -52,7 +52,7 @@ from typing import Any, Optional, Sequence
 import torch
 
 from games.welcome_to import network as nw
-from games.welcome_to import s2_promotion, s2_train, self_play
+from games.welcome_to import paired_targets, s2_promotion, s2_train, self_play
 
 #: Generation metrics copied into ``progress.jsonl`` -- §11.2's strength
 #: signals plus the throughput and length context needed to read them.
@@ -188,6 +188,19 @@ def run_iteration(run: Path, iteration: int, args: argparse.Namespace) -> dict[s
             raise RuntimeError(f"generation for iteration {iteration} exited {code}")
         timings["generation_seconds"] = time.perf_counter() - started
 
+    if args.pairs_roots > 0 and not (directory / paired_targets.PAIRS_FILE).exists():
+        started = time.perf_counter()
+        paired_targets.build(
+            directory,
+            learner,
+            roots=args.pairs_roots,
+            alternatives=args.pairs_alternatives,
+            futures=args.pairs_futures,
+            seed=seed,
+            simulations=args.simulations,
+        )
+        timings["pairs_seconds"] = time.perf_counter() - started
+
     if not candidate.exists():
         resume = learner
         started = time.perf_counter()
@@ -198,6 +211,14 @@ def run_iteration(run: Path, iteration: int, args: argparse.Namespace) -> dict[s
             "--train-steps", str(args.train_steps),
             "--seed", str(seed),
             "--out", str(candidate),
+            *(
+                [
+                    "--pairs-weight", str(args.pairs_weight),
+                    "--pairs-window", str(args.pairs_window),
+                ]
+                if args.pairs_roots > 0
+                else []
+            ),
         ])
         if code != 0:
             raise RuntimeError(f"training for iteration {iteration} exited {code}")
@@ -230,6 +251,15 @@ def run_iteration(run: Path, iteration: int, args: argparse.Namespace) -> dict[s
     if gated:
         gate = json.loads(record.read_text(encoding="utf-8"))
         report = gate.get("report", gate)
+    pairs_line: dict[str, Any] = {}
+    if args.pairs_benchmark:
+        bench = paired_targets.benchmark(candidate, Path(args.pairs_benchmark))
+        pairs_line = {f"benchmark_{name}": value for name, value in bench.items()}
+    training_metrics = json.loads(
+        Path(str(candidate) + ".metrics.json").read_text(encoding="utf-8")
+    )
+    after = (training_metrics.get("pairs") or {}).get("after") or {}
+    pairs_line.update({f"pairs_val_{name}": value for name, value in after.items()})
     line = {
         "iteration": iteration,
         "gated": gated,
@@ -239,6 +269,7 @@ def run_iteration(run: Path, iteration: int, args: argparse.Namespace) -> dict[s
         "gate_candidate": report.get("candidate"),
         "gate_incumbent": report.get("incumbent"),
         **{name: generation.get(name) for name in _GENERATION_FIELDS},
+        **pairs_line,
         **timings,
     }
     with (run / "progress.jsonl").open("a", encoding="utf-8") as handle:
@@ -283,12 +314,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
     parser.add_argument(
         "--assist-fraction",
         type=float,
-        default=0.5,
+        default=0.0,  # 0.5 until 2026-10-02: the scaffold failed (v3_assist_01)
         help="share of iteration-1 games whose learner placements are assisted "
         "(placement_assist); decays linearly to 0 at --assist-end-iteration",
     )
     parser.add_argument("--assist-end-iteration", type=int, default=6)
     parser.add_argument("--assist-through", type=int, default=16)
+    parser.add_argument(
+        "--pairs-roots",
+        type=int,
+        default=0,
+        help="paired placement roots built per iteration (paired_targets.py); 0 = off",
+    )
+    parser.add_argument("--pairs-futures", type=int, default=48)
+    parser.add_argument("--pairs-alternatives", type=int, default=2)
+    parser.add_argument("--pairs-weight", type=float, default=1.0)
+    parser.add_argument("--pairs-window", type=int, default=4)
+    parser.add_argument(
+        "--pairs-benchmark",
+        help="sibling_probe dataset.pt whose held-out roots score every candidate",
+    )
     parser.add_argument("--inflight", type=int, default=256)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--seed", type=int, default=60_000)

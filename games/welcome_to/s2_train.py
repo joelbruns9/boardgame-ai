@@ -27,6 +27,7 @@ from torch.nn import functional as F
 
 from games.welcome_to import encoder as enc
 from games.welcome_to import network as nw
+from games.welcome_to import paired_targets
 from games.welcome_to import s2_replay
 from games.welcome_to import self_play
 from games.welcome_to import train as s0_train
@@ -49,6 +50,15 @@ class S2TrainConfig:
     log_every: int = 50
     max_eval_games: int = 256
     seed: int = 0
+    #: Paired placement targets (paired_targets.py). 0 disables them.
+    pairs_weight: float = 0.0
+    #: 25 and score-only: the 48-future sibling probe (2026-10-02) found
+    #: score-only fine-tuning generalised (clear-pair accuracy 69% -> 76%)
+    #: while adding the rank loss gave nothing over the shuffled control.
+    pairs_pair_weight: float = 25.0
+    pairs_rank_weight: float = 0.0
+    pairs_roots_per_step: int = 16
+    pairs_max_eval_roots: int = 300
 
     def __post_init__(self) -> None:
         if not 0.0 < self.val_fraction < 1.0:
@@ -432,6 +442,7 @@ def fit(
     replay_metrics: Optional[Mapping[str, Any]] = None,
     trajectory_iterations: Optional[Sequence[int]] = None,
     log: bool = True,
+    pairs: Optional[Sequence[dict]] = None,
 ) -> tuple[nw.WelcomeToNet, torch.optim.AdamW, dict[str, Any]]:
     """Train one S2 candidate for a fixed number of replay updates.
 
@@ -496,6 +507,23 @@ def fit(
         for group in optimizer.param_groups:
             group["lr"] = config.lr
             group["weight_decay"] = config.weight_decay
+
+    pairs_train: list[dict] = []
+    pairs_val: list[dict] = []
+    use_pairs = bool(pairs) and config.pairs_weight > 0.0
+    if use_pairs:
+        pairs_train, pairs_val = paired_targets.split(
+            pairs, config.val_fraction, config.val_split_salt
+        )
+        pairs_val = sorted(pairs_val, key=lambda r: (r["game_seed"], r["turn"]))[
+            : config.pairs_max_eval_roots
+        ]
+        if not pairs_train:
+            use_pairs = False
+    pairs_before = (
+        paired_targets.decision_metrics(net, pairs_val, torch_device) if use_pairs else None
+    )
+    pair_rng = random.Random(config.seed ^ 0x5041_4952)
 
     before = evaluate(net, val_set, torch_device)
     pretrain_newest = None
@@ -571,6 +599,21 @@ def fit(
             batch["global_scalars"],
         )
         total, parts = nw.losses(out, batch)
+        if use_pairs:
+            chosen = pair_rng.sample(
+                pairs_train, min(config.pairs_roots_per_step, len(pairs_train))
+            )
+            paired, paired_parts = paired_targets.paired_loss(
+                net,
+                chosen,
+                torch_device,
+                pair_weight=config.pairs_pair_weight,
+                rank_weight=config.pairs_rank_weight,
+            )
+            total = total + config.pairs_weight * paired
+            parts = {**parts, "paired": paired.detach(), **{
+                name: torch.tensor(value) for name, value in paired_parts.items()
+            }}
         if not torch.isfinite(total):
             raise FloatingPointError("S2 loss became non-finite")
         total.backward()
@@ -621,6 +664,9 @@ def fit(
         raise RuntimeError("training loader yielded more than the fixed step budget")
 
     after = evaluate(net, val_set, torch_device)
+    pairs_after = (
+        paired_targets.decision_metrics(net, pairs_val, torch_device) if use_pairs else None
+    )
     train_positions = sum(len(game.searches) for game in train_set)
     buffer_positions = sum(len(game.searches) for game in trajectories)
     replay = dict(replay_metrics or {})
@@ -655,6 +701,14 @@ def fit(
             "pretrain_newest_iteration": newest_iteration,
             "pretrain_newest_metrics": pretrain_newest,
             "replay": replay,
+            "pairs": {
+                "train_roots": float(len(pairs_train)),
+                "val_roots": float(len(pairs_val)),
+                "before": pairs_before,
+                "after": pairs_after,
+            }
+            if use_pairs
+            else None,
         }
     )
     return net, optimizer, metrics
@@ -764,6 +818,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
         "--max-eval-games", type=int, default=S2TrainConfig().max_eval_games
     )
     parser.add_argument("--seed", type=int, default=S2TrainConfig().seed)
+    parser.add_argument("--pairs-weight", type=float, default=0.0,
+                        help="weight of paired placement targets (paired_targets.py); 0 = off")
+    parser.add_argument("--pairs-window", type=int, default=4,
+                        help="iterations of pairs.pt files to train from")
+    parser.add_argument("--pairs-pair-weight", type=float, default=S2TrainConfig().pairs_pair_weight)
+    parser.add_argument("--pairs-rank-weight", type=float, default=S2TrainConfig().pairs_rank_weight)
+    parser.add_argument("--pairs-roots-per-step", type=int, default=S2TrainConfig().pairs_roots_per_step)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args(argv)
 
@@ -810,7 +871,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
         log_every=args.log_every,
         max_eval_games=args.max_eval_games,
         seed=args.seed,
+        pairs_weight=args.pairs_weight,
+        pairs_pair_weight=args.pairs_pair_weight,
+        pairs_rank_weight=args.pairs_rank_weight,
+        pairs_roots_per_step=args.pairs_roots_per_step,
     )
+    pairs = None
+    if args.pairs_weight > 0.0:
+        if not args.replay_root:
+            parser.error("--pairs-weight needs --replay-root")
+        through = args.replay_through_iteration or max(corpus.trajectory_iterations)
+        pairs = paired_targets.load_window(Path(args.replay_root), through, args.pairs_window)
+        print(f"paired targets: {len(pairs)} roots from the last {args.pairs_window} iterations")
     net, optimizer, metrics = fit(
         trajectories,
         net=net,
@@ -822,6 +894,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
         training_runs_completed=training_runs_completed,
         replay_metrics=corpus.metrics(),
         trajectory_iterations=corpus.trajectory_iterations,
+        pairs=pairs,
     )
     path = save_checkpoint(
         args.out, net, optimizer, config, metrics, source=source_name

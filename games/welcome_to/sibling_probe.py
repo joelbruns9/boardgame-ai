@@ -429,12 +429,14 @@ def score_decisions(values_by_root: list[np.ndarray], roots: list[dict], fit: in
         played_regrets.append(best - mean[0])
         uniform_regrets.append(best - mean.mean())
         # The ceiling: choose by the fit futures' own mean (labels, not a model).
-        oracle_regrets.append(best - mean[int(np.argmax(root["blend"][:, :fit].mean(axis=1)))])
+        if fit > 0:
+            oracle_regrets.append(best - mean[int(np.argmax(root["blend"][:, :fit].mean(axis=1)))])
         # The learner's final score: a steadier yardstick than the blend.
         score = root["scores"][:, fit:, 0].mean(axis=1)
         score_regrets.append(score.max() - score[int(np.argmax(values))])
         score_played.append(score.max() - score[0])
-        score_oracle.append(score.max() - score[int(np.argmax(root["scores"][:, :fit, 0].mean(axis=1)))])
+        if fit > 0:
+            score_oracle.append(score.max() - score[int(np.argmax(root["scores"][:, :fit, 0].mean(axis=1)))])
         for a, b in itertools.combinations(range(len(values)), 2):
             diff = truth[a] - truth[b]
             empirical = diff.mean()
