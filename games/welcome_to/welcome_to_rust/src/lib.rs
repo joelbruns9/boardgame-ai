@@ -87,13 +87,14 @@ pub struct RustGameState {
 impl RustGameState {
     /// `GameState.new(seed=..., config=...)` on the portable RNG (M0-B).
     #[new]
-    #[pyo3(signature = (seed, players=2, advanced=false, expert=false, solo_rules=true))]
+    #[pyo3(signature = (seed, players=2, advanced=false, expert=false, solo_rules=true, plan_ids=None))]
     fn new(
         seed: u64,
         players: usize,
         advanced: bool,
         expert: bool,
         solo_rules: bool,
+        plan_ids: Option<[usize; 3]>,
     ) -> PyResult<Self> {
         let config = Config {
             players,
@@ -103,7 +104,7 @@ impl RustGameState {
         };
         check_supported(&config)?;
         Ok(RustGameState {
-            inner: Game::new(seed, config).map_err(to_py)?,
+            inner: Game::new_with_plans(seed, config, plan_ids).map_err(to_py)?,
         })
     }
 

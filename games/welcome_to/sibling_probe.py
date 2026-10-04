@@ -132,13 +132,7 @@ def select_roots(
     rng = random.Random(seed)
     roots: list[Root] = []
     for trajectory in trajectories:
-        state = wr.RustGameState(
-            trajectory.engine_seed,
-            players=trajectory.players,
-            advanced=True,
-            expert=False,
-            solo_rules=False,
-        )
+        state = trajectory.new_rust_state()
         eligible: dict[int, list[tuple[int, object, int]]] = {}
         for decision, action in enumerate(trajectory.actions):
             if state.actor == 0 and state.is_macro_root and _is_write(action):

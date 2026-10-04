@@ -10,6 +10,8 @@ import pytest
 import torch
 
 from games.welcome_to import datagen
+from games.welcome_to import macro_codec as mc
+from games.welcome_to.game import GameState
 from games.welcome_to import network as nw
 from games.welcome_to import s2_throughput
 from games.welcome_to import self_play
@@ -687,3 +689,28 @@ def test_s2_weighted_opponent_pool_is_deterministic_and_respects_mass():
         )
     assert names == repeated
     assert names.count("current") > 5 * names.count("archive")
+
+
+def test_generation_reports_plan_completion_and_point_mix(generated):
+    """Plan and point metrics agree with a replay of the same games."""
+    trajectories, metrics = generated
+    states = []
+    for t in trajectories:
+        state = GameState.new(seed=t.engine_seed, config=t.config, rng_kind=t.rng)
+        for action in t.actions:
+            mc.apply_macro(state, action)
+        states.append(state)
+    dealt = {}
+    done = {}
+    for state in states:
+        for slot, pid in enumerate(state.plan_ids):
+            dealt[str(pid)] = dealt.get(str(pid), 0) + 1
+            done[str(pid)] = done.get(str(pid), 0) + (0 in state.plan_turns[slot])
+    assert metrics["plan_dealt_by_id"] == dict(sorted(dealt.items(), key=lambda kv: int(kv[0])))
+    for key, rate in metrics["plan_completion_by_id"].items():
+        assert rate == pytest.approx(done[key] / dealt[key])
+    assert sum(dealt.values()) == 3 * len(states)
+    parks = sum(s.score_breakdown(0).parks for s in states) / len(states)
+    assert metrics["learner_points_parks"] == pytest.approx(parks)
+    rates = [metrics[f"learner_{k}_plans_rate"] for k in ("two", "three")]
+    assert all(0.0 <= r <= 1.0 for r in rates)

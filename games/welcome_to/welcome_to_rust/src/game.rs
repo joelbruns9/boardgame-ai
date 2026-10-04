@@ -238,7 +238,19 @@ impl Game {
     // Construction
     // ──────────────────────────────────────────────────────────────────
     /// `welcometo::setupNewGame`, on the portable RNG (M0-B).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(seed: u64, config: Config) -> EngineResult<Game> {
+        Game::new_with_plans(seed, config, None)
+    }
+
+    /// `GameState.new(..., plan_ids=...)`: the plans are drawn as usual, then
+    /// replaced, so every later draw matches the un-forced game. Each forced
+    /// plan must come from its own stack.
+    pub fn new_with_plans(
+        seed: u64,
+        config: Config,
+        forced_plans: Option<[usize; 3]>,
+    ) -> EngineResult<Game> {
         if config.players < 1 {
             return Err(EngineError::Invalid("need at least one player".into()));
         }
@@ -255,6 +267,16 @@ impl Game {
         for (i, stack) in [1u8, 2, 3].into_iter().enumerate() {
             let choices = available_plan_ids(stack, config.advanced);
             plan_ids[i] = rng.choice(&choices);
+        }
+        if let Some(forced) = forced_plans {
+            for (i, stack) in [1u8, 2, 3].into_iter().enumerate() {
+                if !available_plan_ids(stack, config.advanced).contains(&forced[i]) {
+                    return Err(EngineError::Invalid(format!(
+                        "forced plans {forced:?} are not one legal plan per stack"
+                    )));
+                }
+            }
+            plan_ids = forced;
         }
 
         let sheets: Vec<Sheet> = (0..config.players).map(|_| Sheet::new()).collect();

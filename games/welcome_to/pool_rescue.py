@@ -189,7 +189,7 @@ class PoolAssistant:
 
 def plan_rows(trajectory: self_play.SelfPlayTrajectory) -> dict:
     """Per-game plan facts beyond hygiene_rescue.game_metrics."""
-    state = GameState.new(seed=trajectory.engine_seed, config=trajectory.config, rng_kind=trajectory.rng)
+    state = trajectory.new_python_state()
     for action in trajectory.actions:
         mc.apply_macro(state, action)
     pool_slots = [s for s, pid in enumerate(state.plan_ids) if pid in POOL_PLAN_IDS]

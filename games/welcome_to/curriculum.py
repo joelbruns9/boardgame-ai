@@ -77,6 +77,8 @@ class Restart:
     reshuffle_seed: int
     distance: int
     slot: int
+    #: The source game's forced City Plan deal, or ``()`` if it was natural.
+    plan_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if self.at <= 0:
@@ -95,6 +97,7 @@ class Candidate:
     distance: int
     slot: int
     prefix: tuple[int, ...]
+    plan_ids: tuple[int, ...] = ()
 
 
 def candidates(
@@ -113,13 +116,7 @@ def candidates(
     for trajectory in trajectories:
         if trajectory.restart is not None:
             continue
-        state = wr.RustGameState(
-            trajectory.seed,
-            players=trajectory.players,
-            advanced=True,
-            expert=False,
-            solo_rules=False,
-        )
+        state = trajectory.new_rust_state()
         first_decision_of_turn: dict[int, int] = {}
         for decision, action in enumerate(trajectory.actions):
             if state.turn not in first_decision_of_turn:
@@ -152,6 +149,7 @@ def candidates(
                         distance=distance,
                         slot=slot,
                         prefix=tuple(trajectory.actions[:at]),
+                        plan_ids=tuple(trajectory.plan_ids or ()),
                     )
                 )
     return out
@@ -202,6 +200,7 @@ def plan_restarts(
                 reshuffle_seed=reshuffle,
                 distance=candidate.distance,
                 slot=candidate.slot,
+                plan_ids=candidate.plan_ids,
             ),
             candidate.prefix,
         )

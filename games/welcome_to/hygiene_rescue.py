@@ -64,9 +64,7 @@ Assistant = placement_assist.Assistant
 
 def game_metrics(trajectory: self_play.SelfPlayTrajectory) -> dict[str, float]:
     """Per-deal outcomes, from a Python replay of the macro sequence."""
-    state = GameState.new(
-        seed=trajectory.engine_seed, config=trajectory.config, rng_kind=trajectory.rng
-    )
+    state = trajectory.new_python_state()
     log = training.ReplayLog(state)
     hygiene: Optional[list[tuple[float, int]]] = None
     for action in trajectory.actions:

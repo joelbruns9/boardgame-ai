@@ -48,7 +48,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 import numpy as np
 
@@ -321,8 +321,15 @@ class GameState:
         seed: Optional[int] = None,
         config: Optional[GameConfig] = None,
         rng_kind: str = DEFAULT_RNG_KIND,
+        plan_ids: Optional[Sequence[int]] = None,
     ) -> "GameState":
         """``welcometo::setupNewGame``.
+
+        ``plan_ids`` forces the City Plan deal (the plan-deal curriculum). The
+        plans are still drawn from the generator first and then replaced, so
+        every later random draw is the one the un-forced game would make: a
+        forced deal plays the same cards as its natural twin. Each forced plan
+        must come from its own stack -- the deal stays legal.
 
         ``rng_kind`` picks the engine generator.  ``"portable"`` is the default
         and is what the Rust engine reproduces; ``"cpython"`` replays a game
@@ -339,9 +346,18 @@ class GameState:
         deck = list(range(NUM_BASE_CARDS))
         rng.shuffle(deck)
 
-        plan_ids = tuple(
+        dealt = tuple(
             rng.choice(available_plan_ids(stack, config.advanced)) for stack in (1, 2, 3)
         )
+        if plan_ids is None:
+            plan_ids = dealt
+        else:
+            plan_ids = tuple(int(pid) for pid in plan_ids)
+            if len(plan_ids) != 3 or any(
+                pid not in available_plan_ids(stack, config.advanced)
+                for stack, pid in zip((1, 2, 3), plan_ids)
+            ):
+                raise ValueError(f"forced plans {plan_ids} are not one legal plan per stack")
 
         sheets = [Sheet.new() for _ in range(config.players)]
         groups = config.stack_groups

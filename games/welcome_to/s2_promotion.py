@@ -151,11 +151,7 @@ def normalized_rank(state: GameState, seat: int) -> float:
 
 
 def _game_metrics(trajectory: self_play.SelfPlayTrajectory) -> _GameMetrics:
-    state = GameState.new(
-        seed=trajectory.engine_seed,
-        config=trajectory.config,
-        rng_kind=trajectory.rng,
-    )
+    state = trajectory.new_python_state()
     for action in trajectory.actions:
         mc.apply_macro(state, action)
     if not state.is_terminal or tuple(state.scores()) != trajectory.scores:

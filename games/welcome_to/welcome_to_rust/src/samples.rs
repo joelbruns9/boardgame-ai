@@ -182,9 +182,10 @@ fn replay_history(
     terminal: &Game,
     actions: &[usize],
     restart: Option<RestartPoint>,
+    plan_ids: Option<[usize; 3]>,
 ) -> Result<ReplayHistory, EngineError> {
     let engine_seed = restart.map_or(seed, |(source, _, _)| source);
-    let mut game = Game::new(engine_seed, terminal.config)?;
+    let mut game = Game::new_with_plans(engine_seed, terminal.config, plan_ids)?;
     let players = terminal.config.players;
     let mut forced_refusals = vec![Vec::new(); players];
     let mut plan_deaths = vec![[None; 3]; players];
@@ -495,13 +496,14 @@ impl RustTrainingCapture {
         Ok(())
     }
 
-    #[pyo3(signature = (state, trajectory_json, actions, restart=None))]
+    #[pyo3(signature = (state, trajectory_json, actions, restart=None, plan_ids=None))]
     fn finish(
         &mut self,
         state: &RustGameState,
         trajectory_json: String,
         actions: Vec<usize>,
         restart: Option<RestartPoint>,
+        plan_ids: Option<[usize; 3]>,
     ) -> PyResult<RustTrainingGame> {
         if self.finished {
             return Err(PyRuntimeError::new_err(
@@ -515,7 +517,7 @@ impl RustTrainingCapture {
             return Err(PyValueError::new_err("restart point is outside the macro list"));
         }
         let history =
-            replay_history(self.seed, &state.inner, &actions, restart).map_err(to_py)?;
+            replay_history(self.seed, &state.inner, &actions, restart, plan_ids).map_err(to_py)?;
         let terminal = outcomes(&state.inner, &history).map_err(to_py)?;
         let roots = std::mem::take(&mut self.roots);
         let samples = roots

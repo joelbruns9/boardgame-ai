@@ -107,6 +107,10 @@ class SelfPlayTrajectory:
     #: :mod:`placement_assist` through this turn.  Search targets are still the
     #: search's own visits.
     assist_through: Optional[int] = None
+    #: A forced City Plan deal (plan-deal curriculum), one legal plan per
+    #: stack; ``None`` for a natural deal. A restart takes its deal from its
+    #: ``restart`` record instead.
+    plan_ids: Optional[tuple[int, int, int]] = None
     version: int = FORMAT_VERSION
     _sample_source: Any = field(default=None, repr=False, compare=False)
 
@@ -135,9 +139,42 @@ class SelfPlayTrajectory:
                 raise ValueError("a curriculum game has a search target in its prefix")
 
     @property
+    def engine_plan_ids(self) -> Optional[tuple[int, ...]]:
+        """The forced deal the engine is built with, or ``None`` (natural)."""
+        if self.restart is not None:
+            return self.restart.plan_ids or None
+        return self.plan_ids
+
+    def new_python_state(self) -> GameState:
+        """The Python engine at this game's start (seed, config, forced deal)."""
+        return GameState.new(
+            seed=self.engine_seed,
+            config=self.config,
+            rng_kind=self.rng,
+            plan_ids=self.engine_plan_ids,
+        )
+
+    def new_rust_state(self):
+        """The Rust engine at this game's start (seed, config, forced deal)."""
+        plans = self.engine_plan_ids
+        return wr.RustGameState(
+            self.engine_seed,
+            players=self.players,
+            advanced=True,
+            expert=False,
+            solo_rules=False,
+            plan_ids=None if plans is None else list(plans),
+        )
+
+    @property
     def engine_seed(self) -> int:
         """The seed the engine is built from: the source game's, for a restart."""
         return self.seed if self.restart is None else self.restart.source_seed
+
+    @property
+    def rust_plan_ids(self) -> Optional[list[int]]:
+        plans = self.engine_plan_ids
+        return None if plans is None else list(plans)
 
     @property
     def rust_restart(self) -> Optional[tuple[int, int, int]]:
@@ -164,6 +201,7 @@ class SelfPlayTrajectory:
             "rng": self.rng,
             "restart": None if self.restart is None else asdict(self.restart),
             "assist_through": self.assist_through,
+            "plan_ids": None if self.plan_ids is None else list(self.plan_ids),
             "version": self.version,
         }
         return json.dumps(raw, separators=(",", ":"))
@@ -192,7 +230,15 @@ class SelfPlayTrajectory:
             restart=(
                 None
                 if raw.get("restart") is None
-                else curriculum.Restart(**{k: int(v) for k, v in raw["restart"].items()})
+                else curriculum.Restart(
+                    **{
+                        k: (tuple(int(x) for x in v) if k == "plan_ids" else int(v))
+                        for k, v in raw["restart"].items()
+                    }
+                )
+            ),
+            plan_ids=(
+                None if raw.get("plan_ids") is None else tuple(int(x) for x in raw["plan_ids"])
             ),
             assist_through=(
                 None if raw.get("assist_through") is None else int(raw["assist_through"])
@@ -313,6 +359,7 @@ class _LiveGame:
     capture: object
     restart: Optional[curriculum.Restart] = None
     assist_through: Optional[int] = None
+    plan_ids: Optional[tuple[int, ...]] = None
     assisted_decisions: int = 0
     assisted_changes: int = 0
     learner_decisions: int = 0
@@ -403,11 +450,7 @@ def replay(trajectory: SelfPlayTrajectory) -> Iterator[datagen.Sample]:
     if trajectory._sample_source is not None:
         yield from trajectory._sample_source.samples()
         return
-    state = GameState.new(
-        seed=trajectory.engine_seed,
-        config=trajectory.config,
-        rng_kind=trajectory.rng,
-    )
+    state = trajectory.new_python_state()
     targets = {target.decision: target for target in trajectory.searches}
     visits = []
     log = training.ReplayLog(state)
@@ -815,6 +858,7 @@ def validate_resume(
     config: SelfPlayConfig,
     restarts: Mapping[int, tuple[curriculum.Restart, tuple[int, ...]]] = {},
     assisted: Mapping[int, int] = {},
+    forced_plans: Mapping[int, tuple[int, ...]] = {},
 ) -> frozenset[int]:
     """Prove persisted games belong to this exact seed/seat-count schedule,
     and each is the ordinary, curriculum or assisted game the plans say."""
@@ -848,6 +892,11 @@ def validate_resume(
         if trajectory.assist_through != assisted.get(trajectory.seed):
             raise ValueError(
                 f"resume seed {trajectory.seed} disagrees with the assist plan"
+            )
+        planned_deal = forced_plans.get(trajectory.seed)
+        if trajectory.plan_ids != (None if planned_deal is None else tuple(planned_deal)):
+            raise ValueError(
+                f"resume seed {trajectory.seed} disagrees with the forced-deal plan"
             )
     return frozenset(seen)
 
@@ -1126,6 +1175,7 @@ def _new_live(
     all_full_search: bool = False,
     restart: Optional[tuple[curriculum.Restart, tuple[int, ...]]] = None,
     assist_through: Optional[int] = None,
+    plan_ids: Optional[tuple[int, ...]] = None,
 ) -> _LiveGame:
     assignment = PortableRng((seed ^ _POOL_DOMAIN) & _MASK64)
     population = list(range(len(opponents)))
@@ -1146,12 +1196,15 @@ def _new_live(
         # says the whole divergence problem lives. Same repair as
         # ``portable_rng.derive_search_seed``: one draw of the stream itself.
         rngs.append(PortableRng(derive_seat_stream(seed, seat)))
+    if restart is not None:
+        plan_ids = restart[0].plan_ids or None
     state = wr.RustGameState(
         seed if restart is None else restart[0].source_seed,
         players=players,
         advanced=True,
         expert=False,
         solo_rules=False,
+        plan_ids=None if plan_ids is None else list(plan_ids),
     )
     actions: list[int] = []
     if restart is not None:
@@ -1177,8 +1230,65 @@ def _new_live(
         capture=wr.RustTrainingCapture(seed),
         restart=None if restart is None else restart[0],
         assist_through=assist_through,
+        plan_ids=None if restart is not None or plan_ids is None else tuple(plan_ids),
         all_full_search=all_full_search,
     )
+
+
+_POINT_COMPONENTS: tuple[str, ...] = (
+    "parks", "pools", "estates", "plans", "temp", "bis", "permits", "roundabouts",
+)
+#: Plan and scoring metrics (2026-10-03): what the model has learned to do.
+_PLAN_POINT_METRICS: tuple[str, ...] = (
+    "learner_plans_per_game",
+    "learner_two_plans_rate",
+    "learner_three_plans_rate",
+    "plan_completion_by_id",
+    "plan_dealt_by_id",
+    *(f"learner_points_{name}" for name in _POINT_COMPONENTS),
+)
+
+
+def _plan_and_point_metrics(final_states: Sequence[GameState]) -> dict[str, Any]:
+    """The learner's plans and score composition, per game.
+
+    * per plan id: how often it was dealt and how often the learner completed
+      it -- which plans the model can and cannot do;
+    * how often the learner finished exactly two, or all three, plans -- the
+      race to a plan ending;
+    * the mean points per scoring component (penalties as positive costs),
+      so the point mix can be compared across iterations.
+    """
+    if not final_states:
+        return {}
+    dealt: dict[str, int] = {}
+    done: dict[str, int] = {}
+    counts = []
+    points = {name: 0.0 for name in _POINT_COMPONENTS}
+    for state in final_states:
+        completed = 0
+        for slot, plan_id in enumerate(state.plan_ids):
+            key = str(plan_id)
+            dealt[key] = dealt.get(key, 0) + 1
+            if LEARNER_SEAT in state.plan_turns[slot]:
+                done[key] = done.get(key, 0) + 1
+                completed += 1
+        counts.append(completed)
+        breakdown = state.score_breakdown(LEARNER_SEAT)
+        for name in _POINT_COMPONENTS:
+            points[name] += getattr(breakdown, name)
+    games = len(final_states)
+    return {
+        "learner_plans_per_game": sum(counts) / games,
+        "learner_two_plans_rate": sum(c == 2 for c in counts) / games,
+        "learner_three_plans_rate": sum(c == 3 for c in counts) / games,
+        "plan_dealt_by_id": dict(sorted(dealt.items(), key=lambda kv: int(kv[0]))),
+        "plan_completion_by_id": {
+            key: done.get(key, 0) / count
+            for key, count in sorted(dealt.items(), key=lambda kv: int(kv[0]))
+        },
+        **{f"learner_points_{name}": value / games for name, value in points.items()},
+    }
 
 
 #: :func:`_summary` fields that measure play rather than throughput; reported
@@ -1198,6 +1308,7 @@ _STRENGTH_METRICS: tuple[str, ...] = (
     "identical_games",
     "mean_first_divergence_turn",
     "mean_score_spread",
+    *_PLAN_POINT_METRICS,
 )
 
 
@@ -1270,6 +1381,7 @@ def _summary(
         )
         / seats,
         "temps_per_seat_game": sum(sheet.temps for sheet in sheets) / seats,
+        **_plan_and_point_metrics(final_states),
     }
     metrics.update(training.diversity_report(list(final_states)))
     for players in (2, 3, 4):
@@ -1326,6 +1438,7 @@ def generate(
     restarts: Mapping[int, tuple[curriculum.Restart, tuple[int, ...]]] = {},
     move_override: Optional[Callable[[object, int], int]] = None,
     assisted: Mapping[int, int] = {},
+    forced_plans: Mapping[int, tuple[int, ...]] = {},
 ) -> tuple[list[SelfPlayTrajectory], dict[str, Any]]:
     """Generate a continuously replenished batch of learner-only S2 games.
 
@@ -1402,6 +1515,8 @@ def generate(
         raise ValueError(f"restarts/assists name seeds outside this run: {sorted(stray)[:8]}")
     if set(restarts) & set(assisted):
         raise ValueError("a curriculum game is never placement-assisted")
+    if set(forced_plans) - requested_seeds or set(forced_plans) & set(restarts):
+        raise ValueError("forced deals must name ordinary games of this run")
     jobs = [job for job in jobs if job[0] not in skip_seeds]
     if not jobs:
         raise ValueError("no pending S2 games remain after applying skip_seeds")
@@ -1443,6 +1558,7 @@ def generate(
             all_full_search=seed in all_full_seeds,
             restart=restarts.get(seed),
             assist_through=assisted.get(seed),
+            plan_ids=forced_plans.get(seed),
         )
         next_job += 1
 
@@ -1613,12 +1729,14 @@ def generate(
                 prune_roundabout_pass=search_config.prune_roundabout_pass,
                 restart=game.restart,
                 assist_through=game.assist_through,
+                plan_ids=game.plan_ids,
             )
             captured = game.capture.finish(
                 game.state,
                 trajectory.to_json(),
                 list(game.actions),
                 trajectory.rust_restart,
+                trajectory.rust_plan_ids,
             )
             if on_captured is not None:
                 on_captured(trajectory, captured)
@@ -1643,6 +1761,7 @@ def generate(
                     all_full_search=seed in all_full_seeds,
                     restart=restarts.get(seed),
                     assist_through=assisted.get(seed),
+                    plan_ids=forced_plans.get(seed),
                 )
                 next_job += 1
             else:
@@ -1672,7 +1791,9 @@ def generate(
     natural = [
         (trajectory, state)
         for trajectory, state in zip(trajectories, final_states)
-        if trajectory.restart is None and trajectory.assist_through is None
+        if trajectory.restart is None
+        and trajectory.assist_through is None
+        and trajectory.plan_ids is None
     ]
     metrics["natural_games"] = float(len(natural))
     if natural and len(natural) != len(trajectories):
