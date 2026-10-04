@@ -30,6 +30,9 @@ PROSE_ONLY = {
     "--fit-on",
     "--out",
     "--calibrate",
+    # A flag of the F4 sweep (`f4_staged_sweep`), quoted where `--emit-config`
+    # explains how the sweep buys back its cost.
+    "--sims-divisor",
 }
 
 

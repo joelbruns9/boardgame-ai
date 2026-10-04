@@ -36,8 +36,18 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def load(table: str, row: int):
+def log_path(table: str):
+    """One captured table, or a skip: a worktree can hold a log directory
+    without the particular games these tests were written against."""
+
     path = LOG_DIR / f"table_{table}.jsonl"
+    if not path.exists():
+        pytest.skip(f"BGA game log {path.name} is not present")
+    return path
+
+
+def load(table: str, row: int):
+    path = log_path(table)
     rows = [
         json.loads(line)
         for line in path.read_text(encoding="utf-8").splitlines()
@@ -239,7 +249,7 @@ def test_duplicate_observations_are_collapsed():
     """The logs repeat identical observations; counting them twice inflates the
     corpus. `907773062` is the known offender."""
 
-    path = LOG_DIR / f"table_{SCIENCE_TABLE}.jsonl"
+    path = log_path(SCIENCE_TABLE)
     rows = [
         json.loads(line)
         for line in path.read_text(encoding="utf-8").splitlines()

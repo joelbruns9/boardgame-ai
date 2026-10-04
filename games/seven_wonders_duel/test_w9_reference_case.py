@@ -41,6 +41,16 @@ def evaluator():
     return Evaluator(build_model("transformer", 32, 1), "cpu")
 
 
+def _stand_in_checkpoint(tmp_path):
+    """A file for the artifact to fingerprint. The evaluator is stubbed, so the
+    real candidate_0085.pt (untracked, absent from fresh worktrees) was only
+    ever hashed here, never loaded."""
+
+    path = tmp_path / "candidate_stand_in.pt"
+    path.write_bytes(b"stand-in checkpoint")
+    return path
+
+
 def _args(**overrides):
     argv = []
     for key, value in overrides.items():
@@ -246,7 +256,7 @@ def test_smoke_run_writes_a_complete_artifact(tmp_path, monkeypatch, evaluator):
     out = tmp_path / "smoke.json"
     monkeypatch.setattr(
         w9, "load_evaluator_for",
-        lambda args: (evaluator, w9.REPO_ROOT / "extension_7wd/candidate_0085.pt"),
+        lambda args: (evaluator, _stand_in_checkpoint(tmp_path)),
     )
     assert w9.main(["--smoke", "--quiet", "--out", str(out)]) == 0
 
@@ -274,7 +284,7 @@ def test_stage_selection_omits_unrequested_sections(tmp_path, monkeypatch, evalu
     out = tmp_path / "walk_only.json"
     monkeypatch.setattr(
         w9, "load_evaluator_for",
-        lambda args: (evaluator, w9.REPO_ROOT / "extension_7wd/candidate_0085.pt"),
+        lambda args: (evaluator, _stand_in_checkpoint(tmp_path)),
     )
     assert w9.main(
         ["--smoke", "--quiet", "--stages", "walk", "--out", str(out)]
@@ -295,7 +305,7 @@ def test_summary_out_is_the_small_committable_half(tmp_path, monkeypatch, evalua
     full, summary_path = tmp_path / "full.json", tmp_path / "summary.json"
     monkeypatch.setattr(
         w9, "load_evaluator_for",
-        lambda args: (evaluator, w9.REPO_ROOT / "extension_7wd/candidate_0085.pt"),
+        lambda args: (evaluator, _stand_in_checkpoint(tmp_path)),
     )
     assert w9.main(
         ["--smoke", "--quiet", "--out", str(full), "--summary-out", str(summary_path)]

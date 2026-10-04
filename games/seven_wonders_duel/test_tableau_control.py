@@ -48,8 +48,12 @@ LOG_DIR = REPO_ROOT / "runs/seven_wonders_duel/bga_game_log"
 FIXTURES = REPO_ROOT / "games/seven_wonders_duel/fixtures/control_positions.json"
 _INF = 99
 
+#: The captured tables the engine-parity tests replay. Checked file by file:
+#: a worktree can hold a log directory with other games in it.
+NEEDED_TABLES = ("908370787", "907773062")
 needs_logs = pytest.mark.skipif(
-    not LOG_DIR.exists(), reason="BGA game logs are not present"
+    not all((LOG_DIR / f"table_{t}.jsonl").exists() for t in NEEDED_TABLES),
+    reason="the BGA game logs these fixtures came from are not present",
 )
 
 
