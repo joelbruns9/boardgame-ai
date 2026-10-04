@@ -1069,6 +1069,33 @@ through separate heads; it is blended into the main target here so a running
 model adopts it without a shape change. Applies to cached examples at the next
 derivation (it is computed from the record, not stored in it).
 
+### `--value-target-contract`
+
+**Default:** `g2`. **Values:** `g2`, `legacy`
+
+What each value head is trained toward, per kind of evidence
+(`MODEL_GROWTH_PLAN.md` G2, `train.value_targets`). Under `g2`:
+
+- **Exact (chance-free) proof** -> the proven W/D/L replaces the target of BOTH
+  the flat value head and W4's hierarchical outcome. A proof settles who wins,
+  not how: W4's type factor keeps the realised type given the realised outcome
+  (still a valid sample of that conditional) and never takes one from a proof.
+- **Expectimax proof** -> only its expected utility `P(win) - P(loss)` is
+  supervised (binary cross-entropy against `P(win) + P(draw)/2`), on both heads.
+  The old `(win, 0, loss)` mapping also forced the draw mass to zero.
+- **Certain win** (`dataset.certain_win_moves`: every remaining move of the game
+  is the winner's and none but the last triggered a chance event) -> exact
+  outcome AND the recorded victory type, nothing blended in. Derived from the
+  record by both backends, so it applies to re-derived old buffers.
+- `--short-term-value-weight` and the solver row weights now reach W4's outcome
+  too.
+
+`legacy` is run07's objective: W4 trained only on the realised joint class
+blended with `--outlook-bootstrap`, expectimax proofs as `(win, 0, loss)`, no
+certain-win rows. It is the A/B arm (G5). Training logs
+`sampled_certain_win_rows` per window. Validation is unchanged by the contract
+(proofs are off there and a certain row's exact target equals its realised one).
+
 ### `--value-weight`
 
 **Default:** `1.0` (historical). **Value:** positive float
@@ -1736,6 +1763,16 @@ action legality, mask hashes, actors, resolved chance outcomes, final result --
 but the stored trajectory and final digests go unchecked for those rows, and it
 warns once per source when it happens. Running `--derive-backend python` once
 gives the full preflight if a buffer's provenance is uncertain.
+
+### `--cuda-graphs`, `--no-cuda-graphs`
+
+**Default:** off.
+
+Replays the evaluator forward as CUDA graphs: each batch is padded to a bucket
+and ~520 kernel launches become one replay. Within bf16 noise of the eager
+forward, not bit-identical. run07 passed it but almost certainly ran eager
+(concurrent-shard capture failed and self-disabled silently); fixed in
+`9fe6512`. Check the run log for graph capture before trusting it is on.
 
 ### `--gate-backend`
 
@@ -3023,6 +3060,11 @@ products, `P(outcome) * P(type | outcome)`, so the two are one object.
 | `--hierarchical-value` / `--no-hierarchical-value` | off | build the head. Shadow only: `value` and `joint7` stay authoritative for search. |
 | `--hierarchical-value-detach` / `--no-...` | **on** | learn from a stop-gradient readout |
 | `--hier-value-weight` | see below | loss weight |
+| `--outlook-bootstrap` | `0.0` | blend weight of search's seven-way root outlook into W4's target (the `--value-bootstrap` of victory type); 0 keeps the realised class |
+| `--outlook-bootstrap-games` | `0` | games over which `--outlook-bootstrap` ramps up from zero while a fresh head is untrained (0 = full from the start) |
+
+What W4 trains toward on proof and certain-win rows is set by
+`--value-target-contract` (G2).
 
 `--hier-value-weight` resolves to 0 without the head, to
 **`value_weight x aux_weight`** in the replacement arm, and to 0.15 otherwise.
@@ -3123,6 +3165,9 @@ gate is trained.
 | `--action-residual` / `--no-action-residual` | off | build the shared contextual action scorer. Off means the model has no scorer parameters at all, not a scorer that is ignored. |
 | `--action-policy-weight` | see `ACTION_POLICY_WEIGHT_DEFAULT` | weight on the scorer's independent action-policy loss. This is what trains the scorer while it is shadowed; it is masked to the legal set, so illegal actions cannot absorb probability. |
 | `--train-action-gate` / `--no-train-action-gate` | off | let the gate move. While off the served policy is exactly the inherited one, whatever the scorer has learned. Turning it on is the moment W5a can change play, and should be a deliberate arm rather than a default. |
+| `--fit-action-alpha` / `--no-fit-action-alpha` | off | after each training step set W5's served weight to the value that best predicts HELD-OUT search targets, instead of training the gate (AdamW moves it only ~0.01/iteration). Requires `--action-residual`. |
+| `--action-alpha-max` | `2.0` | ceiling on the fitted weight, built into the model as its gate ceiling; above 1 lets W5 outvote the flat head |
+| `--action-alpha-step` | `0.1` | largest change to the fitted weight per iteration |
 
 Requiring `--action-policy-weight > 0` without `--action-residual` is refused:
 the weight would silently do nothing, which reads as a configured run and is not

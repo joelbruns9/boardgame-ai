@@ -44,6 +44,10 @@ pub(crate) struct DerivedGame {
     move_legal_offsets: Vec<u8>,
     move_legal_actions: Vec<u8>,
     move_actors: Vec<u8>,
+    /// Chance events each move triggered, one u8 per move (G2: a win the
+    /// mover reached with no chance in between is certain, see
+    /// `dataset.certain_win_moves`).
+    move_chance_counts: Vec<u8>,
     ending_age: u8,
     max_absolute_track: i32,
     sixth_science_symbol: bool,
@@ -133,6 +137,8 @@ fn derive_one(mut spec: DeriveSpec) -> Result<DerivedGame, String> {
         }
         let events = self_play::actual_chance_outcomes(&spec.state, action, move_index)
             .map_err(|error| format!("move {move_index}: {error}"))?;
+        out.move_chance_counts
+            .push(u8::try_from(events.len()).map_err(|_| format!("move {move_index}: chance count overflow"))?);
         actual_chance.extend(
             events
                 .into_iter()
@@ -290,6 +296,10 @@ pub(crate) fn to_python(py: Python<'_>, games: Vec<DerivedGame>) -> PyResult<Vec
                 packed_bytes(py, &game.move_legal_actions),
             )?;
             payload.set_item("move_actors", packed_bytes(py, &game.move_actors))?;
+            payload.set_item(
+                "move_chance_counts",
+                packed_bytes(py, &game.move_chance_counts),
+            )?;
             let stats = PyDict::new(py);
             stats.set_item("ending_age", game.ending_age)?;
             stats.set_item("max_absolute_track", game.max_absolute_track)?;

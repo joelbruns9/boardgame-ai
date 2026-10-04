@@ -222,6 +222,31 @@ Contract:
   player's frame" (not "> 0.95"), checked through Python derivation, Rust
   derivation, packed batches, loss construction, and deployed head selection.
 
+**BUILT 2026-10-04** (`--value-target-contract g2`, default; `legacy` = run07's
+objective, the G5 arm). `train.value_targets` builds every head's target in one
+place; tests in `test_g2_value_contract.py`.
+
+- W4's loss is split into its factors, outcome + type-given-outcome (exactly the
+  old joint NLL under `legacy`). The outcome factor now takes the proofs, the
+  short-term term and the solver row weights.
+- Expectimax proof -> expected utility only, both heads: BCE of `(1+v)/2`
+  against `P(win) + P(draw)/2`, indifferent to draw mass.
+- **Certain win** = `dataset.certain_win_moves`: every remaining move is the
+  winner's and none but the last triggered chance. Exact outcome and recorded
+  type, nothing blended. Computed from the record by both backends (Rust derive
+  now returns per-move chance counts), so re-derived run07 buffers get it.
+  Missed immediate wins are NOT detected (audit: all 54 were taken); certain-win
+  fast moves are not newly retained (G1's cap only).
+- Deviation from the bullet above: a proof does not MASK W4's type. The
+  realised type given the realised outcome is still a valid sample of that
+  conditional; masking would drop type supervision on ~26% of rows.
+- Measured on run07 iters 60 / 100 (1,000 games each, G1 cap 4): 18,384 /
+  18,491 rows; exact proofs 1,186 / 1,298; expectimax 3,804 / 3,909; certain
+  wins 306 / 347 (types civ/sci/mil 93/121/92 and 133/132/82; 86-90% also have a
+  proof); short-term newly reaches W4 on ~13.3k rows.
+- Validation numbers are unchanged by the contract (proofs off there; a certain
+  row's exact target equals its realised one).
+
 ## G3 -- Controlled decisive-pattern sampling
 
 Recipe to start from (Braun 4.2.4, KataGo policy-surprise weighting): 70% of

@@ -200,6 +200,11 @@ class Example:
     #: `root_outlook` are dropped), so its value target is the proof plus the
     #: realised outcome. Counted per sampled batch in `train_steps`.
     retained_proof: bool = False
+    #: G2: the actor reaches the recorded win from this position by its own
+    #: moves alone, with no chance event in between (`certain_win_moves`), so
+    #: the outcome AND the victory type (`joint7_class`) are exact, not a
+    #: sample. The loss replaces every blended target with them.
+    certain_win: bool = False
 
     def __post_init__(self) -> None:
         """Make the arrays read-only as well as the fields.
@@ -684,6 +689,44 @@ def retained_proof_moves(record, cap: int) -> set[int]:
     return {proven[int(k * step)] for k in range(cap)}
 
 
+def certain_win_moves(record, chance_counts) -> set[int]:
+    """Move indices from which the game's winner reaches the recorded win alone.
+
+    G2's "certain immediate win": the rows at the END of a game where every
+    remaining move is the winner's own (an extra turn, a pending choice, the
+    winning build itself) and none of those moves but the last triggered a
+    chance event. From such a position the win is guaranteed by the line the
+    winner actually played, so the outcome is exact rather than one sample, and
+    the recorded victory type is a type the winner can force. A chance event
+    inside the tail (a Great Library draw, a card reveal before an extra turn)
+    makes it a gamble that happened to come off, so the walk stops there.
+
+    `chance_counts[i]` is how many chance events move `i` triggered. Only WINS
+    qualify: a loss or a draw reached by the mover's own final move says
+    nothing about whether a better move existed. Shared-civilian endings carry
+    no winner and so never qualify. Missed immediate wins are out of scope --
+    the run07 audit found every immediate retrieval win was taken.
+    """
+
+    winner = record.winner
+    if winner is None or not record.moves:
+        return set()
+    moves = record.moves
+    if len(chance_counts) != len(moves):
+        raise ReplayMismatchError(
+            f"{len(chance_counts)} chance counts for {len(moves)} moves"
+        )
+    certain: set[int] = set()
+    for position in range(len(moves) - 1, -1, -1):
+        move = moves[position]
+        if move.actor != winner:
+            break
+        if position != len(moves) - 1 and chance_counts[position]:
+            break
+        certain.add(move.i)
+    return certain
+
+
 def emits_example(move, *, record_fast_moves: bool, retained: set[int]) -> bool:
     """Whether a recorded move becomes a training row (both derive backends)."""
 
@@ -1004,7 +1047,13 @@ def examples_from_record(
         )
 
     row_weights = solver_row_weights(record.moves)
-    game = replay(record, on_state=featurize)
+    chance_counts = [0] * len(record.moves)
+
+    def count_events(move, events) -> None:
+        chance_counts[move.i] = len(events)
+
+    game = replay(record, on_state=featurize, on_events=count_events)
+    certain = certain_win_moves(record, chance_counts)
     replies = reply_targets(record.moves, legal_by_move)
     maximum_track = max(maximum_track, abs(game.conflict_position))
     final_position = game.conflict_position
@@ -1094,6 +1143,7 @@ def examples_from_record(
                 root_value_shaped=root_value_shaped,
                 move_index=move_index,
                 retained_proof=move_index in retained,
+                certain_win=move_index in certain,
             )
         )
     return _with_short_term(examples, record)
@@ -1152,6 +1202,15 @@ def _examples_from_rust_payload(
     move_actors = np.frombuffer(payload["move_actors"], dtype=np.uint8)
     if len(move_offsets) != len(moves) + 1 or len(move_actors) != len(moves):
         raise ReplayMismatchError("Rust replay move count differs from record")
+    if "move_chance_counts" not in payload:
+        raise RuntimeError(
+            "seven_wonders_rust predates G2 (no move_chance_counts); rebuild it "
+            "with maturin develop --release"
+        )
+    certain = certain_win_moves(
+        record,
+        np.frombuffer(payload["move_chance_counts"], dtype=np.uint8).tolist(),
+    )
     for index, move in enumerate(moves):
         if move.i != index:
             raise ReplayMismatchError(
@@ -1272,6 +1331,7 @@ def _examples_from_rust_payload(
                 reanalysis=bool(getattr(move, "reanalysis", False)),
                 move_index=move.i,
                 retained_proof=move.i in retained,
+                certain_win=move.i in certain,
             )
         )
 
@@ -1650,6 +1710,14 @@ def collate(
     # proven draw is a proven draw, and it arrives as an exact 0.0 value.
     value_solver = torch.zeros((size, 3), dtype=torch.float32)
     value_solver_valid = torch.zeros(size, dtype=torch.bool)
+    # G2 target contract (`train.value_targets`): what each proof actually
+    # proves. A chance-free proof is an exact W/D/L; an expectimax proof is
+    # only its expected utility, carried as the scalar so the loss can
+    # supervise that quantity and nothing else. `value_certain` marks rows whose
+    # outcome AND victory type are exact (`certain_win_moves`).
+    value_solver_exact = torch.zeros(size, dtype=torch.bool)
+    value_solver_utility = torch.zeros(size, dtype=torch.float32)
+    value_certain = torch.zeros(size, dtype=torch.bool)
     joint7 = torch.zeros(size, dtype=torch.long)
     # Search's own seven-way outlook at this root, for W4's soft target. Only the
     # outcome LABEL existed before, and it is game-constant: every row of a game
@@ -1701,6 +1769,9 @@ def collate(
         if proven is not None:
             value_solver[row] = torch.tensor(proven)
             value_solver_valid[row] = True
+            value_solver_exact[row] = example.solver_exact
+            value_solver_utility[row] = float(example.solver_value)
+        value_certain[row] = getattr(example, "certain_win", False)
         joint7[row] = example.joint7_class
         outlook = usable_root_outlook(example)
         if outlook is not None:
@@ -1732,6 +1803,9 @@ def collate(
         "value_short_valid": value_short_valid,
         "value_solver": value_solver,
         "value_solver_valid": value_solver_valid,
+        "value_solver_exact": value_solver_exact,
+        "value_solver_utility": value_solver_utility,
+        "value_certain": value_certain,
         "joint7": joint7,
         "outlook_soft": outlook_soft,
         "outlook_soft_valid": outlook_soft_valid,

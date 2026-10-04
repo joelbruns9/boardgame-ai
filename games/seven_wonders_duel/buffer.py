@@ -679,7 +679,7 @@ class GameRecorder:
         )
 
 
-def replay(record: GameRecord, on_state=None) -> GameState:
+def replay(record: GameRecord, on_state=None, on_events=None) -> GameState:
     """Re-run the game from (seed, actions), verifying masks, chance log, and
     the final digest. Raises ReplayMismatchError on any divergence.
 
@@ -687,6 +687,9 @@ def replay(record: GameRecord, on_state=None) -> GameState:
     integrity checks pass and BEFORE the move is applied — the hook consumers
     (featurization, reanalyze) use so they can never read from an unverified
     replay.
+
+    ``on_events(move, events)`` is invoked after each move is applied, with the
+    chance events it triggered, once they have matched the recorded log.
 
     A record written under a different ``spec_version`` is refused up front:
     the digests would fail anyway, but confusingly and only at the end.
@@ -734,6 +737,8 @@ def replay(record: GameRecord, on_state=None) -> GameState:
                     f"recorded {record.chance_log[log_position]}"
                 )
             log_position += 1
+        if on_events is not None:
+            on_events(move, result.events)
     if log_position != len(record.chance_log):
         raise ReplayMismatchError("recorded chance log has unconsumed entries")
     if game.phase is not Phase.COMPLETE:

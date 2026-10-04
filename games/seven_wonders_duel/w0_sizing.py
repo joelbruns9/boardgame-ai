@@ -34,6 +34,7 @@ from .dataset import (
     collate,
     examples_from_record,
     solver_value_distribution,
+    usable_root_outlook,
 )
 from .net import default_heads
 from .phase_d import ModelAgentSpec, PhaseDConfig, PhaseDLoop
@@ -226,7 +227,12 @@ def _pack_examples(examples, val_fraction: float, split_salt: str) -> dict:
         "value_short_valid": torch.zeros(rows, dtype=torch.bool),
         "value_solver": torch.zeros(rows, 3, dtype=torch.float32),
         "value_solver_valid": torch.zeros(rows, dtype=torch.bool),
+        "value_solver_exact": torch.zeros(rows, dtype=torch.bool),
+        "value_solver_utility": torch.zeros(rows, dtype=torch.float32),
+        "value_certain": torch.zeros(rows, dtype=torch.bool),
         "joint7": torch.zeros(rows, dtype=torch.int8),
+        "outlook_soft": torch.zeros(rows, 7, dtype=torch.float32),
+        "outlook_soft_valid": torch.zeros(rows, dtype=torch.bool),
         "margin": torch.zeros(rows, dtype=torch.float32),
         "margin_valid": torch.zeros(rows, dtype=torch.bool),
         "military_final": torch.zeros(rows, dtype=torch.float32),
@@ -275,7 +281,14 @@ def _pack_examples(examples, val_fraction: float, split_salt: str) -> dict:
         if proven is not None:
             storage["value_solver"][row] = torch.tensor(proven)
             storage["value_solver_valid"][row] = True
+            storage["value_solver_exact"][row] = example.solver_exact
+            storage["value_solver_utility"][row] = float(example.solver_value)
+        storage["value_certain"][row] = getattr(example, "certain_win", False)
         storage["joint7"][row] = example.joint7_class
+        outlook = usable_root_outlook(example)
+        if outlook is not None:
+            storage["outlook_soft"][row] = torch.tensor(outlook)
+            storage["outlook_soft_valid"][row] = True
         storage["margin"][row] = example.margin
         storage["margin_valid"][row] = example.margin_valid
         storage["military_final"][row] = example.military_final

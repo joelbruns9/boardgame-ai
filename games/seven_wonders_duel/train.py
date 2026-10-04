@@ -69,6 +69,15 @@ HIER_VALUE_WEIGHT_DEFAULT = 0.15
 #: are what stalls a run; see ablate_value_head.py.
 VALUE_WEIGHT_DEFAULT = 1.0
 
+#: G2 (`MODEL_GROWTH_PLAN.md`): what each value head is trained on, per proof
+#: type. ``"g2"`` -- every value head (flat W/D/L and W4's hierarchical head)
+#: takes the same proofs, short-term term and row weights; an expectimax proof
+#: supervises only the expected utility it proved; a certain win
+#: (`dataset.certain_win_moves`) sets outcome AND victory type exactly.
+#: ``"legacy"`` is run07's objective, kept as the A/B arm (G5).
+VALUE_TARGET_CONTRACTS = ("g2", "legacy")
+VALUE_TARGET_CONTRACT_DEFAULT = "g2"
+
 
 def control_table_for(model):
     """The W3 table to label batches with, or None when the head is absent.
@@ -86,6 +95,168 @@ def control_table_for(model):
     return default_table()
 
 
+def _utility_loss(log_probs: torch.Tensor, utility: torch.Tensor) -> torch.Tensor:
+    """Per-row loss on the EXPECTED UTILITY of a (win, draw, loss) head alone.
+
+    An expectimax proof is a scalar ``P(win) - P(loss)`` and says nothing about
+    how the rest of the mass splits into draws, so the target is that scalar
+    and nothing else: binary cross-entropy between ``(1 + v) / 2`` and the
+    head's ``P(win) + P(draw) / 2``. Minimised exactly where the head's
+    expected utility equals the proof, at any draw mass, and in nats like the
+    cross-entropies beside it.
+    """
+
+    probs = log_probs.float().exp()
+    predicted = (probs[:, 0] + 0.5 * probs[:, 1]).clamp(1e-6, 1.0 - 1e-6)
+    target = ((1.0 + utility.float()) / 2.0).clamp(0.0, 1.0)
+    return -(target * predicted.log() + (1.0 - target) * (1.0 - predicted).log())
+
+
+def value_targets(
+    batch: dict[str, torch.Tensor],
+    *,
+    value_bootstrap: float = 0.0,
+    short_term_value_weight: float = 0.0,
+    outlook_bootstrap: float = 0.0,
+    solver_value_target: bool = True,
+    contract: str = VALUE_TARGET_CONTRACT_DEFAULT,
+    hierarchical: bool = False,
+) -> dict[str, torch.Tensor | None]:
+    """The effective value targets of one batch, per head (G2 contract).
+
+    Returns ``flat`` -- the flat head's (win, draw, loss) target, or None for
+    the hard ``value_class`` -- plus ``utility_rows``/``utility``: rows whose
+    flat target is an expectimax proof's expected utility alone. With
+    ``hierarchical``, also ``hier_outcome`` [B, 3], ``hier_utility_rows``, and
+    ``hier_type`` [B, 7]: the mass on each joint class whose conditional
+    ``P(type | outcome)`` is supervised.
+
+    A proof never supplies a TYPE: it settles who wins, not how. It does not
+    remove one either -- the realised type given the realised outcome is a
+    sample of that conditional whatever the proof says about the marginal, and
+    masking it would drop type supervision on ~26% of run07's rows, the late
+    ones where the type is most settled. Only a certain win replaces it.
+
+    Kept separate from the loss so a test can assert what a head is trained
+    toward rather than reverse-engineering it from a loss value.
+    """
+
+    if contract not in VALUE_TARGET_CONTRACTS:
+        raise ValueError(f"contract must be one of {VALUE_TARGET_CONTRACTS}")
+    legacy = contract == "legacy"
+    value_class = batch["value_class"].long()
+    hard = F.one_hot(value_class, num_classes=3).float()
+    size = hard.shape[0]
+    solver_rows = batch.get("value_solver_valid") if solver_value_target else None
+    if solver_rows is None:
+        solver_rows = torch.zeros(size, dtype=torch.bool, device=hard.device)
+    has_solver = bool(solver_rows.any())
+    if legacy or "value_solver_exact" not in batch:
+        utility_rows = torch.zeros_like(solver_rows)
+    else:
+        utility_rows = solver_rows & ~batch["value_solver_exact"]
+    exact_rows = solver_rows & ~utility_rows
+    certain = batch.get("value_certain")
+    if legacy or certain is None:
+        certain = torch.zeros_like(solver_rows)
+    has_certain = bool(certain.any())
+    utility = batch.get("value_solver_utility")
+
+    def short_term(base: torch.Tensor) -> torch.Tensor:
+        if short_term_value_weight > 0.0 and "value_short" in batch:
+            # The TD(lambda) return over values recorded later in the game
+            # (`dataset.short_term_values`), mixed into whatever the target
+            # already is: outcome x (1-b)(1-s), own search x b(1-s),
+            # short-term x s. Rows without it keep their target.
+            return torch.where(
+                batch["value_short_valid"].unsqueeze(1),
+                (1.0 - short_term_value_weight) * base
+                + short_term_value_weight * batch["value_short"],
+                base,
+            )
+        return base
+
+    def prove(target: torch.Tensor) -> torch.Tensor:
+        # A proven value REPLACES the outcome outright rather than blending with
+        # it -- at full weight, and regardless of any bootstrap. The realised
+        # result of a settled endgame is a sample of this number produced by two
+        # players who may both then err; averaging the two can only move the
+        # target away from the truth. Expectimax rows keep whatever target they
+        # had here under "g2" and are re-scored by `_utility_loss`.
+        if has_solver:
+            rows = solver_rows if legacy else exact_rows
+            target = torch.where(rows.unsqueeze(1), batch["value_solver"], target)
+        if has_certain:
+            target = torch.where(certain.unsqueeze(1), hard, target)
+        return target
+
+    if value_bootstrap > 0.0 and "value_soft" in batch:
+        # Blend the realised outcome with the search's own estimate. The outcome
+        # is one sample of a probability; fitting it hard produces a head that is
+        # confidently wrong off-distribution (cloud3: holdout value loss tripled
+        # while accuracy moved 4 points -- pure overconfidence). Rows without a
+        # search keep the hard label, so nothing is invented for them.
+        flat = torch.where(
+            batch["value_soft_valid"].unsqueeze(1),
+            (1.0 - value_bootstrap) * hard + value_bootstrap * batch["value_soft"],
+            hard,
+        )
+    else:
+        flat = None
+    if short_term_value_weight > 0.0 and "value_short" in batch:
+        flat = short_term(flat if flat is not None else hard)
+    if has_solver or has_certain:
+        flat = prove(flat if flat is not None else hard)
+    out: dict[str, torch.Tensor | None] = {
+        "flat": flat,
+        "utility_rows": utility_rows & ~certain,
+        "utility": utility,
+    }
+    if not hierarchical:
+        return out
+    joint_hard = F.one_hot(batch["joint7"].long(), num_classes=7).float()
+    if outlook_bootstrap > 0.0 and "outlook_soft" in batch:
+        # The value head's bootstrap, applied to the victory type: blend the
+        # realised class with search's own seven-way outlook at this root. The
+        # realised class is one sample and game-constant; the outlook is
+        # position-specific and exact at every terminal the search reached.
+        joint = torch.where(
+            batch["outlook_soft_valid"].unsqueeze(1),
+            (1.0 - outlook_bootstrap) * joint_hard
+            + outlook_bootstrap * batch["outlook_soft"],
+            joint_hard,
+        )
+    else:
+        joint = joint_hard
+    # The joint target's own (win, draw, loss) marginal, in the head's outcome
+    # order. Under "legacy" this split is exactly the old single NLL term:
+    # -sum_c t_c log P(c) = -sum_o t_o log P(o) - sum_{o,k} t_ok log P(k | o).
+    outcome = torch.stack(
+        [joint[:, 0:3].sum(dim=1), joint[:, 6], joint[:, 3:6].sum(dim=1)], dim=1
+    )
+    type_mass = joint.clone()
+    type_mass[:, 6] = 0.0
+    if legacy:
+        out.update(
+            hier_outcome=outcome,
+            hier_utility_rows=torch.zeros_like(solver_rows),
+            hier_type=type_mass,
+        )
+        return out
+    outcome = prove(short_term(outcome))
+    # A certain win settles the route as well, so its realised class is the
+    # exact target, with no outlook blended in.
+    certain_type = joint_hard.clone()
+    certain_type[:, 6] = 0.0
+    type_mass = torch.where(certain.unsqueeze(1), certain_type, type_mass)
+    out.update(
+        hier_outcome=outcome,
+        hier_utility_rows=utility_rows & ~certain,
+        hier_type=type_mass,
+    )
+    return out
+
+
 def compute_losses(
     outputs: dict[str, torch.Tensor],
     batch: dict[str, torch.Tensor],
@@ -101,6 +272,7 @@ def compute_losses(
     hier_value_weight: float = HIER_VALUE_WEIGHT_DEFAULT,
     hier_value_replaces_joint7: bool = False,
     outlook_bootstrap: float = 0.0,
+    value_target_contract: str = VALUE_TARGET_CONTRACT_DEFAULT,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     log_policy = masked_policy_log_softmax(outputs["policy"], batch["legal_mask"])
     # Targets are zero on illegal actions where log_policy is -inf; read only
@@ -158,53 +330,30 @@ def compute_losses(
             action_policy_loss = (
                 per_action_row[has_policy] * weights
             ).sum() / weights.sum().clamp(min=1e-9)
-    solver_rows = batch.get("value_solver_valid") if solver_value_target else None
-    has_solver = solver_rows is not None and bool(solver_rows.any())
-    if value_bootstrap > 0.0 and "value_soft" in batch:
-        # Blend the realised outcome with the search's own estimate. The outcome
-        # is one sample of a probability; fitting it hard produces a head that is
-        # confidently wrong off-distribution (cloud3: holdout value loss tripled
-        # while accuracy moved 4 points -- pure overconfidence). Rows without a
-        # search keep the hard label, so nothing is invented for them.
-        hard = F.one_hot(batch["value_class"], num_classes=3).float()
-        target = torch.where(
-            batch["value_soft_valid"].unsqueeze(1),
-            (1.0 - value_bootstrap) * hard + value_bootstrap * batch["value_soft"],
-            hard,
-        )
-    elif has_solver:
-        target = F.one_hot(batch["value_class"], num_classes=3).float()
-    else:
-        target = None
-    if short_term_value_weight > 0.0 and "value_short" in batch:
-        # The TD(lambda) return over values recorded later in the game
-        # (`dataset.short_term_values`), mixed into whatever the target already
-        # is: outcome x (1-b)(1-s), own search x b(1-s), short-term x s. Rows
-        # without it keep their target. A proof, below, still replaces all three.
-        base = (
-            target if target is not None
-            else F.one_hot(batch["value_class"], num_classes=3).float()
-        )
-        target = torch.where(
-            batch["value_short_valid"].unsqueeze(1),
-            (1.0 - short_term_value_weight) * base
-            + short_term_value_weight * batch["value_short"],
-            base,
-        )
-    if has_solver:
-        # A proven value REPLACES the outcome outright rather than blending with
-        # it -- at full weight, and regardless of `value_bootstrap`. The realised
-        # result of an endgame the solver has settled is a sample of this number
-        # produced by two players who may both then err; there is nothing in it
-        # the exact value does not already contain, and averaging the two can
-        # only move the target away from the truth.
-        target = torch.where(solver_rows.unsqueeze(1), batch["value_solver"], target)
-    if target is None:
+    targets = value_targets(
+        batch,
+        value_bootstrap=value_bootstrap,
+        short_term_value_weight=short_term_value_weight,
+        outlook_bootstrap=outlook_bootstrap,
+        solver_value_target=solver_value_target,
+        contract=value_target_contract,
+        hierarchical="hier_joint7" in outputs,
+    )
+    if targets["flat"] is None:
         per_value = F.cross_entropy(
-            outputs["value"], batch["value_class"], reduction="none"
+            outputs["value"], batch["value_class"].long(), reduction="none"
         )
     else:
-        per_value = F.cross_entropy(outputs["value"], target, reduction="none")
+        per_value = F.cross_entropy(outputs["value"], targets["flat"], reduction="none")
+    if bool(targets["utility_rows"].any()):
+        per_value = torch.where(
+            targets["utility_rows"],
+            _utility_loss(
+                torch.log_softmax(outputs["value"].float(), dim=-1),
+                targets["utility"],
+            ),
+            per_value,
+        )
     value_loss = (per_value * value_w).sum() / value_w.sum().clamp(min=1e-9)
     joint7_loss = F.cross_entropy(outputs["joint7"], batch["joint7"])
     # The REPLACEMENT arm. `joint7` and W4's head fit the same per-game label,
@@ -231,29 +380,29 @@ def compute_losses(
     science_loss = F.mse_loss(outputs["science"], batch["sci_final"])
     hier_value_loss = outputs["policy"].new_zeros(())
     if "hier_joint7" in outputs:
-        # ONE term, not two. The head emits log P(outcome) + log P(type|outcome)
-        # already summed into the seven joint classes, so the negative
-        # log-likelihood of the true class trains the outcome factor and the
-        # conditional factor together, weighted exactly as the data weights
-        # them. Fitting the marginal separately would double-count the rows and
-        # let the two factors disagree, which is the defect this head exists to
-        # remove.
-        if outlook_bootstrap > 0.0 and "outlook_soft" in batch:
-            # The value head's bootstrap, applied to the victory type: blend the
-            # realised class with search's own seven-way outlook at this root.
-            # The realised class is one sample and game-constant; the outlook is
-            # position-specific and exact at every terminal the search reached.
-            # Rows without a usable outlook keep the hard label.
-            hard = F.one_hot(batch["joint7"], num_classes=7).float()
-            target = torch.where(
-                batch["outlook_soft_valid"].unsqueeze(1),
-                (1.0 - outlook_bootstrap) * hard
-                + outlook_bootstrap * batch["outlook_soft"],
-                hard,
+        # The joint NLL, split into its two factors so each takes the target it
+        # can be given: log P(class) = log P(outcome) + log P(type | outcome).
+        # The outcome factor gets the same proofs, short-term term and row
+        # weights as the flat head; the type factor is supervised only where
+        # the type is known (`value_targets`). Under the legacy contract the
+        # sum is exactly the old single NLL over `hier_joint7`.
+        outcome_log = outputs["hier_value"]
+        per_outcome = -(targets["hier_outcome"] * outcome_log).sum(dim=-1)
+        if bool(targets["hier_utility_rows"].any()):
+            per_outcome = torch.where(
+                targets["hier_utility_rows"],
+                _utility_loss(outcome_log, targets["utility"]),
+                per_outcome,
             )
-            hier_value_loss = -(target * outputs["hier_joint7"]).sum(dim=-1).mean()
+        if value_target_contract == "legacy":
+            outcome_term = per_outcome.mean()
         else:
-            hier_value_loss = F.nll_loss(outputs["hier_joint7"], batch["joint7"])
+            outcome_term = (per_outcome * value_w).sum() / value_w.sum().clamp(min=1e-9)
+        type_log = torch.cat(
+            [outputs["hier_type_win"], outputs["hier_type_loss"]], dim=-1
+        )
+        type_term = -(targets["hier_type"][:, :6] * type_log).sum(dim=-1).mean()
+        hier_value_loss = outcome_term + type_term
     reply_loss = outputs["policy"].new_zeros(())
     if "reply" in outputs and batch.get("has_reply") is not None:
         rows = batch["has_reply"]
@@ -1292,6 +1441,7 @@ def train_steps(
     hier_value_weight: float = HIER_VALUE_WEIGHT_DEFAULT,
     hier_value_replaces_joint7: bool = False,
     outlook_bootstrap: float = 0.0,
+    value_target_contract: str = VALUE_TARGET_CONTRACT_DEFAULT,
     log=print,
 ) -> tuple[list[dict], dict]:
     """Fixed-budget training on uniform random minibatches from the replay.
@@ -1355,6 +1505,10 @@ def train_steps(
     any_retained = any(retained_rows)
     sampled_rows = 0
     sampled_retained = 0
+    # G2: rows whose outcome and victory type are exact (`certain_win_moves`).
+    certain_rows = [bool(getattr(e, "certain_win", False)) for e in train_examples]
+    any_certain = any(certain_rows)
+    sampled_certain = 0
 
     def learning_rate(step: int) -> float:
         if not warm and warmup_steps > 0 and step < warmup_steps:
@@ -1374,6 +1528,8 @@ def train_steps(
         sampled_rows += len(sampled)
         if any_retained:
             sampled_retained += sum(retained_rows[i] for i in sampled)
+        if any_certain:
+            sampled_certain += sum(certain_rows[i] for i in sampled)
         batch = (
             batch_getter(sampled, device)
             if batch_getter is not None
@@ -1398,6 +1554,7 @@ def train_steps(
                 hier_value_replaces_joint7=hier_value_replaces_joint7,
                 outlook_bootstrap=outlook_bootstrap,
                 short_term_value_weight=short_term_value_weight,
+                value_target_contract=value_target_contract,
             )
         scaler.scale(total).backward()
         scaler.unscale_(optimizer)
@@ -1439,6 +1596,7 @@ def train_steps(
             "grad_overflow_steps": overflow_steps,
             "sampled_rows": sampled_rows,
             "sampled_retained_proof_rows": sampled_retained,
+            "sampled_certain_win_rows": sampled_certain,
         }
         running = {}
         running_grad_norm = 0.0

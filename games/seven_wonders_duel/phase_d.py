@@ -135,6 +135,8 @@ from .train import (
     make_checkpoint,
     stable_game_split,
     train_steps,
+    VALUE_TARGET_CONTRACT_DEFAULT,
+    VALUE_TARGET_CONTRACTS,
 )
 from .net import LEGACY_HEADS
 
@@ -685,6 +687,13 @@ class PhaseDConfig:
 
     derive_backend: str = "rust"
     """Replay/encoding implementation: production Rust or Python reference."""
+
+    value_target_contract: str = VALUE_TARGET_CONTRACT_DEFAULT
+    """G2: what every value head trains on, per proof type
+    (`train.value_targets`). "g2": the flat and W4 heads share proofs, the
+    short-term term and row weights; expectimax proofs supervise expected
+    utility only; certain wins fix outcome and victory type. "legacy" is
+    run07's objective (W4 trained on the blended realised class alone)."""
 
     example_cache_examples: int = 250_000
     """Vectorized examples held in memory across iterations (0 disables).
@@ -1270,6 +1279,10 @@ class PhaseDConfig:
     def validate(self) -> None:
         if not 0.0 <= self.short_term_value_weight < 1.0:
             raise ValueError("short_term_value_weight must be in [0, 1)")
+        if self.value_target_contract not in VALUE_TARGET_CONTRACTS:
+            raise ValueError(
+                f"value_target_contract must be one of {VALUE_TARGET_CONTRACTS}"
+            )
         if self.precision not in {"fp32", "bf16"}:
             raise ValueError("precision must be fp32 or bf16")
         if self.schedule_basis not in {"games", "iterations"}:
@@ -5030,6 +5043,7 @@ class PhaseDLoop:
             value_weight=self.config.value_weight,
             value_bootstrap=self.config.value_bootstrap,
             short_term_value_weight=self.config.short_term_value_weight,
+            value_target_contract=self.config.value_target_contract,
             action_policy_weight=self.config.action_policy_weight,
             hier_value_weight=self.config.hier_value_weight,
             hier_value_replaces_joint7=self.config.hier_value_replaces_joint7,
@@ -5513,6 +5527,7 @@ class PhaseDLoop:
             value_weight=self.config.value_weight,
             value_bootstrap=self.config.value_bootstrap,
             short_term_value_weight=self.config.short_term_value_weight,
+            value_target_contract=self.config.value_target_contract,
             action_policy_weight=self.config.action_policy_weight,
             hier_value_weight=self.config.hier_value_weight,
             hier_value_replaces_joint7=self.config.hier_value_replaces_joint7,
@@ -7680,6 +7695,16 @@ def build_parser() -> argparse.ArgumentParser:
         "so --train-steps must rise with it",
     )
     parser.add_argument(
+        "--value-target-contract",
+        choices=VALUE_TARGET_CONTRACTS,
+        default=VALUE_TARGET_CONTRACT_DEFAULT,
+        help="G2: value targets per head and proof type. g2 (default): W4's "
+        "hierarchical head takes the same proofs, short-term term and row "
+        "weights as the flat head; expectimax proofs supervise expected utility "
+        "only; certain wins fix outcome and victory type. legacy: run07's "
+        "objective, the A/B arm",
+    )
+    parser.add_argument(
         "--retain-proofs-per-game",
         type=int,
         default=RETAIN_PROOFS_PER_GAME_DEFAULT,
@@ -8030,6 +8055,7 @@ def main(argv=None) -> int:
         memory_headroom_gb=args.memory_headroom_gb,
         record_fast_moves=args.record_fast_moves,
         retain_proofs_per_game=args.retain_proofs_per_game,
+        value_target_contract=args.value_target_contract,
         derive_backend=args.derive_backend,
         eval_search_mode=args.eval_search_mode,
         generation_backend=args.generation_backend,

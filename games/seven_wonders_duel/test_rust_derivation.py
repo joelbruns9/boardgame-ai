@@ -34,6 +34,7 @@ SCALAR_FIELDS = (
     "game_key",
     "iteration",
     "root_value",
+    "certain_win",
 )
 
 
