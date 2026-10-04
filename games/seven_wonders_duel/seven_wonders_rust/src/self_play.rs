@@ -1492,6 +1492,9 @@ pub struct SchedulerMetrics {
     pub proven_leaves: usize,
     /// G4 layer 2: interior nodes settled by proof propagation.
     pub solved_nodes: usize,
+    /// G4b: option-expanded pending nodes and their extra network rows.
+    pub option_expansions: usize,
+    pub option_rows: usize,
     pub collisions: usize,
     pub global_batches: usize,
     pub global_rows: usize,
@@ -1693,6 +1696,8 @@ impl SchedulerMetrics {
             terminal_leaves: _,
             proven_leaves: _,
             solved_nodes: _,
+            option_expansions: _,
+            option_rows: _,
             collisions: _,
             global_batches: _,
             global_rows: _,
@@ -1771,6 +1776,8 @@ impl SchedulerMetrics {
         self.terminal_leaves += other.terminal_leaves;
         self.proven_leaves += other.proven_leaves;
         self.solved_nodes += other.solved_nodes;
+        self.option_expansions += other.option_expansions;
+        self.option_rows += other.option_rows;
         self.collisions += other.collisions;
         self.global_batches += other.global_batches;
         self.global_rows += other.global_rows;
@@ -2408,6 +2415,8 @@ fn absorb_slot_metrics(metrics: &mut SchedulerMetrics, slot: &GameSlot) {
     metrics.terminal_leaves += slot.terminal_leaves;
     metrics.proven_leaves += slot.proven_leaves;
     metrics.solved_nodes += slot.solved_nodes;
+    metrics.option_expansions += slot.option_expansions;
+    metrics.option_rows += slot.option_rows;
     metrics.collisions += slot.collisions;
     metrics.forced_rows += slot.forced_rows;
     metrics.fixed_support_edges += slot.fixed_support_edges;
@@ -2487,6 +2496,8 @@ struct GameSlot {
     terminal_leaves: usize,
     proven_leaves: usize,
     solved_nodes: usize,
+    option_expansions: usize,
+    option_rows: usize,
     collisions: usize,
     forced_rows: usize,
     forced_rows_by_kind: [usize; 4],
@@ -2545,6 +2556,8 @@ impl GameSlot {
             terminal_leaves: 0,
             proven_leaves: 0,
             solved_nodes: 0,
+            option_expansions: 0,
+            option_rows: 0,
             collisions: 0,
             forced_rows: 0,
             forced_rows_by_kind: [0; 4],
@@ -2786,6 +2799,8 @@ impl GameSlot {
             self.terminal_leaves += metrics.terminal_leaves;
             self.proven_leaves += metrics.proven_leaves;
             self.solved_nodes += metrics.solved_nodes;
+            self.option_expansions += metrics.option_expansions;
+            self.option_rows += metrics.option_rows;
             self.collisions += metrics.collisions;
             self.forced_rows += metrics.forced_outcome_rows;
             self.fixed_support_edges += metrics.fixed_support_edges;

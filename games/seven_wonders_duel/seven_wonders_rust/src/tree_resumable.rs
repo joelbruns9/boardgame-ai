@@ -12,7 +12,7 @@ use crate::chance::{self, ChanceKind, ChanceSpec};
 use crate::codec::{decode_action, legal_action_indices};
 use crate::eval::{terminal_value_p0, Eval, LeafBias, LeafOut, Outlook};
 use crate::rng::Rng;
-use crate::state::{GameState, Phase};
+use crate::state::{GameState, PendingChoiceKind, Phase};
 use crate::tree::{SearchConfig, SearchResult};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -81,6 +81,10 @@ pub struct Node {
     /// the network, never averaged with network estimates. Only ever set on
     /// children (`make_child`) -- the root is the decision being made.
     pub proven: Option<(f64, Outlook)>,
+    /// G4b: an option-expanded pending node (Mausoleum retrieval). Every backup
+    /// through it passes up the MAX of its options' current Q in the chooser's
+    /// frame instead of the value that arrived from below.
+    pub max_node: bool,
     /// F4.5 forced-child cache. Force expansion seeds the child's value/visit
     /// exactly as before but retains priors for the first ordinary visit.
     cached_evaluation: Option<(f64, Vec<f64>, Option<Outlook>)>,
@@ -109,6 +113,7 @@ impl Node {
             value_sum_p0: 0.0,
             incomplete: 0,
             proven: None,
+            max_node: false,
             cached_evaluation: None,
         }
     }
@@ -147,6 +152,10 @@ impl Node {
 pub struct Arena {
     nodes: Vec<Node>,
     root_id: NodeId,
+    /// G8.0: Great Library token afterstates by canonical digest, so every
+    /// offer that contains token `t` after reveal `r` shares ONE node for
+    /// "took `t`". See `canonical_library_afterstate`.
+    library_afterstates: HashMap<String, NodeId>,
 }
 
 impl Arena {
@@ -158,6 +167,7 @@ impl Arena {
         Self {
             nodes: vec![root],
             root_id: 0,
+            library_afterstates: HashMap::new(),
         }
     }
 
@@ -182,6 +192,24 @@ impl Arena {
         } else {
             0.0
         }
+    }
+
+    /// G4b: `(index, value_p0)` of the edge with the best current Q for the
+    /// node's mover, over edges that have been seeded or visited.
+    fn best_option(&self, node_id: NodeId) -> Option<(usize, f64)> {
+        let node = &self.nodes[node_id];
+        let sign = if node.actor == 0 { 1.0 } else { -1.0 };
+        let mut best: Option<(usize, f64)> = None;
+        for (index, edge) in node.edges.iter().enumerate() {
+            if edge.visits == 0 {
+                continue;
+            }
+            let q = self.edge_q_p0(node_id, index);
+            if best.map_or(true, |(_, b)| sign * q > sign * b) {
+                best = Some((index, q));
+            }
+        }
+        best
     }
 
     fn select(&self, node_id: NodeId, c_puct: f64) -> usize {
@@ -500,6 +528,7 @@ fn clear_incomplete(arena: &mut Arena, pending: &mut PendingSimulation) {
 }
 
 fn backup(arena: &mut Arena, pending: PendingSimulation, value_p0: f64) {
+    let mut value_p0 = value_p0;
     let leaf = &mut arena.nodes[pending.leaf_id];
     leaf.visits += 1;
     leaf.value_sum_p0 += value_p0;
@@ -508,12 +537,45 @@ fn backup(arena: &mut Arena, pending: PendingSimulation, value_p0: f64) {
             .children
             .iter()
             .any(|(_, child)| child.node_id == step.chance_child_id));
+        {
+            let edge = &mut arena.nodes[step.node_id].edges[step.edge_id];
+            edge.visits += 1;
+            edge.value_sum_p0 += value_p0;
+        }
+        // G4b: an option-expanded node reports its best option's CURRENT Q --
+        // refined where search went below it, the cached network value
+        // elsewhere -- so the max is recomputed rather than locked in.
+        if arena.nodes[step.node_id].max_node {
+            if let Some((_, best)) = arena.best_option(step.node_id) {
+                value_p0 = best;
+            }
+        }
         let node = &mut arena.nodes[step.node_id];
-        node.edges[step.edge_id].visits += 1;
-        node.edges[step.edge_id].value_sum_p0 += value_p0;
         node.visits += 1;
         node.value_sum_p0 += value_p0;
     }
+}
+
+/// G8.0: the position after taking a Great Library token, with the part that
+/// differs between offers -- which drawn tokens went back to the box -- made
+/// canonical, or None when `parent` is not a Great Library choice.
+///
+/// Safe because nothing reads `unused_progress_tokens` once the Library has
+/// drawn: the Library is the engine's only reader (one Wonder, built once),
+/// the encoder never sees the pool, and no chance spec draws from it again.
+/// Everything that does matter -- the chosen token, the reveal, the actor, a
+/// pending extra turn or effect -- stays in the state and so in the key.
+fn canonical_library_afterstate(parent: &GameState, mut child: GameState) -> (GameState, Option<String>) {
+    let is_library = parent
+        .pending_choice
+        .as_ref()
+        .is_some_and(|p| p.kind == PendingChoiceKind::ChooseUnusedProgress);
+    if !is_library {
+        return (child, None);
+    }
+    child.unused_progress_tokens.clear();
+    let key = crate::digest::state_digest(&child);
+    (child, Some(key))
 }
 
 /// G4 layer 2: the exact value of one edge, when every outcome it can lead to
@@ -951,6 +1013,12 @@ pub struct SearchMetrics {
     pub proven_leaves: usize,
     /// G4 layer 2: interior nodes settled by proof propagation.
     pub solved_nodes: usize,
+    /// G4b: pending nodes expanded over all their options, and the extra
+    /// network rows that cost.
+    pub option_expansions: usize,
+    pub option_rows: usize,
+    /// G8.0: option children served by an existing Library afterstate.
+    pub shared_afterstates: usize,
     pub collisions: usize,
     pub leaf_waves: usize,
     pub max_wave_paths: usize,
@@ -998,6 +1066,12 @@ struct PendingWave {
     /// A `Vec` beats a set here: waves are a handful of entries and the linear
     /// scan is cheaper than hashing.
     root_edges: Vec<usize>,
+    /// G4b: `(parent leaf, action index, child, fresh)` for every option child
+    /// of an option-expanded leaf. Fresh children were created for this wave:
+    /// those needing a network row are also in `unique_leaf_ids`, exact ones
+    /// are not. A child that is not fresh is a G8.0 shared afterstate that
+    /// already exists and keeps its statistics.
+    option_children: Vec<(NodeId, usize, NodeId, bool)>,
 }
 
 enum PendingEvaluation {
@@ -1460,6 +1534,145 @@ impl SearchSession {
         Ok(())
     }
 
+    /// G4b: does this leaf get option expansion? A Mausoleum retrieval or a
+    /// Great Library token choice, under exact tactics, in an unbiased search,
+    /// below the root.
+    fn expands_options(&self, leaf_id: NodeId) -> bool {
+        if !crate::tactics::enabled()
+            || self.cfg.leaf_bias.is_active()
+            || leaf_id == self.arena.root_id
+        {
+            return false;
+        }
+        let node = &self.arena.nodes[leaf_id];
+        node.edges.is_empty()
+            && node
+                .state
+                .pending_choice
+                .as_ref()
+                .is_some_and(|p| {
+                    matches!(
+                        p.kind,
+                        PendingChoiceKind::BuildFromDiscardFree
+                            | PendingChoiceKind::ChooseUnusedProgress
+                    )
+                })
+    }
+
+    /// G4b: build every option child of `leaf_id` now, so the whole choice is
+    /// evaluated in this one request. Retrievals draw no chance; if any option
+    /// would, the leaf keeps its ordinary single evaluation.
+    fn build_option_children(&mut self, wave: &mut PendingWave, leaf_id: NodeId) {
+        let state = self.arena.nodes[leaf_id].state.clone();
+        let legal = self.arena.nodes[leaf_id].legal.clone();
+        let mut built = Vec::with_capacity(legal.len());
+        for &index in &legal {
+            let action = decode_action(&state, index);
+            if !chance::chance_signature(&state, &action).is_empty() {
+                return;
+            }
+            let mut child = state.clone();
+            if child.apply_with_chance(&action, &[]).is_err() {
+                return;
+            }
+            built.push((index, child));
+        }
+        for (index, child_state) in built {
+            let (child_state, key) = canonical_library_afterstate(&state, child_state);
+            if let Some(&existing) = key.as_ref().and_then(|k| self.arena.library_afterstates.get(k)) {
+                self.metrics.shared_afterstates += 1;
+                wave.option_children.push((leaf_id, index, existing, false));
+                continue;
+            }
+            let child_id = self.arena.push(Node::make_child(child_state));
+            if let Some(key) = key {
+                self.arena.library_afterstates.insert(key, child_id);
+            }
+            if self.arena.nodes[child_id].exact().is_none() {
+                wave.unique_leaf_ids.push(child_id);
+                self.metrics.option_rows += 1;
+            }
+            wave.option_children.push((leaf_id, index, child_id, true));
+        }
+        self.metrics.option_expansions += 1;
+    }
+
+    /// G4b: seed each option child with ONE visit at its value (cached
+    /// network row, or exact), keep its priors for its first ordinary visit,
+    /// attach it under its parent's edge, and mark the parent a max node.
+    fn attach_option_children(
+        &mut self,
+        wave: &PendingWave,
+        rows: &HashMap<NodeId, (f64, Vec<f64>, Option<Outlook>)>,
+    ) -> PyResult<()> {
+        // Fresh children are seeded first, so a shared afterstate created by
+        // another offer in this same wave already carries its value below.
+        for &(_, _, child_id, fresh) in &wave.option_children {
+            if !fresh || self.arena.nodes[child_id].visits > 0 {
+                continue;
+            }
+            let value = match rows.get(&child_id) {
+                Some((value, priors, outlook)) => {
+                    let child = &mut self.arena.nodes[child_id];
+                    child.cached_evaluation = Some((*value, priors.clone(), *outlook));
+                    *value
+                }
+                None => {
+                    let (value, _) = self.arena.nodes[child_id]
+                        .exact()
+                        .expect("an option child without a row is exact");
+                    value
+                }
+            };
+            let child = &mut self.arena.nodes[child_id];
+            child.visits = 1;
+            child.value_sum_p0 = value;
+        }
+        for &(parent, action_index, child_id, _fresh) in &wave.option_children {
+            // A shared afterstate brings its CURRENT value, refined by any
+            // search that already went below it from another offer.
+            let value = self.arena.nodes[child_id].value_p0();
+            let node = &mut self.arena.nodes[parent];
+            let Some(edge) = node
+                .edges
+                .iter_mut()
+                .find(|edge| edge.action_index == action_index)
+            else {
+                return Err(PyRuntimeError::new_err(
+                    "option child has no matching edge on its parent",
+                ));
+            };
+            edge.children.push((
+                Vec::new(),
+                Child {
+                    probability: Some(1.0),
+                    node_id: child_id,
+                    samples: 1,
+                },
+            ));
+            edge.visits = 1;
+            edge.value_sum_p0 = value;
+            node.max_node = true;
+        }
+        Ok(())
+    }
+
+    /// G4b: the value an option-expanded leaf passes up on its first visit:
+    /// its best option's value, with that option's outlook.
+    fn option_leaf_value(
+        &self,
+        leaf_id: NodeId,
+        rows: &HashMap<NodeId, (f64, Vec<f64>, Option<Outlook>)>,
+    ) -> Option<(f64, Option<Outlook>)> {
+        let (edge_idx, value) = self.arena.best_option(leaf_id)?;
+        let (_, child) = self.arena.nodes[leaf_id].edges[edge_idx].children.first()?;
+        let outlook = match rows.get(&child.node_id) {
+            Some((_, _, outlook)) => *outlook,
+            None => self.arena.nodes[child.node_id].exact().map(|(_, o)| o),
+        };
+        Some((value, outlook))
+    }
+
     fn make_request(&mut self, wave: PendingWave) -> PyResult<SearchEvent> {
         if wave.unique_leaf_ids.is_empty() {
             return Err(PyRuntimeError::new_err(
@@ -1552,6 +1765,7 @@ impl SearchSession {
             simulations: Vec::new(),
             unique_leaf_ids: Vec::new(),
             root_edges: Vec::new(),
+            option_children: Vec::new(),
         };
         loop {
             if self.sims_launched >= self.cfg.sims {
@@ -1664,6 +1878,9 @@ impl SearchSession {
             if !wave.unique_leaf_ids.contains(&pending.leaf_id) {
                 wave.unique_leaf_ids.push(pending.leaf_id);
                 self.metrics.unique_nn_leaves += 1;
+                if self.expands_options(pending.leaf_id) {
+                    self.build_option_children(&mut wave, pending.leaf_id);
+                }
             } else {
                 self.metrics.collisions += 1;
             }
@@ -1732,6 +1949,11 @@ impl SearchSession {
     /// Simulations completed so far. Needed by the advisor's resumable handle,
     /// which advances a fixed chunk at a time and reports progress between
     /// chunks rather than running to `cfg.sims` in one call.
+    /// The search's counters so far.
+    pub fn metrics(&self) -> &SearchMetrics {
+        &self.metrics
+    }
+
     pub fn sims_done(&self) -> usize {
         self.sims_completed
     }
@@ -1964,9 +2186,33 @@ impl SearchSession {
                 wave.unique_leaf_ids.len()
             )));
         }
+        // G4b option children are rows too, but they are seeded and cached,
+        // not expanded: they are a choice's options, not leaves of their own.
+        let option_ids: Vec<NodeId> = wave
+            .option_children
+            .iter()
+            .map(|&(_, _, child, _)| child)
+            .collect();
+        let mut option_rows: HashMap<NodeId, (f64, Vec<f64>, Option<Outlook>)> = HashMap::new();
         for (&leaf_id, leaf) in wave.unique_leaf_ids.iter().zip(&evaluations) {
             let priors = &leaf.priors;
+            if option_ids.contains(&leaf_id) {
+                if priors.len() != self.arena.nodes[leaf_id].legal.len() {
+                    self.clear_wave(&mut wave);
+                    return Err(PyValueError::new_err(
+                        "option child returned the wrong number of priors",
+                    ));
+                }
+                option_rows.insert(leaf_id, (leaf.value_p0, priors.clone(), leaf.outlook_p0));
+                continue;
+            }
             if let Err(err) = expand(&mut self.arena, leaf_id, priors.clone()) {
+                self.clear_wave(&mut wave);
+                return Err(err);
+            }
+        }
+        if !wave.option_children.is_empty() {
+            if let Err(err) = self.attach_option_children(&wave, &option_rows) {
                 self.clear_wave(&mut wave);
                 return Err(err);
             }
@@ -1978,6 +2224,9 @@ impl SearchSession {
                 // Decided when the leaf was selected, not re-derived here: the
                 // two must be the same fact whichever path settles it.
                 Some(value) => (value, pending.immediate_outlook),
+                None if self.arena.nodes[pending.leaf_id].max_node => self
+                    .option_leaf_value(pending.leaf_id, &option_rows)
+                    .expect("an option-expanded leaf has seeded options"),
                 None => {
                     let row = wave
                         .unique_leaf_ids

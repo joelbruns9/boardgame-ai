@@ -540,6 +540,21 @@ impl RustPuctSearch {
         (self.session.sims_done(), visits, value_sum, actor, edges)
     }
 
+    /// G4 counters so far: `{proven, solved, option_expansions, option_rows,
+    /// requested, terminal}`. A separate call so `snapshot`'s shape is kept.
+    fn tactics_metrics(&self) -> std::collections::HashMap<&'static str, usize> {
+        let m = self.session.metrics();
+        std::collections::HashMap::from([
+            ("proven", m.proven_leaves),
+            ("solved", m.solved_nodes),
+            ("option_expansions", m.option_expansions),
+            ("option_rows", m.option_rows),
+            ("shared_afterstates", m.shared_afterstates),
+            ("requested", m.requested_nn_leaves),
+            ("terminal", m.terminal_leaves),
+        ])
+    }
+
     /// `[(root_action_index, ranked_follow_up_indices, contingent)]` for the
     /// root actions whose move is not over -- see `follow_ups` in
     /// `tree_resumable.rs`. `contingent` marks an option set that is itself
@@ -1917,6 +1932,8 @@ fn scheduler_result_to_py(
     metrics.set_item("terminal_leaves", m.terminal_leaves)?;
     metrics.set_item("proven_leaves", m.proven_leaves)?;
     metrics.set_item("solved_nodes", m.solved_nodes)?;
+    metrics.set_item("option_expansions", m.option_expansions)?;
+    metrics.set_item("option_rows", m.option_rows)?;
     metrics.set_item("collisions", m.collisions)?;
     metrics.set_item("global_batches", m.global_batches)?;
     metrics.set_item("global_rows", m.global_rows)?;

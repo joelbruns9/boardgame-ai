@@ -353,6 +353,33 @@ make building these Wonders look too good. Under the contract above, optimism
 pulls visits to the inflated option and search below it corrects it; the
 residual risk is **low budgets** (100-sim cheap moves) ending before correction.
 
+**BUILT 2026-10-04** -- both halves,
+with G8.0's sharing, in `tree_resumable.rs`; rides `--exact-tactics`, skipped
+under a specialist leaf bias and at the root:
+
+- When a Mausoleum retrieval or a Great Library token choice is first reached
+  as a leaf, every option child is built and sent in the SAME request (exact
+  children -- terminal or G4-proven -- need no row). The leaf is ONE
+  simulation: each option is seeded with one visit at its value, its priors
+  cached for its first ordinary visit, and the leaf passes up the best.
+- The node becomes a `max_node`: every later backup through it passes up the
+  best option's CURRENT Q (refined below visited options, cached elsewhere),
+  so the max is recomputed, never locked in (contract points 2 and 3).
+- Library: the per-offer max sits under the build's sampled chance edge, whose
+  average over offers estimates `0.6*v1 + 0.3*v2 + 0.1*v3` without a separate
+  formula node; the analytic combination was not built.
+- Metrics: `option_expansions`, `option_rows`, `shared_afterstates` (self-play
+  and `RustPuctSearch.tactics_metrics()`).
+- Tests: `test_exact_tactics.py` (G4b / G8.0 sections), passing.
+- RICCP (run07 iter 60, vs full G4 without G4b): Library Q at ~1k 45-53% (was
+  47-48%), ~4k 51.9-53.1% (was 50.5-50.8%; ~1 pt over the true 51.4% -- the
+  predicted max optimism), 16k 51.8%; University root ~4k 56-58% (was 59-62%),
+  Build University top in 0/3 seeds; seconds per ~4k sims 3.8-5.2 (was
+  1.8-2.6, baseline 4.8-6.5) -- each expansion costs one row per option.
+- Self-play vs off (laptop, 3 x 32 games per arm): ~-4% sims/s (+6.5 / -6.0 /
+  -3.9% per pair; full G4 without G4b was ~-2%); 8-11k expansions and 28-48k
+  extra network rows per 32 games.
+
 **Measure** (extend `riccp_923216750_review/test_immediate_guard.py` with an
 arm next to "terminal override only"): Library edge Q at ~4k and 16k; the
 University decision; quiet negative controls for inflation (expanded value vs a
@@ -395,6 +422,12 @@ change, not a fan-out fix.
   token from `unused_progress_tokens`, so post-pick states differ by offer:
   canonicalize only after proving those fields cannot affect future play, and
   keep chosen token, reveal, actor, extra-turn and pending effects in the key.
+  **BUILT 2026-10-04** with G4b: Library token afterstates are
+  canonicalized (unused pool cleared -- read only by the Library draw itself,
+  invisible to the encoder) and shared by digest across every offer, so each
+  "took `t` after reveal `r`" node is created and evaluated once. Realized
+  reuse is `shared_afterstates` in `RustPuctSearch.tactics_metrics()` (a test
+  confirms reuse happens; not aggregated in self-play metrics, not measured).
 - **G8.1 Hybrid widening (heuristic).** Represent every outcome (one NN value
   each), deepen a selected few, back up with **true chance probabilities**, not
   allocation frequencies; keep an exploration floor. One evaluation per world

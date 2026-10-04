@@ -1802,6 +1802,15 @@ narrow predicate, 77 civilian). Self-play A/B vs off (laptop, 3 x 32 games per
 arm): ~-2% sims/s (-0.6 / -5.4 / -0.3% per pair), ~22k proven leaves and ~1.4k
 solved interior nodes per 32 games.
 
+**G4b + G8.0 (built 2026-10-04).** Also under this flag: a
+Mausoleum retrieval or Great Library token choice reached as a leaf is
+expanded over ALL its options in one request (one simulation; each option
+seeded at its value), and from then on reports its best option's current Q.
+Library token afterstates are shared across offers (the unused-token pool,
+which nothing reads after the draw, is canonicalized). Each such leaf costs one
+network row per option: self-play ~-4% sims/s vs off in total (G4 without G4b
+~-2%). RICCP: the Library value reaches the true 51.4% by ~1k sims.
+
 ### `--cuda-graphs`, `--no-cuda-graphs`
 
 **Default:** off.

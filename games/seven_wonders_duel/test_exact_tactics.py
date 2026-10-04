@@ -232,3 +232,142 @@ def test_a_proof_two_levels_down_reaches_the_root_edge(positions):
     # The edge into `mid` reads the exact value: its statistics were reset
     # when `mid` was solved, and every later visit returned the proof.
     assert value_sum / visits == pytest.approx(exact, abs=1e-12)
+
+
+# --- G4b: Mausoleum retrievals expanded over every option --------------------
+
+
+def _mausoleum_root(records):
+    """A position whose mover can build the Mausoleum deterministically and
+    would then choose among two or more discarded cards."""
+
+    from .codec import decode_action, legal_action_indices
+    from .engine import ActionUse, apply_action
+    from .search import chance_signature
+
+    for record in records:
+        states = []
+        replay(record, on_state=lambda game, _move: states.append(game.clone()))
+        for state in states:
+            if state.phase is not Phase.PLAY_AGE or state.pending_choice is not None:
+                continue
+            for index in legal_action_indices(state):
+                action = decode_action(state, index)
+                if (
+                    action.use is not ActionUse.CONSTRUCT_WONDER
+                    or action.wonder_name != "The Mausoleum"
+                    or chance_signature(state, action)
+                ):
+                    continue
+                child = state.clone()
+                apply_action(child, action)
+                pending = child.pending_choice
+                if pending is not None and len(legal_action_indices(child)) >= 2:
+                    return state, index, len(legal_action_indices(child))
+    return None
+
+
+def test_a_mausoleum_retrieval_is_expanded_over_every_option():
+    found = _mausoleum_root(pe.fresh_bot_records(120, seed=2468))
+    if found is None:
+        pytest.skip("no deterministic Mausoleum build with 2+ retrievals in the fixture")
+    root, action, options = found
+
+    def run(enabled: bool):
+        swr.set_exact_tactics(enabled)
+        try:
+            handle = swr.RustPuctSearch.open_mock(rust_game_from_state(root), 600, 9)
+            handle.advance(600)
+            return handle.tactics_metrics(), handle.follow_ups()
+        finally:
+            swr.set_exact_tactics(False)
+
+    on, follow_on = run(True)
+    off, _ = run(False)
+    assert off["option_expansions"] == 0 and off["option_rows"] == 0
+    assert on["option_expansions"] >= 1
+    # The options were valued in the expanding request itself. (No per-node
+    # bound from the ROOT's option count: deeper Mausoleum nodes see bigger
+    # discard piles, and Library expansions count here too.)
+    assert on["option_rows"] >= 1
+    ranked = {root_action: follow for root_action, follow, _c in follow_on}
+    if action in ranked:
+        # Seeded options all carry a visit, so the ranking can name them.
+        assert len(ranked[action]) >= min(options, 3)
+
+
+# --- G8.0: Great Library token afterstates are shared across offers ----------
+
+
+def _library_root(records):
+    """A position whose mover can build the Great Library without a reveal."""
+
+    from .codec import decode_action, legal_action_indices
+    from .engine import ActionUse
+    from .search import chance_signature
+    from .game import ChanceKind
+
+    for record in records:
+        states = []
+        replay(record, on_state=lambda game, _move: states.append(game.clone()))
+        for state in states:
+            if state.phase is not Phase.PLAY_AGE or state.pending_choice is not None:
+                continue
+            for index in legal_action_indices(state):
+                action = decode_action(state, index)
+                if (
+                    action.use is ActionUse.CONSTRUCT_WONDER
+                    and action.wonder_name == "The Great Library"
+                ):
+                    specs = chance_signature(state, action)
+                    if all(spec.kind is ChanceKind.GREAT_LIBRARY_DRAW for spec in specs):
+                        return state, index
+    return None
+
+
+def test_the_unused_token_pool_is_invisible_to_the_network(positions):
+    """The safety argument for sharing: two positions that differ ONLY in which
+    tokens went back to the box must encode identically, for either seat."""
+
+    import numpy as np
+
+    from .dataset import vectorize
+    from .encoder import encode
+
+    checked = 0
+    for state in positions:
+        if state.phase is Phase.COMPLETE or not state.unused_progress_tokens:
+            continue
+        stripped = state.clone()
+        stripped.unused_progress_tokens = ()
+        for seat in (0, 1):
+            a = vectorize(encode(state.observation(seat)))
+            b = vectorize(encode(stripped.observation(seat)))
+            assert all(np.array_equal(x, y) for x, y in zip(a, b))
+        checked += 1
+        if checked >= 50:
+            break
+    assert checked >= 10
+
+
+def test_library_afterstates_are_shared_across_offers():
+    found = _library_root(pe.fresh_bot_records(120, seed=1357))
+    if found is None:
+        pytest.skip("no reveal-free Great Library build in the fixture")
+    root, _action = found
+
+    def run(enabled: bool):
+        swr.set_exact_tactics(enabled)
+        try:
+            handle = swr.RustPuctSearch.open_mock(rust_game_from_state(root), 800, 4)
+            handle.advance(800)
+            return handle.tactics_metrics()
+        finally:
+            swr.set_exact_tactics(False)
+
+    on, off = run(True), run(False)
+    assert off["shared_afterstates"] == 0
+    assert on["option_expansions"] >= 2
+    # Two offers after the same reveal overlap in at least one token, so a
+    # second expansion must reuse an afterstate rather than evaluate it again.
+    assert on["shared_afterstates"] >= 1
