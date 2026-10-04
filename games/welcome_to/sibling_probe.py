@@ -193,11 +193,8 @@ def _finish_all(
             ids = [i for i in live[start : start + chunk] if not states[i].is_terminal]
             if not ids:
                 continue
-            policies, legals = packed.policy_states(
-                [states[i] for i in ids], [players[i] for i in ids]
-            )
-            for i, policy, legal in zip(ids, policies, legals):
-                choice = max(legal, key=lambda m: (float(policy[m]), -m))
+            choices = packed.best_moves([states[i] for i in ids], [players[i] for i in ids])
+            for i, choice in zip(ids, choices):
                 if steer is not None and steer[i] and int(states[i].actor) == 0:
                     choice = _POOL_STEER(states[i], int(choice))
                 states[i].apply_macro(int(choice))

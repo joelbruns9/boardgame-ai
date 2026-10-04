@@ -426,6 +426,75 @@ class PackedNetEvaluator:
             "scores": scores_out.numpy().astype("<f4", copy=False).tobytes(),
         }
 
+    def best_moves(self, states: Sequence[object], seats: Sequence[int]) -> list[int]:
+        """Each state's highest-logit legal macro, ties to the lowest macro.
+
+        The fast path for policy-only playouts (2026-10-03): encodings and legal
+        lists come from one parallel Rust call (``encode_batch``) instead of a
+        Python loop of ``encode_state``, and the choice is made on the compact
+        legal logits without building dense probability vectors. Same choice
+        as ``max(legal, key=(probability, -macro))`` over :meth:`policy_states`
+        -- softmax is monotone -- up to float ties.
+        """
+        import welcome_to_rust as wr
+
+        rows = len(states)
+        if rows == 0:
+            return []
+        if len(seats) != rows:
+            raise ValueError("states and seat counts are not row-aligned")
+        for state, count in zip(states, seats):
+            if not 0 <= int(state.actor) < count <= enc.MAX_SEATS:
+                raise ValueError(f"invalid actor/seats pair {state.actor}/{count}")
+        planes, scalars, viewer, global_, legal_bytes, offset_bytes = wr.encode_batch(list(states))
+        ids = np.arange(
+            self._external_request_id, self._external_request_id + rows, dtype=np.uint64
+        ).astype("<u4")
+        self._external_request_id = (self._external_request_id + rows) & 0xFFFFFFFF
+        offsets = np.frombuffer(offset_bytes, dtype="<u4")
+        if np.any(offsets[1:] == offsets[:-1]):
+            raise ValueError("a live state has no legal macros")
+        payload = {
+            "version": EVALUATOR_ABI_VERSION,
+            "rows": rows,
+            "sheet_planes": planes,
+            "sheet_scalars": scalars,
+            "viewer_plane": viewer,
+            "global_scalars": global_,
+            "legal_indices": legal_bytes,
+            "legal_offsets": offset_bytes,
+            "kind": bytes([POLICY] * rows),
+            "seats": bytes(int(count) for count in seats),
+            "request_id": ids.tobytes(),
+        }
+        response = self.forward(payload)
+        response_ids = np.frombuffer(response["request_id"], dtype="<u4")
+        if not np.array_equal(response_ids, ids):
+            order = {int(r): i for i, r in enumerate(response_ids)}
+            if set(order) != set(int(i) for i in ids):
+                raise ValueError("policy response request ids are not aligned")
+        response_offsets = np.frombuffer(response["legal_offsets"], dtype="<u4").astype(np.int64)
+        logits = np.frombuffer(response["legal_logits"], dtype="<f4")
+        legal = np.frombuffer(legal_bytes, dtype="<u2").astype(np.int64)
+        by_row = (
+            range(rows)
+            if np.array_equal(response_ids, ids)
+            else [order[int(i)] for i in ids]
+        )
+        starts = response_offsets[:-1]
+        lengths = np.diff(response_offsets)
+        row_max = np.maximum.reduceat(logits, starts)
+        is_max = logits == np.repeat(row_max, lengths)
+        request_offsets = offsets.astype(np.int64)
+        choices = []
+        for request_row, response_row in enumerate(by_row):
+            a, b = int(response_offsets[response_row]), int(response_offsets[response_row + 1])
+            c, d = int(request_offsets[request_row]), int(request_offsets[request_row + 1])
+            if b - a != d - c:
+                raise ValueError("policy response legal segment is misaligned")
+            choices.append(int(legal[c:d][is_max[a:b]].min()))
+        return choices
+
     def policy_states(
         self, states: Sequence[object], seats: Sequence[int]
     ) -> tuple[list[np.ndarray], list[tuple[int, ...]]]:

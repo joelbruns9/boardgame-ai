@@ -450,6 +450,140 @@ impl RustGameState {
 }
 
 /// The primitive sequence a macro index stands for.
+/// Encode many states for their own actors, and list their legal macros, in
+/// parallel across CPU cores (2026-10-03: profiling paired-target playouts put
+/// 54% of the wall time in one-at-a-time `encode_state` calls at ~66 us each).
+///
+/// Returns the four packed little-endian float32 buffers row-major in input
+/// order, then the flat legal-macro indices (u16) and their row offsets (u32)
+/// -- the evaluator's POLICY payload layout. The encoding is the same function
+/// `encode_state` calls; only the scheduling differs.
+/// One worker's packed output: the four float buffers, legal indices (u16
+/// LE), and how many legal macros each of its rows has.
+struct PackedChunk {
+    planes: Vec<u8>,
+    scalars: Vec<u8>,
+    viewer: Vec<u8>,
+    global: Vec<u8>,
+    legal: Vec<u8>,
+    counts: Vec<u32>,
+}
+
+/// Append `values` as little-endian f32 bytes in one copy.
+fn extend_f32_le(out: &mut Vec<u8>, values: &[f32]) {
+    #[cfg(target_endian = "little")]
+    {
+        // SAFETY: f32 has no padding and every bit pattern is a valid u8
+        // sequence; on a little-endian target the in-memory bytes ARE the
+        // little-endian encoding `f32_le_bytes` builds element by element.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(values.as_ptr() as *const u8, std::mem::size_of_val(values))
+        };
+        out.extend_from_slice(bytes);
+    }
+    #[cfg(not(target_endian = "little"))]
+    out.extend(f32_le_bytes(values));
+}
+
+fn encode_chunk(games: &[Game]) -> Result<PackedChunk, EngineError> {
+    let mut chunk = PackedChunk {
+        planes: Vec::with_capacity(games.len() * encoder::SHEET_PLANES_LEN * 4),
+        scalars: Vec::with_capacity(games.len() * encoder::SHEET_SCALARS_LEN * 4),
+        viewer: Vec::with_capacity(games.len() * encoder::VIEWER_PLANE_LEN * 4),
+        global: Vec::with_capacity(games.len() * encoder::NUM_GLOBAL_SCALAR * 4),
+        legal: Vec::new(),
+        counts: Vec::with_capacity(games.len()),
+    };
+    for game in games {
+        let encoded = encoder::encode_state(game, game.actor)?;
+        extend_f32_le(&mut chunk.planes, &encoded.sheet_planes);
+        extend_f32_le(&mut chunk.scalars, &encoded.sheet_scalars);
+        extend_f32_le(&mut chunk.viewer, &encoded.viewer_plane);
+        extend_f32_le(&mut chunk.global, &encoded.global_scalars);
+        let legal = macro_codec::legal_macros(game)?;
+        for action in &legal {
+            chunk.legal.extend_from_slice(&(*action as u16).to_le_bytes());
+        }
+        chunk.counts.push(legal.len() as u32);
+    }
+    Ok(chunk)
+}
+
+/// Encode many states for their own actors, and list their legal macros, in
+/// parallel across CPU cores (2026-10-03: profiling paired-target playouts put
+/// 54% of the wall time in one-at-a-time `encode_state` calls at ~66 us each).
+///
+/// Returns the four packed little-endian float32 buffers row-major in input
+/// order, then the flat legal-macro indices (u16) and their row offsets (u32)
+/// -- the evaluator's POLICY payload layout. The encoding is the same function
+/// `encode_state` calls; each worker also packs its own rows, because serial
+/// packing measured as costly as the encoding itself. Workers default to the
+/// core count capped at 8, where scaling flattened (measured, 2,000 states:
+/// 1 -> 131 ms, 4 -> 43, 8 -> 38, 16 -> 46); `WTO_ENCODE_THREADS` overrides.
+#[pyfunction]
+fn encode_batch<'py>(
+    py: Python<'py>,
+    states: Vec<PyRef<'py, RustGameState>>,
+) -> PyResult<(
+    Bound<'py, PyBytes>,
+    Bound<'py, PyBytes>,
+    Bound<'py, PyBytes>,
+    Bound<'py, PyBytes>,
+    Bound<'py, PyBytes>,
+    Bound<'py, PyBytes>,
+)> {
+    let games: Vec<Game> = states.iter().map(|state| state.inner.clone()).collect();
+    drop(states);
+    let rows = games.len();
+    let workers = std::env::var("WTO_ENCODE_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8))
+        .clamp(1, 16)
+        .min(rows.max(1));
+    let chunks: Vec<Result<PackedChunk, EngineError>> = py.detach(|| {
+        let size = rows.div_ceil(workers.max(1)).max(1);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = games
+                .chunks(size)
+                .map(|part| scope.spawn(move || encode_chunk(part)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("encode worker panicked"))
+                .collect()
+        })
+    });
+    let mut planes = Vec::with_capacity(rows * encoder::SHEET_PLANES_LEN * 4);
+    let mut scalars = Vec::with_capacity(rows * encoder::SHEET_SCALARS_LEN * 4);
+    let mut viewer = Vec::with_capacity(rows * encoder::VIEWER_PLANE_LEN * 4);
+    let mut global = Vec::with_capacity(rows * encoder::NUM_GLOBAL_SCALAR * 4);
+    let mut legal = Vec::new();
+    let mut offsets: Vec<u8> = Vec::with_capacity((rows + 1) * 4);
+    offsets.extend_from_slice(&0u32.to_le_bytes());
+    let mut total = 0u32;
+    for chunk in chunks {
+        let chunk = chunk.map_err(to_py)?;
+        planes.extend_from_slice(&chunk.planes);
+        scalars.extend_from_slice(&chunk.scalars);
+        viewer.extend_from_slice(&chunk.viewer);
+        global.extend_from_slice(&chunk.global);
+        legal.extend_from_slice(&chunk.legal);
+        for count in chunk.counts {
+            total += count;
+            offsets.extend_from_slice(&total.to_le_bytes());
+        }
+    }
+    Ok((
+        PyBytes::new(py, &planes),
+        PyBytes::new(py, &scalars),
+        PyBytes::new(py, &viewer),
+        PyBytes::new(py, &global),
+        PyBytes::new(py, &legal),
+        PyBytes::new(py, &offsets),
+    ))
+}
+
 #[pyfunction]
 fn macro_primitives(index: usize) -> PyResult<Vec<usize>> {
     macro_codec::primitives_for(index).map_err(to_py)
@@ -878,6 +1012,7 @@ fn welcome_to_rust(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<RustSampleShardWriter>()?;
     module.add_class::<RustTrainingBatchLoader>()?;
     module.add_function(wrap_pyfunction!(table_signature, module)?)?;
+    module.add_function(wrap_pyfunction!(encode_batch, module)?)?;
     module.add_function(wrap_pyfunction!(snapshot_version, module)?)?;
     module.add_function(wrap_pyfunction!(portable_rng_stream, module)?)?;
     module.add_function(wrap_pyfunction!(portable_rng_shuffle, module)?)?;
