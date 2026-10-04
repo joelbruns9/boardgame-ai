@@ -25,12 +25,13 @@ use crate::rng::Rng;
 use crate::tables;
 use crate::{to_py, RustGameState};
 
+/// 7: encoder v4 rows (ENCODER_ABI_VERSION 4, 2026-10-03).
 /// 6: adds the per-seat `plan_k_dies_soon` targets (2026-09-30).
 /// 5: adds the per-seat `forced_refusals_soon` target (2026-09-30).
 /// 4: encoder v3 rows after review 2026-09-25 (ENCODER_ABI_VERSION 3).
 /// Versions 1-5 are refused, never read (spec §0.4): 1-3 hold rows of an
 /// earlier encoder, 4-5 lack targets that cannot be re-derived from the row.
-pub const TRAINING_SHARD_VERSION: u16 = 6;
+pub const TRAINING_SHARD_VERSION: u16 = 7;
 pub const GLOBAL_TARGET_NAMES: [&str; 9] = [
     "turns_left",
     "rank_p_0",

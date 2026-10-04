@@ -165,6 +165,12 @@ class NetConfig:
     trunk_blocks: int = 2
     head_hidden: int = 256
     dropout: float = 0.0
+    #: The shared plan encoder (encoder v4, 2026-10-03): one small network
+    #: reads each plan slot -- identity, characteristics and every seat's
+    #: progress block for that slot -- so a plan is learned once, whichever
+    #: slot it is dealt in.
+    plan_hidden: int = 128
+    plan_out: int = 64
 
 
 def _mlp(sizes: list[int], dropout: float = 0.0) -> nn.Sequential:
@@ -208,7 +214,16 @@ class WelcomeToNet(nn.Module):
         )
 
         viewer_floats = enc.NUM_STREETS * enc.MAX_STREET_LEN
-        trunk_in = enc.MAX_SEATS * c.sheet_out + viewer_floats + enc.NUM_GLOBAL_SCALAR
+        plan_in = enc.PLAN_IDENTITY_WIDTH + enc.MAX_SEATS * enc.PLAN_SLOT_WIDTH
+        self.plan_encoder = _mlp([plan_in, c.plan_hidden, c.plan_out], c.dropout)
+        self._plan_identity = [enc.plan_identity_slot_slice(k) for k in range(3)]
+        self._plan_progress = [enc.plan_slot_slice(k) for k in range(3)]
+        trunk_in = (
+            enc.MAX_SEATS * c.sheet_out
+            + viewer_floats
+            + enc.NUM_GLOBAL_SCALAR
+            + 3 * c.plan_out
+        )
         self.trunk_in = nn.Sequential(
             nn.Linear(trunk_in, c.trunk_hidden),
             nn.LayerNorm(c.trunk_hidden),
@@ -241,11 +256,28 @@ class WelcomeToNet(nn.Module):
         )
         h_seat = self.sheet_encoder(flat)                      # (B, seats, sheet_out)
 
+        # Each plan slot through the one shared plan encoder.
+        slots = torch.stack(
+            [
+                torch.cat(
+                    [
+                        global_scalars[:, identity],
+                        sheet_scalars[:, :, progress].reshape(batch, -1),
+                    ],
+                    dim=-1,
+                )
+                for identity, progress in zip(self._plan_identity, self._plan_progress)
+            ],
+            dim=1,
+        )                                                      # (B, 3, plan_in)
+        h_plans = self.plan_encoder(slots)                     # (B, 3, plan_out)
+
         trunk_input = torch.cat(
             [
                 h_seat.reshape(batch, -1),
                 viewer_plane.reshape(batch, -1),
                 global_scalars,
+                h_plans.reshape(batch, -1),
             ],
             dim=-1,
         )

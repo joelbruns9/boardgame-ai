@@ -427,5 +427,6 @@ def test_a_banked_plan_shows_on_the_seat_that_banked_it():
     assert sheets[1, slot0][2] == 1.0, "seat 1 did"
 
     identity = glob[enc.block_slice("plan_identity")].reshape(3, -1)
-    assert identity[0, -1] == 0.0, "the first-place value is claimed"
-    assert identity[1, -1] == 1.0, "the other slots are still open"
+    open_flag = enc.NUM_DEALT_PLANS + 2   # v4: characteristics follow the flag
+    assert identity[0, open_flag] == 0.0, "the first-place value is claimed"
+    assert identity[1, open_flag] == 1.0, "the other slots are still open"

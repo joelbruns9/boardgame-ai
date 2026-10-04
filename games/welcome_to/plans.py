@@ -721,6 +721,98 @@ def requirements(plan: Plan, sheet: "Sheet") -> Requirements:
     )
 
 
+#: Width of :func:`plan_characteristics` (encoder v4, 2026-10-03).
+NUM_PLAN_CHARACTERISTICS: int = 26
+_CHARACTERISTIC_KINDS: tuple[PlanKind, ...] = (
+    PlanKind.ESTATE,
+    PlanKind.FULL_STREET,
+    PlanKind.FIVE_BIS,
+    PlanKind.SEVEN_TEMP,
+    PlanKind.EXTREMITIES,
+    PlanKind.DECORATIVE,
+    PlanKind.COMPLETE_STREET,
+)
+
+
+def plan_characteristics(plan: Plan) -> tuple[float, ...]:
+    """A fixed description of what a plan asks for, shared across plans.
+
+    The 28-way identity makes every plan its own symbol, and a pool plan is
+    dealt in about one game in eleven for its slot. These 26 numbers let plans
+    that ask for the same things -- pools, a particular street, size-6 estates
+    -- be learned as one family:
+
+    ``kind`` (7, one-hot) · ``street`` (3: the street a street-bound plan
+    names; zero for any-street plans) · ``needs`` (6: pools, parks,
+    roundabout, bis, temp marks, estates) · ``estate sizes`` (6: required
+    estates of each size, ÷6) · ``estates`` (1: how many, ÷6) · ``stack`` (3,
+    one-hot).
+    """
+    kind = plan.kind
+    out = [float(kind is k) for k in _CHARACTERISTIC_KINDS]
+    street = [0.0, 0.0, 0.0]
+    if kind is PlanKind.FULL_STREET:
+        street[int(plan.params[0])] = 1.0
+    elif kind is PlanKind.DECORATIVE and plan.params[0] == "pool&park":
+        street[int(plan.params[1])] = 1.0
+    out += street
+    what = plan.params[0] if kind is PlanKind.DECORATIVE else None
+    out += [
+        float(kind is PlanKind.COMPLETE_STREET or what in ("pool", "pool&park")),
+        float(kind is PlanKind.COMPLETE_STREET or what in ("park", "pool&park")),
+        float(kind is PlanKind.COMPLETE_STREET),
+        float(kind is PlanKind.FIVE_BIS),
+        float(kind is PlanKind.SEVEN_TEMP),
+        float(kind is PlanKind.ESTATE),
+    ]
+    sizes = Counter(plan.required_sizes)
+    out += [sizes.get(size, 0) / 6.0 for size in range(1, 7)]
+    out.append(len(plan.required_sizes) / 6.0)
+    out += [float(plan.stack == stack) for stack in (1, 2, 3)]
+    assert len(out) == NUM_PLAN_CHARACTERISTICS
+    return tuple(out)
+
+
+def pool_target_boxes(plan: Plan, sheet: "Sheet") -> list[tuple[int, int]]:
+    """The empty, still-usable pool boxes a pool plan needs (encoder v4).
+
+    Planes 19-21 ("plan k still needs a house here") were all zero for pool
+    plans, so nothing told the network that a particular pool box must take a
+    pool-effect house or the plan dies. A fact about the sheet, the analogue of
+    the full-street plane: the pool boxes still alive (as
+    :func:`_pool_boxes_alive` counts them) in every street that can still
+    finish its pools and that the plan needs.
+    """
+    kind = plan.kind
+    if kind not in (PlanKind.DECORATIVE, PlanKind.COMPLETE_STREET) or not feasible(plan, sheet):
+        return []   # a dead plan needs no box
+    if kind is PlanKind.DECORATIVE:
+        what = plan.params[0]
+        if what == "park":
+            return []
+        candidates = range(NUM_STREETS) if what == "pool" else (int(plan.params[1]),)
+    elif kind is PlanKind.COMPLETE_STREET:
+        roundabout_left = sheet.can_build_roundabout()
+        candidates = [
+            x for x in range(NUM_STREETS) if sheet.has_roundabout_in_street(x) or roundabout_left
+        ]
+    else:
+        return []
+    streets = [
+        x
+        for x in candidates
+        if sheet.pools[x] < 3 and sheet.pools[x] + _pool_boxes_alive(sheet, x) >= 3
+    ]
+    spans = sheet.span_if_roundabout()
+    return [
+        (x, y)
+        for x, y in POOL_POSITIONS
+        if x in streets
+        and sheet.numbers[x][y] is None
+        and (spans[x][y] > 0 or sheet.bis_reachable(x, y))
+    ]
+
+
 def turns_lower_bound(plan: Plan, sheet: "Sheet") -> int:
     """Fewest turns in which ``plan`` could still complete.  A hard bound.
 

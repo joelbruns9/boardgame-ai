@@ -27,17 +27,19 @@ use crate::constants::{
 };
 use crate::game::{EngineError, EngineResult, Game, Phase, NO_CARD};
 use crate::plans::{
-    dense_index, feasible, progress, requirements_given, turns_lower_bound_given, Plan,
-    PlanKind, Requirements, NUM_DEALT_PLANS, PLANS,
+    dense_index, feasible, plan_characteristics, pool_target_boxes, progress,
+    requirements_given, turns_lower_bound_given, Plan, PlanKind, Requirements, NUM_DEALT_PLANS,
+    PLANS,
 };
 use crate::sheet::{Pos, Sheet};
 
-pub const ENCODER_ABI_VERSION: usize = 3;
+pub const ENCODER_ABI_VERSION: usize = 4;
 pub const MAX_SEATS: usize = 4;
 pub const MAX_PLAYERS: usize = 6;
 pub const SHEET_PLANES: usize = 22;
 pub const NUM_SHEET_SCALAR: usize = 194;
-pub const NUM_GLOBAL_SCALAR: usize = 367;
+/// v4: + 3 x 26 plan characteristics, - the 6-wide absolute seat one-hot.
+pub const NUM_GLOBAL_SCALAR: usize = 439;
 #[allow(dead_code)] // mirrors encoder.PLAN_SLOT_WIDTH; asserted in tests
 pub const PLAN_SLOT_WIDTH: usize = 34;
 pub const SHEET_PLANES_LEN: usize = MAX_SEATS * SHEET_PLANES * NUM_STREETS * MAX_STREET_LEN;
@@ -682,6 +684,10 @@ fn write_sheet_planes(
             continue;
         }
         for &(x, y) in &facts[slot].req.target_boxes {
+            targets[slot][x][y] = true;
+        }
+        // v4: pool plans mark the pool boxes they still need.
+        for (x, y) in pool_target_boxes(&PLANS[game.plan_ids[slot]], sheet) {
             targets[slot][x][y] = true;
         }
     }
@@ -1509,6 +1515,9 @@ fn global_scalars(game: &Game, viewer: usize, view: &DeckView) -> EngineResult<V
         w.put_f64(plan.scores.0 as f64 / 20.0);
         w.put_f64(plan.scores.1 as f64 / 20.0);
         w.put(game.plan_turns_for(viewer, slot).is_empty() as u8 as f32);
+        for value in plan_characteristics(plan) {
+            w.put_f64(value);
+        }
     }
 
     w.put(game.may_ask_reshuffle() as u8 as f32);
@@ -1559,7 +1568,6 @@ fn global_scalars(game: &Game, viewer: usize, view: &DeckView) -> EngineResult<V
     w.put(game.config.expert as u8 as f32);
     w.put(game.config.solo() as u8 as f32);
     w.put_f64(game.config.players as f64 / MAX_PLAYERS as f64);
-    w.one_hot((viewer < MAX_PLAYERS).then_some(viewer), MAX_PLAYERS);
     let seats = seat_order(game, viewer).len();
     for k in 0..MAX_SEATS {
         w.put((k < seats) as u8 as f32);
@@ -1645,7 +1653,7 @@ mod tests {
         assert_eq!(SHEET_PLANES_LEN, 4 * 22 * 36);
         assert_eq!(SHEET_SCALARS_LEN, 4 * 194);
         assert_eq!(VIEWER_PLANE_LEN, 36);
-        assert_eq!(NUM_GLOBAL_SCALAR, 367);
+        assert_eq!(NUM_GLOBAL_SCALAR, 439);
         assert_eq!(NUM_DEALT_PLANS, 28);
         assert_eq!(3 * PLAN_SLOT_WIDTH, 102);
     }

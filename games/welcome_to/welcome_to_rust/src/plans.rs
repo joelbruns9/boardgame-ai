@@ -446,6 +446,83 @@ fn pool_boxes_alive(sheet: &Sheet, x: usize) -> i32 {
     alive
 }
 
+/// `plans.plan_characteristics` (encoder v4): kind (7) · street (3) · needs
+/// (6: pools, parks, roundabout, bis, temp, estates) · estate sizes (6, ÷6) ·
+/// estate count (1, ÷6) · stack (3).
+pub const NUM_PLAN_CHARACTERISTICS: usize = 26;
+
+pub fn plan_characteristics(plan: &Plan) -> [f64; NUM_PLAN_CHARACTERISTICS] {
+    let mut out = [0.0f64; NUM_PLAN_CHARACTERISTICS];
+    let kinds = [
+        PlanKind::Estate,
+        PlanKind::FullStreet,
+        PlanKind::FiveBis,
+        PlanKind::SevenTemp,
+        PlanKind::Extremities,
+        PlanKind::Decorative,
+        PlanKind::CompleteStreet,
+    ];
+    for (i, kind) in kinds.iter().enumerate() {
+        out[i] = (plan.kind == *kind) as u8 as f64;
+    }
+    let what = if plan.kind == PlanKind::Decorative { Some(plan.params[0].text()) } else { None };
+    if plan.kind == PlanKind::FullStreet {
+        out[7 + plan.params[0].int() as usize] = 1.0;
+    } else if what == Some("pool&park") {
+        out[7 + plan.params[1].int() as usize] = 1.0;
+    }
+    let complete = plan.kind == PlanKind::CompleteStreet;
+    out[10] = (complete || matches!(what, Some("pool") | Some("pool&park"))) as u8 as f64;
+    out[11] = (complete || matches!(what, Some("park") | Some("pool&park"))) as u8 as f64;
+    out[12] = complete as u8 as f64;
+    out[13] = (plan.kind == PlanKind::FiveBis) as u8 as f64;
+    out[14] = (plan.kind == PlanKind::SevenTemp) as u8 as f64;
+    out[15] = (plan.kind == PlanKind::Estate) as u8 as f64;
+    let sizes = plan.required_sizes();
+    for size in 1..=6usize {
+        out[15 + size] = sizes.iter().filter(|&&s| s == size).count() as f64 / 6.0;
+    }
+    out[22] = sizes.len() as f64 / 6.0;
+    out[23 + (plan.stack as usize - 1)] = 1.0;
+    out
+}
+
+/// `plans.pool_target_boxes` (encoder v4): the empty, still-usable pool boxes
+/// a pool plan needs, in streets that can still finish their pools.
+pub fn pool_target_boxes(plan: &Plan, sheet: &Sheet) -> Vec<(usize, usize)> {
+    if !matches!(plan.kind, PlanKind::Decorative | PlanKind::CompleteStreet) || !feasible(plan, sheet) {
+        return Vec::new(); // a dead plan needs no box
+    }
+    let candidates: Vec<usize> = match plan.kind {
+        PlanKind::Decorative => match plan.params[0].text() {
+            "pool" => (0..NUM_STREETS).collect(),
+            "pool&park" => vec![plan.params[1].int() as usize],
+            _ => return Vec::new(),
+        },
+        PlanKind::CompleteStreet => {
+            let roundabout_left = sheet.can_build_roundabout();
+            (0..NUM_STREETS)
+                .filter(|&x| sheet.has_roundabout_in_street(x) || roundabout_left)
+                .collect()
+        }
+        _ => return Vec::new(),
+    };
+    let streets: Vec<usize> = candidates
+        .into_iter()
+        .filter(|&x| sheet.pools[x] < 3 && sheet.pools[x] + pool_boxes_alive(sheet, x) >= 3)
+        .collect();
+    let spans = sheet.span_if_roundabout(true);
+    POOL_POSITIONS
+        .iter()
+        .copied()
+        .filter(|&(x, y)| {
+            streets.contains(&x)
+                && sheet.numbers[x][y] == EMPTY
+                && (spans[x][y] > 0 || sheet.bis_reachable(x, y))
+        })
+        .collect()
+}
+
 /// Is `plan` still reachable on `sheet`? **Sound, not complete.**
 pub fn feasible(plan: &Plan, sheet: &Sheet) -> bool {
     match plan.kind {

@@ -124,6 +124,9 @@ from games.welcome_to.plans import (
     Plan,
     PlanKind,
     dense_index,
+    NUM_PLAN_CHARACTERISTICS,
+    plan_characteristics,
+    pool_target_boxes,
     feasible,
     progress,
     requirements,
@@ -145,7 +148,7 @@ MAX_OPPONENTS: int = MAX_SEATS - 1
 #    reshuffle vote, F4 dead-street demand, F5 phase-aware houses, F6 card
 #    pairing, §8 rescue/best-roundabout semantics, and `reshuffle_contraction`
 #    8 -> 6 (SPEC GAP 2).  ABI 2 was never trained on.
-ENCODER_ABI_VERSION: int = 3
+ENCODER_ABI_VERSION: int = 4
 #: Width of the seat-index one-hot.
 MAX_PLAYERS: int = 6
 
@@ -242,6 +245,10 @@ SHEET_SCALAR_BLOCKS: tuple[tuple[str, int], ...] = (
 )
 NUM_SHEET_SCALAR: int = sum(size for _, size in SHEET_SCALAR_BLOCKS)
 
+#: One plan slot inside ``plan_identity``: the 28-way identity, the two point
+#: values and "first place still open", then (v4) the plan's characteristics.
+PLAN_IDENTITY_WIDTH: int = NUM_DEALT_PLANS + 3 + NUM_PLAN_CHARACTERISTICS
+
 #: Named blocks of the game-wide flat vector, in order (§9.3).  Viewer-relative
 #: is fine here; per-*seat* is not -- that goes in the sheet block above.
 GLOBAL_SCALAR_BLOCKS: tuple[tuple[str, int], ...] = (
@@ -251,7 +258,7 @@ GLOBAL_SCALAR_BLOCKS: tuple[tuple[str, int], ...] = (
     ("chosen_combination", NUM_NUMBER_VALUES + _NUM_EFFECTS + 1),
     ("last_house", NUM_BOXES + 1),
     ("pending_estate", 7),
-    ("plan_identity", 3 * (NUM_DEALT_PLANS + 3)),
+    ("plan_identity", 3 * PLAN_IDENTITY_WIDTH),   # v4: + characteristics
     ("reshuffle_race", 2),
     ("next_effects", 3 * _NUM_EFFECTS),
     ("deck", 2 + 3 * _NUM_NUMBERS + 2 * _NUM_EFFECTS + _NUM_NUMBERS),
@@ -260,7 +267,9 @@ GLOBAL_SCALAR_BLOCKS: tuple[tuple[str, int], ...] = (
     ("bis_availability_rate", 1),           # §9.3
     ("turns_to_reform", 1),                 # §7.4
     ("config", 4),
-    ("seat", MAX_PLAYERS),
+    # v4 (2026-10-03): the absolute viewer-seat one-hot is gone. Learner rows
+    # were always seat 0 while opponent inference ran as seats 1-3 (review
+    # 2026-10-02 §2.4); seats are viewer-relative everywhere else.
     ("seat_validity", MAX_SEATS),
 )
 NUM_GLOBAL_SCALAR: int = sum(size for _, size in GLOBAL_SCALAR_BLOCKS)
@@ -549,7 +558,10 @@ def _sheet_planes(
         if seat in state.plan_turns_for(viewer, slot):
             targets.append(set())
             continue
-        targets.append(set(requirements(PLANS[plan_id], sheet).target_boxes))
+        targets.append(
+            set(requirements(PLANS[plan_id], sheet).target_boxes)
+            | set(pool_target_boxes(PLANS[plan_id], sheet))   # v4
+        )
 
     # §7.1: compute the fit planes ONCE PER GAP and broadcast.  A gap is a
     # maximal empty run; every box inside one has identical bounds.
@@ -1334,6 +1346,7 @@ def _global_scalars(state: GameState, viewer: int, view: _DeckView) -> np.ndarra
             plan.scores[1] / 20.0,
             0.0 if state.plan_turns_for(viewer, slot) else 1.0,
         )
+        w.put(*plan_characteristics(plan))   # v4
 
     # THE THIRD RACE: whoever finishes the first plan chooses the reshuffle.
     # The second flag is the viewer's OWN vote, not the table-wide
@@ -1382,7 +1395,6 @@ def _global_scalars(state: GameState, viewer: int, view: _DeckView) -> np.ndarra
         float(cfg.solo),
         cfg.players / MAX_PLAYERS,
     )
-    w.one_hot(viewer if viewer < MAX_PLAYERS else None, MAX_PLAYERS)
     seats = len(seat_order(state, viewer))
     for k in range(MAX_SEATS):
         w.put(1.0 if k < seats else 0.0)
@@ -1488,6 +1500,15 @@ def block_axis(name: str) -> str:
         return _BLOCKS[name][0]
     except KeyError:
         raise KeyError(f"no scalar block named {name!r}") from None
+
+
+def plan_identity_slot_slice(slot: int) -> slice:
+    """Where plan ``slot``'s identity + characteristics sit in the global vector."""
+    if not 0 <= slot < 3:
+        raise ValueError(f"plan slot {slot} out of range")
+    block = block_slice("plan_identity")
+    start = block.start + slot * PLAN_IDENTITY_WIDTH
+    return slice(start, start + PLAN_IDENTITY_WIDTH)
 
 
 def plan_slot_slice(slot: int) -> slice:

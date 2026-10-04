@@ -1,6 +1,10 @@
 # Welcome To… — next toy run: plan for review
 
-**Date:** 2026-10-03. **Status:** proposal; nothing here is built yet.
+**Date:** 2026-10-03. **Status: BUILT 2026-10-03** (commits 94c0a08, ac3223d and the
+encoder-v4 commit) -- ready for the toy run, command in §4. Encoder v4: ABI 4, global
+inputs 439, training shard version 7, Python/Rust equivalence 60,127 encodings with zero
+divergences; the fixed paired benchmark re-encodes its positions with the current
+encoder.
 **Framing (owner, 2026-10-03):** the laptop model is a toy whose job is to show the
 system *can learn* the pieces a strong player needs. The real model trains from
 scratch on a rented cloud box afterwards. Breaking checkpoints and the encoder is
@@ -118,7 +122,11 @@ rate, turn of each plan completion. Ordinary games only, as today.
   v3_curriculum_01 only had A from iteration 36, so iterations 1–20 compare
   "package" against "curriculum only" directly.
 * Launch as a separate Windows process (the memory-watchdog workaround) or by the
-  owner in a terminal.
+  owner in a terminal:
+
+  ```
+  .\.venv\Scripts\python.exe -m games.welcome_to.s2_run --run-dir runs/welcome_to_s2/v4_package_01 --iterations 20 --restart-fraction 0.2 --deal-fraction 0.25 --pairs-roots 300 --pairs-start-iteration 3 --pairs-plan-aware 0.3 --helpers-end-iteration 12 --pairs-benchmark runs/welcome_to_s2/v3_curriculum_01/_sibling_probe_48/dataset.pt
+  ```
 
 ## 5. Build order and size
 

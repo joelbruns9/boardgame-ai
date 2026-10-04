@@ -246,8 +246,16 @@ def benchmark(checkpoint: Path, dataset: Path, device: str = "cuda", split_seed:
     with that dataset's independent eval futures as truth."""
     from games.welcome_to import s2_train
 
+    import welcome_to_rust as wr
+
     payload = torch.load(dataset, weights_only=False)
     test = sibling_probe._split(payload["roots"], split_seed)["test"]
+    # Re-encode every afterstate with the CURRENT encoder: the dataset's stored
+    # encodings belong to the encoder that collected it, and a benchmark must
+    # survive encoder changes (v4 broke the v3 layout).
+    for root in test:
+        base = wr.RustGameState.from_snapshot(root["snapshot"])
+        root["afterstates"] = [sibling_probe._encode(base.step_macro(c)) for c in root["candidates"]]
     net, _ = s2_train.load_training_checkpoint(checkpoint, device)
     return decision_metrics(net, test, torch.device(device), payload["simulations"], fit=payload["fit_futures"])
 
