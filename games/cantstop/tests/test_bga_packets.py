@@ -174,3 +174,44 @@ def test_live_luck_summary_from_a_game_log(tmp_path):
     assert by["89146710"]["dice_pts"] == pytest.approx(-by["96364907"]["dice_pts"], abs=0.11)
     again = live.summary("925113041")                            # cached solves
     assert again == r
+
+
+def test_a_damaged_log_line_is_skipped(tmp_path):
+    """One line holding only the tail of a record (the 2026-10-03 write
+    race) must not stop the game from loading or replaying."""
+    lines = FIXTURE.read_text(encoding="utf-8").splitlines()
+    i = next(k for k, l in enumerate(lines) if '"decision"' in l and k > 40)
+    lines[i] = lines[i][len(lines[i]) // 2:]
+    log = tmp_path / "table_925113041.jsonl"
+    log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    game = load_game(log)
+    assert game.skipped >= 1
+    turns = read_turns(log, game)
+    assert game.source == "packets" and turns[-1].end == "win"
+
+
+def test_a_wakeup_nudge_without_a_move_id_is_not_a_hole():
+    """BGA nudges an idle table with a packet that has no move id; the
+    record is still whole. A move-less packet that carried a roll is not."""
+    rs = rows()
+    rs.append({"kind": "bga_packets", "extra": {"packets": [
+        {"move_id": None, "packet_id": 98, "data": [{"type": "wakeupPlayers", "args": []}]}]}})
+    assert starts_at_game_start(packet_events(rs))
+    (turns, final), _ = real_replay(rs)
+    assert final.winner == 1
+    rs.append({"kind": "bga_packets", "extra": {"packets": [
+        {"move_id": None, "packet_id": 99, "data": [{"type": "rollDice", "args": {"dice": [1, 1, 1, 1]}}]}]}})
+    assert not starts_at_game_start(packet_events(rs))
+
+
+def test_a_game_ended_without_a_winner_still_replays():
+    """A concession or timeout: BGA sends game over mid-game. The record up
+    to then replays; the result is left unknown."""
+    events = packet_events(rows())
+    cut = next(i for i, (m, k, a) in enumerate(events) if m >= 120 and k == "rollDice")
+    events = events[:cut] + [(events[cut][0], "gameStateChange", {"id": 99})]
+    game = load_game(FIXTURE)
+    turns, final = replay(events, game.captures[0].state.rules, game.player_ids)
+    assert not final.game_over and turns[-1].end == "ended_early"
+    L = build_ledger(game, turns, HEURISTIC)
+    assert L.outcome is None

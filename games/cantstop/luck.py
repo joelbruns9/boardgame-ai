@@ -161,9 +161,24 @@ def is_stale(prev, cap):
                     for m in legal_moves(a, a.dice)))
 
 
+def read_rows(path):
+    """A game log's rows, and how many lines could not be read. A damaged
+    line is skipped, not fatal: logs are appended live, and two writes that
+    raced (fixed in games/advisor/game_log.py, 2026-10-03) left one line
+    holding only the tail of a record."""
+    rows, bad = [], 0
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            bad += 1
+    return rows, bad
+
+
 def load_game(path, viewer_id=None):
-    rows = [json.loads(line) for line in Path(path).read_text().splitlines()
-            if line.strip()]
+    rows, bad = read_rows(path)
     raws = [r["extra"]["capture"] for r in rows if r.get("kind") == "decision"]
     raws = [r for r in raws if r.get("phase") == "diceChoice"]
     if not raws:
@@ -193,7 +208,7 @@ def load_game(path, viewer_id=None):
     names = {p: raws[-1]["players"][p].get("name", p) for p in order}
     return Game(str(raws[0]["table_id"]), order, order.index(viewer),
                 any(str(r["active_player"]) != viewer for r in raws),
-                caps, names, skipped)
+                caps, names, skipped + bad)
 
 
 # ---- reconstruction: which move, then roll or stop ----
@@ -223,8 +238,7 @@ def read_turns(path, game):
     all of it (every roll, move and stop observed), else reconstructed from
     the board captures with the inference above."""
     from .bga_packets import PacketMismatch, packet_events, replay, starts_at_game_start
-    rows = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()
-            if line.strip()]
+    rows, _bad = read_rows(path)
     events = packet_events(rows)
     if starts_at_game_start(events):
         try:

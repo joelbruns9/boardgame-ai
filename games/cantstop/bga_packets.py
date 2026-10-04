@@ -36,6 +36,7 @@ class PacketMismatch(ValueError):
 
 
 DICE_ROLL, GAME_END = 10, 99
+GAME_EVENTS = {"rollDice", "moveToken", "saveProgress", "removeProgress", "gameStateChange"}
 
 
 def packet_events(rows):
@@ -46,6 +47,13 @@ def packet_events(rows):
         if row.get("kind") != "bga_packets":
             continue
         for p in (row.get("extra") or {}).get("packets") or []:
+            if _int(p.get("move_id")) < 0 and not any(
+                    e.get("type") in GAME_EVENTS for e in p.get("data") or []):
+                # BGA's out-of-band nudges ("wakeupPlayers" to an idle
+                # table, seen on 925888434) carry no move id and no move.
+                # One that did carry a move would keep its -1 and fail
+                # starts_at_game_start, which is the safe outcome.
+                continue
             key = (str(p.get("move_id")), str(p.get("packet_id")))
             if key not in seen:
                 seen.add(key)
@@ -153,8 +161,15 @@ def replay(events, rules, player_ids):
             if sid == DICE_ROLL and state is not None and state.phase == Phase.AWAIT_DECISION:
                 step.then = "roll"
             elif sid == GAME_END:
-                if state is None or not state.game_over:
-                    fail("BGA ended the game; engine has no winner", move_id)
+                if state is None:
+                    fail("BGA ended a game that never started", move_id)
+                if not state.game_over:
+                    # Ended with no winner on the board: a concession or a
+                    # timeout (seen on 925199235). The rolls so far stand;
+                    # the result is unknown to the board.
+                    if turn is not None and not turn.end:
+                        turn.end = "ended_early"
+                    break
         elif kind == "saveProgress":
             if state is None or state.phase != Phase.AWAIT_DECISION:
                 fail("stop outside a stop/roll decision", move_id)

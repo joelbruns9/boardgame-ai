@@ -160,3 +160,30 @@ def test_default_log_dir_is_per_game():
     assert log_dir_for("seven_wonders_duel").as_posix().endswith(
         "runs/seven_wonders_duel/bga_game_log"
     )
+
+
+def test_concurrent_appends_never_interleave(tmp_path):
+    """FastAPI appends from a thread pool. Unserialized, a Windows append
+    (seek to end, then write) can overwrite the head of a concurrent record
+    -- seen on a live Can't Stop table. Large rows force multi-chunk writes."""
+    import threading
+
+    writer = GameLogWriter(tmp_path)
+    threads, per_thread = 16, 40
+    pad = "x" * 20_000
+
+    def post(t):
+        for i in range(per_thread):
+            writer.append(None, table_id="race", kind="bga_packets",
+                          extra={"thread": t, "i": i, "pad": pad})
+
+    workers = [threading.Thread(target=post, args=(t,)) for t in range(threads)]
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join()
+    lines = writer.path_for("race").read_text(encoding="utf-8").splitlines()
+    rows = [json.loads(line) for line in lines]          # every line parses
+    assert len(rows) == threads * per_thread
+    assert {(r["extra"]["thread"], r["extra"]["i"]) for r in rows} == {
+        (t, i) for t in range(threads) for i in range(per_thread)}

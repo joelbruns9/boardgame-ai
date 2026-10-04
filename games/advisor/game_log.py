@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,11 +38,17 @@ class GameLogWriter:
     (a replay importer, a batch backfill) can write the same format.
     """
 
-    __slots__ = ("_dir", "_last")
+    __slots__ = ("_dir", "_last", "_lock")
 
     def __init__(self, log_dir: str | Path):
         self._dir = Path(log_dir)
         self._last: dict[str, str] = {}
+        # FastAPI runs sync routes on a thread pool, so two posts for one
+        # table (a position and a packet batch) can append at once. On
+        # Windows an append is a seek-to-end then a write, not atomic: the
+        # race overwrote the head of one record with another (Can't Stop
+        # table 925887018, 2026-10-03), leaving a line that does not parse.
+        self._lock = threading.Lock()
 
     @staticmethod
     def safe_table_id(table_id: Any) -> str:
@@ -82,23 +89,24 @@ class GameLogWriter:
         # notification-packet batch, say -- has its content in ``extra`` instead,
         # and keying such rows on ``state`` alone made every one of them a
         # duplicate of the last, so only the first was ever written.
-        identity = {"kind": kind, "state": state}
-        if state is None:
-            identity["extra"] = record["extra"]
-        key = hashlib.sha256(
-            json.dumps(identity, sort_keys=True, ensure_ascii=False).encode("utf-8")
-        ).hexdigest()
-        if self._last.get(table) == key:
-            # A streaming client re-posts the same position many times per turn.
-            return {"ok": True, "appended": False, "reason": "duplicate"}
+        with self._lock:
+            identity = {"kind": kind, "state": state}
+            if state is None:
+                identity["extra"] = record["extra"]
+            key = hashlib.sha256(
+                json.dumps(identity, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            ).hexdigest()
+            if self._last.get(table) == key:
+                # A streaming client re-posts the same position many times per turn.
+                return {"ok": True, "appended": False, "reason": "duplicate"}
 
-        self._dir.mkdir(parents=True, exist_ok=True)
-        path = self.path_for(table)
-        record["logged_at"] = time.time()
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n")
-        self._last[table] = key
-        return {"ok": True, "appended": True, "path": str(path)}
+            self._dir.mkdir(parents=True, exist_ok=True)
+            path = self.path_for(table)
+            record["logged_at"] = time.time()
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n")
+            self._last[table] = key
+            return {"ok": True, "appended": True, "path": str(path)}
 
 
 @dataclass(frozen=True, slots=True)
