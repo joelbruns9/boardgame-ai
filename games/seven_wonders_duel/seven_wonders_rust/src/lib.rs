@@ -1916,6 +1916,7 @@ fn scheduler_result_to_py(
     metrics.set_item("unique_nn_leaves", m.unique_nn_leaves)?;
     metrics.set_item("terminal_leaves", m.terminal_leaves)?;
     metrics.set_item("proven_leaves", m.proven_leaves)?;
+    metrics.set_item("solved_nodes", m.solved_nodes)?;
     metrics.set_item("collisions", m.collisions)?;
     metrics.set_item("global_batches", m.global_batches)?;
     metrics.set_item("global_rows", m.global_rows)?;

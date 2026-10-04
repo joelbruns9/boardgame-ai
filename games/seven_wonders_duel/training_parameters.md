@@ -1787,11 +1787,20 @@ expect less.
 
 **Layer 1b, proven losses** (on with the flag; `swr.set_exact_tactics_losses`
 turns it off alone): a node where EVERY move, under every reveal, leaves the
-opponent a guaranteed win is a proven loss (`phase_e.guaranteed_loss_now` is
-the reference; 0 mismatches on 10,463 positions incl. 95 losses). RICCP: the
-losing University move is abandoned in 3/3 seeds at ~4k sims (2/3 win-only)
-and already at ~1k. Self-play A/B vs win-only: faster in all 3 interleaved
-pairs (+7.5% to +13%, noisy run) -- no measurable cost.
+opponent a guaranteed win is a proven loss. RICCP: the losing University move
+is abandoned in 3/3 seeds at ~4k sims (2/3 win-only) and already at ~1k.
+
+**Full G4 (2026-10-04).** The reference is now `tactics.py` (`forced_win` /
+`forced_loss`), which adds wins through ONE extra turn (a play-again wonder, or
+any wonder with Theology) and civilian wins by taking the last card of Age III;
+`phase_e.guaranteed_win_now` stays as the narrower trap-suite predicate. Layer 2
+(MCTS-Solver) propagates proofs up the tree: a node with an exact winning edge,
+or whose every edge is exact, is solved; a chance edge is exact only with its
+complete support (sampled edges never are); the root is never solved. Gate: 0
+mismatches on 16,676 positions (438 wins, 223 losses; 141 wins beyond the
+narrow predicate, 77 civilian). Self-play A/B vs off (laptop, 3 x 32 games per
+arm): ~-2% sims/s (-0.6 / -5.4 / -0.3% per pair), ~22k proven leaves and ~1.4k
+solved interior nodes per 32 games.
 
 ### `--cuda-graphs`, `--no-cuda-graphs`
 

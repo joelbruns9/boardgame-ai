@@ -1490,6 +1490,8 @@ pub struct SchedulerMetrics {
     pub terminal_leaves: usize,
     /// G4: of `terminal_leaves`, the proven-win nodes (`tactics`).
     pub proven_leaves: usize,
+    /// G4 layer 2: interior nodes settled by proof propagation.
+    pub solved_nodes: usize,
     pub collisions: usize,
     pub global_batches: usize,
     pub global_rows: usize,
@@ -1690,6 +1692,7 @@ impl SchedulerMetrics {
             unique_nn_leaves: _,
             terminal_leaves: _,
             proven_leaves: _,
+            solved_nodes: _,
             collisions: _,
             global_batches: _,
             global_rows: _,
@@ -1767,6 +1770,7 @@ impl SchedulerMetrics {
         self.unique_nn_leaves += other.unique_nn_leaves;
         self.terminal_leaves += other.terminal_leaves;
         self.proven_leaves += other.proven_leaves;
+        self.solved_nodes += other.solved_nodes;
         self.collisions += other.collisions;
         self.global_batches += other.global_batches;
         self.global_rows += other.global_rows;
@@ -2403,6 +2407,7 @@ fn absorb_slot_metrics(metrics: &mut SchedulerMetrics, slot: &GameSlot) {
     metrics.unique_nn_leaves += slot.unique_nn_leaves;
     metrics.terminal_leaves += slot.terminal_leaves;
     metrics.proven_leaves += slot.proven_leaves;
+    metrics.solved_nodes += slot.solved_nodes;
     metrics.collisions += slot.collisions;
     metrics.forced_rows += slot.forced_rows;
     metrics.fixed_support_edges += slot.fixed_support_edges;
@@ -2481,6 +2486,7 @@ struct GameSlot {
     unique_nn_leaves: usize,
     terminal_leaves: usize,
     proven_leaves: usize,
+    solved_nodes: usize,
     collisions: usize,
     forced_rows: usize,
     forced_rows_by_kind: [usize; 4],
@@ -2538,6 +2544,7 @@ impl GameSlot {
             unique_nn_leaves: 0,
             terminal_leaves: 0,
             proven_leaves: 0,
+            solved_nodes: 0,
             collisions: 0,
             forced_rows: 0,
             forced_rows_by_kind: [0; 4],
@@ -2778,6 +2785,7 @@ impl GameSlot {
             self.unique_nn_leaves += metrics.unique_nn_leaves;
             self.terminal_leaves += metrics.terminal_leaves;
             self.proven_leaves += metrics.proven_leaves;
+            self.solved_nodes += metrics.solved_nodes;
             self.collisions += metrics.collisions;
             self.forced_rows += metrics.forced_outcome_rows;
             self.fixed_support_edges += metrics.fixed_support_edges;

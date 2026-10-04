@@ -295,9 +295,22 @@ seeds (win-only 2/3), already at ~1k; root 59-62%. Self-play vs win-only:
 +7.5..+13% sims/s in 3/3 interleaved pairs (noisy) -- no measurable cost.
 Advisor host: `SWD_ADVISOR_EXACT_TACTICS`, default on.
 
-Not yet:
-extra-turn and civilian last-card wins, and bounded tactical search (layer 2)
-are not built; no broad suite or game-level measurement.
+**Remaining G4 BUILT 2026-10-04.** Reference moved to `tactics.py`: extra-turn
+wins (one replay, Theology included) and civilian last-card wins, which also
+strengthen proven losses. Layer 2 = MCTS-Solver proof propagation in
+`tree_resumable.rs` (exact winning edge, or all edges exact; chance edges only
+with complete support; never the root; skipped under a specialist leaf bias).
+Gate 0 / 16,676 (438 wins, 223 losses; +141 wins beyond `phase_e`, 77
+civilian). First build cost -28% sims/s: every candidate's whole reveal support
+was applied before checking, and the extra-turn screen let everything through.
+Fixed by checking outcomes lazily and noting that play-again wonders carry no
+shields or science (only Theology widens those reaches): check mean 91 -> 4 us,
+self-play ~-2% vs off with bit-identical games to the slow build. RICCP
+unchanged from win+loss (neither addition fires in those two trees).
+
+Not yet: no broad suite or game-level measurement; bounded search with partial
+[lo, hi] intervals (score-bounded MCTS) not built -- propagation covers exact
+proofs only.
 
 Measure at the **predecessor decision that loses the game** (University), not
 only the tactical leaf. Validate correctness broadly and measure native

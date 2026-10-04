@@ -516,6 +516,105 @@ fn backup(arena: &mut Arena, pending: PendingSimulation, value_p0: f64) {
     }
 }
 
+/// G4 layer 2: the exact value of one edge, when every outcome it can lead to
+/// is settled (terminal or proven). A deterministic edge takes its one child's
+/// value; a probability-weighted edge with its COMPLETE support takes the
+/// weighted sum. A sampled chance edge holds only the outcomes drawn so far and
+/// a fixed-support edge a re-normalised subset, so neither is ever exact.
+fn edge_exact(arena: &Arena, node_id: NodeId, edge_idx: usize) -> Option<(f64, Outlook)> {
+    let edge = &arena.nodes[node_id].edges[edge_idx];
+    if edge.children.is_empty() {
+        return None;
+    }
+    if edge.specs.is_empty() {
+        let (_, child) = edge.children.first()?;
+        return arena.nodes[child.node_id].exact();
+    }
+    if !edge.probability_weighted || edge.fixed_support {
+        return None;
+    }
+    let mut value = 0.0;
+    let mut outlook = [0.0; 7];
+    let mut mass = 0.0;
+    for (_, child) in &edge.children {
+        let p = child.probability?;
+        let (v, o) = arena.nodes[child.node_id].exact()?;
+        value += p * v;
+        for k in 0..7 {
+            outlook[k] += p * o[k];
+        }
+        mass += p;
+    }
+    ((mass - 1.0).abs() <= 1e-9).then_some((value, outlook))
+}
+
+/// G4 layer 2 (MCTS-Solver): the node is settled when its mover has an exact
+/// winning edge, or when every edge is exact (then the mover's best).
+fn solve_node(arena: &Arena, node_id: NodeId) -> Option<(f64, Outlook)> {
+    let node = &arena.nodes[node_id];
+    if node.edges.is_empty() || node.edges.len() != node.legal.len() {
+        return None;
+    }
+    let sign = if node.actor == 0 { 1.0 } else { -1.0 };
+    let mut best: Option<(f64, Outlook)> = None;
+    let mut all_exact = true;
+    for edge_idx in 0..node.edges.len() {
+        match edge_exact(arena, node_id, edge_idx) {
+            Some((value, outlook)) => {
+                if sign * value >= 1.0 - 1e-12 {
+                    return Some((value, outlook));
+                }
+                if best.map_or(true, |(b, _)| sign * value > sign * b) {
+                    best = Some((value, outlook));
+                }
+            }
+            None => all_exact = false,
+        }
+    }
+    if all_exact {
+        best
+    } else {
+        None
+    }
+}
+
+/// After a backup: walk up from a settled leaf, solving ancestors while each
+/// newly settles. Never the root -- it is the decision being searched, and a
+/// settled root would stop every simulation at the root.
+///
+/// A solved node's statistics are reset to its exact value, and so is a
+/// deterministic edge into a settled child, so no stale network estimate is
+/// averaged into either afterwards. Values here are RAW; callers run this
+/// only when the search's leaf bias is inactive, where raw is the utility.
+fn propagate_proofs(arena: &mut Arena, path: &[PathStep]) -> usize {
+    let mut solved = 0;
+    let Some(root_id) = path.first().map(|step| step.node_id) else {
+        return solved;
+    };
+    for step in path.iter().rev() {
+        let Some((child_value, _)) = arena.nodes[step.chance_child_id].exact() else {
+            return solved;
+        };
+        {
+            let edge = &mut arena.nodes[step.node_id].edges[step.edge_id];
+            if edge.specs.is_empty() {
+                edge.value_sum_p0 = edge.visits as f64 * child_value;
+            }
+        }
+        if step.node_id == root_id || arena.nodes[step.node_id].exact().is_some() {
+            return solved;
+        }
+        let Some((value, outlook)) = solve_node(arena, step.node_id) else {
+            return solved;
+        };
+        let node = &mut arena.nodes[step.node_id];
+        node.proven = Some((value, outlook));
+        node.value_sum_p0 = node.visits as f64 * value;
+        solved += 1;
+    }
+    solved
+}
+
 /// F4.5 semantic-safe forced-child expansion: evaluate all materialized children
 /// in one prepared batch, seed the legacy value/visit, and retain priors for the
 /// first ordinary visit without descending an extra ply.
@@ -850,6 +949,8 @@ pub struct SearchMetrics {
     /// Of `terminal_leaves`, those that were G4-proven nodes rather than
     /// finished games.
     pub proven_leaves: usize,
+    /// G4 layer 2: interior nodes settled by proof propagation.
+    pub solved_nodes: usize,
     pub collisions: usize,
     pub leaf_waves: usize,
     pub max_wave_paths: usize,
@@ -1321,7 +1422,16 @@ impl SearchSession {
         let root_edge = pending.root_edge;
         let utility = self.cfg.leaf_bias.shape(value_p0, outlook)?;
         clear_incomplete(&mut self.arena, &mut pending);
+        // Only a settled leaf can settle anything above it, so the common case
+        // costs one check and no allocation.
+        let solver_path = (crate::tactics::enabled()
+            && !self.cfg.leaf_bias.is_active()
+            && self.arena.nodes[pending.leaf_id].exact().is_some())
+            .then(|| pending.path.clone());
         backup(&mut self.arena, pending, utility);
+        if let Some(path) = solver_path {
+            self.metrics.solved_nodes += propagate_proofs(&mut self.arena, &path);
+        }
         self.unshaped_sum += value_p0;
         self.unshaped_visits += 1;
         if let Some(o) = outlook {

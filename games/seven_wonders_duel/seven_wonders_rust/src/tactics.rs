@@ -1,41 +1,39 @@
 //! G4 (`MODEL_GROWTH_PLAN.md`): exact immediate tactics for the searcher.
 //!
-//! A node whose mover has a GUARANTEED win this turn is proven: its value is
-//! exact, so the searcher treats it like a finished game -- no network call, no
-//! expansion, and no later averaging of network estimates into it. The
-//! predicate is a port of `phase_e.guaranteed_win_now`, which is the Python
-//! reference it is gated against (`test_exact_tactics.py`):
+//! A node whose outcome is FORCED is proven: its value is exact, so the
+//! searcher treats it like a finished game -- no network call, no expansion,
+//! and no later averaging of network estimates into it. Port of `tactics.py`,
+//! the Python reference it is gated against (`test_exact_tactics.py`):
 //!
-//! * a military or scientific win reachable by one action, through the mover's
-//!   OWN pending choices (Mausoleum retrieval, a science-pair token, Law) --
-//!   the sign does not flip until the opponent moves;
-//! * across EVERY consistent chance outcome of that action -- a win in one
-//!   world is not a proof at the chance parent;
-//! * extra-turn two-move wins and civilian last-card wins are out of scope, as
-//!   in the reference.
+//! * `guaranteed_win_now` -- the mover forces a win before the opponent moves
+//!   again: military or science, through their own pending choices, through
+//!   ONE extra turn, or on points by taking the last card of Age III; every
+//!   chance outcome of every step must win;
+//! * `guaranteed_loss_now` -- every action, under every outcome, leaves the
+//!   opponent a forced win.
 //!
-//! The prefilter (`threat_possible`) is a necessary condition, so it only costs
-//! recall, never soundness: every positive is confirmed by applying actions.
+//! Whatever cannot be seen through (an Age deal, an inapplicable outcome)
+//! counts against the claim: a win proof skips it, a loss proof treats it as
+//! an escape. The reach screens are necessary conditions, so they cost recall,
+//! never soundness.
 
 use crate::chance::{self, ChanceKind};
 use crate::codec::{decode_action, legal_action_indices};
-use crate::data::card;
+use crate::data::{card, progress_id, wonder, EffectKind};
 use crate::engine::ActionUse;
 use crate::state::{GameState, Phase};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Max plausible one-action shield swing (3 shields + Strategy +1, with one
-/// square of slack). `phase_e.MILITARY_REACH`.
+/// One action's largest plausible shield swing. `tactics.MILITARY_REACH`.
 const MILITARY_REACH: i32 = 5;
-/// 4 distinct symbols can reach 6 in one action: a new-symbol green that also
-/// completes a pair -> progress choice -> Law. `phase_e.SCIENCE_REACH`.
-const SCIENCE_REACH: usize = 4;
-/// `phase_e.PENDING_DEPTH`.
+/// Steps of the mover's own pending choices followed. `tactics.PENDING_DEPTH`.
 pub const PENDING_DEPTH: usize = 6;
+/// Extra turns followed. `tactics.EXTRA_TURNS`.
+pub const EXTRA_TURNS: usize = 1;
 
 static EXACT_TACTICS: AtomicBool = AtomicBool::new(false);
 
-/// Process-wide switch, like the solver's: OFF by default until measured.
+/// Process-wide switch. OFF here; Phase D and the advisor host turn it on.
 pub fn set_enabled(enabled: bool) {
     EXACT_TACTICS.store(enabled, Ordering::Relaxed);
 }
@@ -44,8 +42,8 @@ pub fn enabled() -> bool {
     EXACT_TACTICS.load(Ordering::Relaxed)
 }
 
-/// Layer 1b (proven LOSSES) under its own switch, ON by default but only
-/// consulted when `enabled()`: it costs ~2x the win check per node.
+/// Proven LOSSES under their own switch, ON by default but only consulted
+/// when `enabled()`.
 static EXACT_LOSSES: AtomicBool = AtomicBool::new(true);
 
 pub fn set_losses_enabled(enabled: bool) {
@@ -60,43 +58,126 @@ fn actor(state: &GameState) -> usize {
     crate::tree::state_actor(state)
 }
 
-fn threat_possible(state: &GameState, player: usize) -> bool {
+fn present_cards(state: &GameState) -> usize {
+    state.tableau.slots.iter().filter(|slot| slot.present).count()
+}
+
+/// Necessary condition for `player` to win within `turns` own actions.
+/// `tactics._within_reach`.
+fn within_reach(state: &GameState, player: usize, turns: usize) -> bool {
     let need = if player == 0 {
         9 - state.conflict_position
     } else {
         9 + state.conflict_position
     };
-    need <= MILITARY_REACH || state.science_symbols(player).len() >= SCIENCE_REACH
+    if need <= MILITARY_REACH * turns as i32 {
+        return true;
+    }
+    if state.science_symbols(player).len() + 2 * turns >= 6 {
+        return true;
+    }
+    state.age == 3 && present_cards(state) <= turns
 }
 
-/// `player` holds the pending choice: a terminal won by them that some option
-/// chain reaches without the opponent moving, or None.
-fn pending_forced_win(state: &GameState, player: usize, depth: usize) -> Option<GameState> {
-    if state.phase == Phase::Complete {
-        return (state.winner == Some(player)).then(|| state.clone());
-    }
-    let pending = state.pending_choice.as_ref()?;
-    if pending.player != player || depth == 0 {
+/// The chance outcomes of one action, or None when they cannot be enumerated
+/// (an Age deal). `tactics._chains`.
+fn chains(state: &GameState, index: usize) -> Option<Vec<Vec<Vec<usize>>>> {
+    let action = decode_action(state, index);
+    let specs = chance::chance_signature(state, &action);
+    if specs.iter().any(|spec| spec.kind == ChanceKind::AgeDeal) {
         return None;
     }
-    for index in legal_action_indices(state) {
-        let mut clone = state.clone();
-        let action = decode_action(&clone, index);
-        // A pending option whose outcome is hidden is not deterministic here;
-        // the reference skips it (HiddenInformationError) and so does this.
-        if clone.apply_with_chance(&action, &[]).is_err() {
-            continue;
-        }
-        if let Some(won) = pending_forced_win(&clone, player, depth - 1) {
-            return Some(won);
-        }
+    if specs.is_empty() {
+        return Some(vec![Vec::new()]);
     }
-    None
+    Some(
+        chance::enumerate_chains_unkeyed(state, &specs)
+            .into_iter()
+            .map(|(outcomes, _probability)| outcomes)
+            .collect(),
+    )
 }
 
-/// Actions that could conceivably end the game for the actor this move.
-fn winning_move_candidates(state: &GameState) -> Vec<usize> {
+/// `test` holds for EVERY consistent child of the action; returns the first
+/// child's witness. Children are built one at a time and the walk stops at the
+/// first failure -- most candidates fail in their first world, and building
+/// every world first was ~50x the cost. `tactics._every_child`.
+fn every_child<F>(state: &GameState, index: usize, mut test: F) -> Option<GameState>
+where
+    F: FnMut(&GameState) -> Option<GameState>,
+{
+    let outcomes_list = chains(state, index)?;
+    let action = decode_action(state, index);
+    let mut witness = None;
+    for outcomes in outcomes_list {
+        let mut child = state.clone();
+        child.apply_with_chance(&action, &outcomes).ok()?;
+        let terminal = test(&child)?;
+        witness.get_or_insert(terminal);
+    }
+    witness
+}
+
+/// `player` still holds an unbuilt wonder that would grant an extra turn (a
+/// play-again wonder, or any wonder with Theology). `tactics._can_replay`.
+fn can_replay(state: &GameState, player: usize) -> bool {
+    let city = &state.cities[player];
+    let mut unbuilt = city.wonders.iter().filter(|w| !city.built_wonders.contains(w));
+    if city.progress_tokens.contains(&progress_id("Theology")) {
+        return unbuilt.next().is_some();
+    }
+    unbuilt.any(|&w| {
+        wonder(w)
+            .effects
+            .iter()
+            .any(|effect| effect.kind == EffectKind::PlayAgain)
+    })
+}
+
+/// Necessary condition for a win that NEEDS the extra turn: a play-again
+/// wonder brings no shields or symbols, so only Theology widens those reaches;
+/// the civilian ending widens with each card. `tactics._replay_reach`.
+fn replay_reach(state: &GameState, player: usize, extra: usize) -> bool {
+    if extra == 0 || !can_replay(state, player) {
+        return false;
+    }
+    if state.cities[player]
+        .progress_tokens
+        .contains(&progress_id("Theology"))
+    {
+        return within_reach(state, player, 1 + extra);
+    }
+    state.age == 3 && present_cards(state) <= 1 + extra
+}
+
+/// Wonder builds that hand the mover an extra turn: a play-again wonder, or
+/// any wonder once they hold Theology. `tactics._replay_wonders`.
+fn replay_wonders(state: &GameState) -> Vec<usize> {
+    let player = actor(state);
+    let theology = state.cities[player]
+        .progress_tokens
+        .contains(&progress_id("Theology"));
     legal_action_indices(state)
+        .into_iter()
+        .filter(|&index| {
+            let action = decode_action(state, index);
+            action.use_ == ActionUse::ConstructWonder
+                && (theology
+                    || wonder(action.wonder.expect("wonder build names a wonder"))
+                        .effects
+                        .iter()
+                        .any(|effect| effect.kind == EffectKind::PlayAgain))
+        })
+        .collect()
+}
+
+/// `tactics._candidates`.
+fn candidates(state: &GameState) -> Vec<usize> {
+    let legal = legal_action_indices(state);
+    if state.age == 3 && present_cards(state) <= 1 {
+        return legal;
+    }
+    legal
         .into_iter()
         .filter(|&index| {
             let action = decode_action(state, index);
@@ -113,131 +194,111 @@ fn winning_move_candidates(state: &GameState) -> Vec<usize> {
         .collect()
 }
 
-/// A terminal state the actor of `state` can force THIS TURN, or None.
-///
-/// The returned witness is one won terminal; its victory type feeds the root
-/// outlook. When several chance outcomes all win, they may win differently --
-/// the value is exact, the witness's type is one of the forced ones.
-pub fn guaranteed_win_now(state: &GameState, depth: usize) -> Option<GameState> {
+/// After one of `player`'s actions resolved: a won terminal the line forces.
+/// `tactics._won`.
+fn won(child: &GameState, player: usize, depth: usize, extra: usize) -> Option<GameState> {
+    if child.phase == Phase::Complete {
+        return (child.winner == Some(player)).then(|| child.clone());
+    }
+    if actor(child) != player {
+        return None;
+    }
+    if child.pending_choice.is_some() {
+        return pending_win(child, player, depth, extra);
+    }
+    if extra == 0 {
+        return None;
+    }
+    forced_win(child, depth, extra - 1)
+}
+
+fn pending_win(state: &GameState, player: usize, depth: usize, extra: usize) -> Option<GameState> {
+    if depth == 0 {
+        return None;
+    }
+    legal_action_indices(state).into_iter().find_map(|index| {
+        every_child(state, index, |child| won(child, player, depth - 1, extra))
+    })
+}
+
+fn forced_win(state: &GameState, depth: usize, extra: usize) -> Option<GameState> {
     if state.phase == Phase::Complete {
         return None;
     }
     let player = actor(state);
-    if !threat_possible(state, player) {
+    let now = within_reach(state, player, 1);
+    if !(now || replay_reach(state, player, extra)) {
         return None;
     }
     if state.pending_choice.is_some() {
-        return pending_forced_win(state, player, depth);
+        return pending_win(state, player, depth, extra);
     }
-    'actions: for index in winning_move_candidates(state) {
-        let action = decode_action(state, index);
-        let specs = chance::chance_signature(state, &action);
-        if specs.iter().any(|spec| spec.kind == ChanceKind::AgeDeal) {
-            continue;
-        }
-        let chains = if specs.is_empty() {
-            vec![(Vec::new(), 1.0)]
-        } else {
-            chance::enumerate_chains_unkeyed(state, &specs)
-        };
-        let mut witness = None;
-        for (outcomes, _probability) in chains {
-            let mut clone = state.clone();
-            if clone.apply_with_chance(&action, &outcomes).is_err() {
-                continue 'actions;
-            }
-            let won = if clone.winner == Some(player) {
-                Some(clone)
-            } else {
-                pending_forced_win(&clone, player, depth)
-            };
-            match won {
-                Some(terminal) => {
-                    witness.get_or_insert(terminal);
-                }
-                None => continue 'actions,
-            }
-        }
-        if witness.is_some() {
-            return witness;
-        }
-    }
-    None
-}
-
-/// Every consistent child of one action, or None when the outcomes cannot be
-/// enumerated (an Age deal) or applied. None means "cannot prove": a loss
-/// proof must treat it as an escape. `phase_e._resolved_children`.
-fn resolved_children(state: &GameState, index: usize) -> Option<Vec<GameState>> {
-    let action = decode_action(state, index);
-    let specs = chance::chance_signature(state, &action);
-    if specs.iter().any(|spec| spec.kind == ChanceKind::AgeDeal) {
-        return None;
-    }
-    let chains = if specs.is_empty() {
-        vec![(Vec::new(), 1.0)]
+    // Out of reach this action: only an extra turn can get there.
+    let candidates = if now {
+        candidates(state)
     } else {
-        chance::enumerate_chains_unkeyed(state, &specs)
+        replay_wonders(state)
     };
-    let mut children = Vec::with_capacity(chains.len());
-    for (outcomes, _probability) in chains {
-        let mut clone = state.clone();
-        clone.apply_with_chance(&action, &outcomes).ok()?;
-        children.push(clone);
-    }
-    Some(children)
+    candidates
+        .into_iter()
+        .find_map(|index| every_child(state, index, |child| won(child, player, depth, extra)))
 }
 
-/// After `actor`'s action resolved: a terminal the opponent forces, or None
-/// when `actor` is not certainly lost. `phase_e._outcome_lost`.
-fn outcome_lost(child: &GameState, actor: usize, depth: usize) -> Option<GameState> {
+/// A won terminal the mover can force before the opponent moves again, or
+/// None. `tactics.forced_win`.
+pub fn guaranteed_win_now(state: &GameState, depth: usize) -> Option<GameState> {
+    forced_win(state, depth, EXTRA_TURNS)
+}
+
+/// After the mover's action resolved: a terminal the opponent forces, or None
+/// when the mover is not certainly lost. `tactics._lost`.
+fn lost(child: &GameState, mover: usize, depth: usize) -> Option<GameState> {
     if child.phase == Phase::Complete {
         return match child.winner {
-            Some(winner) if winner != actor => Some(child.clone()),
+            Some(winner) if winner != mover => Some(child.clone()),
             _ => None,
         };
     }
-    if crate::tree::state_actor(child) == actor {
+    if actor(child) == mover {
         // Own pending choice: lost only if EVERY option is. An extra turn
-        // keeps the initiative and is never lost here.
+        // keeps the initiative and is never proven lost here.
         if child.pending_choice.is_none() || depth == 0 {
             return None;
         }
         let mut witness = None;
         for index in legal_action_indices(child) {
-            for grandchild in resolved_children(child, index)? {
-                let lost = outcome_lost(&grandchild, actor, depth - 1)?;
-                witness.get_or_insert(lost);
-            }
+            let terminal = every_child(child, index, |g| lost(g, mover, depth - 1))?;
+            witness.get_or_insert(terminal);
         }
         return witness;
     }
     guaranteed_win_now(child, depth)
 }
 
-/// G4 layer 1b: EVERY action of the mover, under EVERY consistent chance
-/// outcome, leaves the opponent a guaranteed win next move. Returns one of the
-/// opponent's forced terminals as the witness. `phase_e.guaranteed_loss_now`.
+/// EVERY action of the mover, under every outcome, leaves the opponent a
+/// forced win; returns one of the opponent's terminals. `tactics.forced_loss`.
 pub fn guaranteed_loss_now(state: &GameState, depth: usize) -> Option<GameState> {
     if state.phase == Phase::Complete {
         return None;
     }
     let mover = actor(state);
-    // The mover's action adds to the opponent's symbols or shields only by
-    // revealing a card, which the screen already allows for.
-    if !threat_possible(state, 1 - mover) {
-        return None;
-    }
-    let legal = legal_action_indices(state);
-    if legal.is_empty() {
+    let opponent = 1 - mover;
+    // The mover's action brings the opponent no shields or symbols (bar a
+    // reveal, which the reaches allow for), but it does take a card.
+    // The mover's own action takes a card, so every civilian reach is one card
+    // wider here.
+    let present = present_cards(state);
+    if !(within_reach(state, opponent, 1)
+        || replay_reach(state, opponent, EXTRA_TURNS)
+        || (state.age == 3 && present <= 2)
+        || (state.age == 3 && present <= 2 + EXTRA_TURNS && can_replay(state, opponent)))
+    {
         return None;
     }
     let mut witness = None;
-    for index in legal {
-        for child in resolved_children(state, index)? {
-            let lost = outcome_lost(&child, mover, depth)?;
-            witness.get_or_insert(lost);
-        }
+    for index in legal_action_indices(state) {
+        let terminal = every_child(state, index, |child| lost(child, mover, depth))?;
+        witness.get_or_insert(terminal);
     }
     witness
 }
