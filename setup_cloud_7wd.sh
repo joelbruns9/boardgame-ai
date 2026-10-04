@@ -48,7 +48,7 @@
 #                   derived, not defaulted — see the note beside them below
 #   TRAIN_BATCH_SIZE=512
 #   HOF_FRACTION=0.15 GATE_LADDER="200 600 1000 1500"
-#   PROMOTION_EVERY=5 BOOTSTRAP_POLICY=auto_first_trained
+#   PROMOTION_EVERY=10 BOOTSTRAP_POLICY=auto_first_trained
 #   PROBATION_RESET_AFTER=4 REVERT_RESET_AFTER=3
 #   LAUNCH_FLAGS_JSON=<f4_cloud_finalize output>  measured --rust-* flags (W6.3)
 #   PRECISION_ARENA_CHECKPOINT=<path>             runs W6.2b before launching
@@ -312,7 +312,7 @@ CURRICULUM_ANNEAL_GAMES="${CURRICULUM_ANNEAL_GAMES:-15000}"
 HOF_START_GAMES="${HOF_START_GAMES:-50000}"
 GATE_LADDER="${GATE_LADDER:-200 600 1000 1500}"
 GATE_LADDER_FLOOR_GAMES="${GATE_LADDER_FLOOR_GAMES:-10000}"
-PROMOTION_EVERY="${PROMOTION_EVERY:-5}"
+PROMOTION_EVERY="${PROMOTION_EVERY:-10}"
 BOOTSTRAP_POLICY="${BOOTSTRAP_POLICY:-auto_first_trained}"
 PROBATION_RESET_AFTER="${PROBATION_RESET_AFTER:-4}"
 REVERT_RESET_AFTER="${REVERT_RESET_AFTER:-3}"
@@ -359,7 +359,9 @@ CHEAP_DOUBLE_REVEAL_OFFSETS="${CHEAP_DOUBLE_REVEAL_OFFSETS:-3}"
 # metric (Q MAE 1.6e-4, action disagreement 4.8%, regret 0.007); its verdict is
 # that "approximation quality is not the blocker".
 DOUBLE_REVEAL_OFFSETS="${DOUBLE_REVEAL_OFFSETS:-3}"
-GATE_SIMS="${GATE_SIMS:-64}"
+# Promotion gate at 800 sims (was 64): run07 gated only at 64, so its "stall"
+# was never measured at a search depth near the 1,600-sim player.
+GATE_SIMS="${GATE_SIMS:-800}"
 OPPONENT_FRACTION="${OPPONENT_FRACTION:-0}"
 
 # ── Search geometry, targets and the endgame solver ─────────────────────────
@@ -636,6 +638,8 @@ GRAPH_ALPHA="${GRAPH_ALPHA:-}"
 SWD_CONTROL_FEATURES="${SWD_CONTROL_FEATURES:-1}"   # W3
 # CUDA-graph replay of the evaluator forward (`cuda_graphs.py`). Off unless
 # asked: it moves the forward by bf16 noise, so it is a decision, not a default.
+# With CUDA_GRAPHS=1, stage 9 refuses a box where captures fail (run07 ran
+# eager all run despite the flag).
 CUDA_GRAPHS="${CUDA_GRAPHS:-0}"
 GRAPH_REPLAY_FLAGS=()
 [ "$CUDA_GRAPHS" = "1" ] && GRAPH_REPLAY_FLAGS+=(--cuda-graphs)
@@ -676,11 +680,13 @@ REANALYSIS_SLOTS="${REANALYSIS_SLOTS:-256}"
 # (stage 8b writes sweeps/measured_env.sh; source it and re-run), which is the
 # documented path -- but an operator who skips the sweep now gets a cloud-shaped
 # configuration rather than a laptop one.
-GATE_SLOTS="${GATE_SLOTS:-144}"
+# 256 (was 144, sized at 64 gate sims): an 800-sim gate is shaped like
+# generation, which runs 256. Stage 8b sweeps 144-512 and overrides this.
+GATE_SLOTS="${GATE_SLOTS:-256}"
 RUST_SLOTS="${RUST_SLOTS:-256}"
 RUST_GLOBAL_BATCH_CAP="${RUST_GLOBAL_BATCH_CAP:-2048}"
 RUST_MAX_INFLIGHT_BATCHES="${RUST_MAX_INFLIGHT_BATCHES:-1}"
-GATE_GLOBAL_BATCH_CAP="${GATE_GLOBAL_BATCH_CAP:-1024}"
+GATE_GLOBAL_BATCH_CAP="${GATE_GLOBAL_BATCH_CAP:-2048}"
 CRATE_DIR_REL="games/seven_wonders_duel/seven_wonders_rust"
 
 common::require_python
@@ -1468,9 +1474,9 @@ PYSOLVES
       --work-dir "$SWEEP_DIR/gate_$RUNG" \
       --output "$SWEEP_DIR/gate_$RUNG.json" \
       --games "$RUNG" \
-      --slots ${SWEEP_SLOTS:-48 96 144} \
-      --caps ${SWEEP_CAPS:-256 1024} \
-      --sims "${GATE_SIMS:-64}" \
+      --slots ${SWEEP_SLOTS:-144 256 512} \
+      --caps ${SWEEP_CAPS:-1024 2048} \
+      --sims "${GATE_SIMS:-800}" \
       --precision "$PRECISION" \
       || die "Gate sweep at rung $RUNG failed."
     ok "Gate sweep (rung $RUNG): $SWEEP_DIR/gate_$RUNG.json"
@@ -1645,6 +1651,29 @@ else
     ${GRAPH_REPLAY_FLAGS[@]+"${GRAPH_REPLAY_FLAGS[@]}"} \
     || die "CUDA plumbing smoke failed — do not launch training."
   ok "Smoke completed: $SMOKE_DIR"
+  # run07 launched with --cuda-graphs and ran EAGER the whole run: captures
+  # failed under concurrent shard threads and the wrapper disabled itself
+  # without a trace in the training log. The adapter now records graph_* counts
+  # in rust_boundary; read them back here, before money is spent.
+  if [ "$CUDA_GRAPHS" = "1" ]; then
+    "$PY" - "$SMOKE_DIR/training_log.jsonl" <<'PYEOF' || die "CUDA graphs are not replaying on this box (see above) — do not launch."
+import json, sys
+from pathlib import Path
+log = Path(sys.argv[1])
+rows = [json.loads(l) for l in log.read_text().splitlines() if l.strip()] if log.is_file() else []
+totals = {"graph_replays": 0, "graph_eager_calls": 0, "graph_capture_failures": 0}
+for row in rows:
+    boundary = (row.get("generation_performance") or {}).get("rust_boundary") or {}
+    for key in totals:
+        totals[key] += int(boundary.get(key, 0))
+print(f"smoke graph counters: {totals}")
+if totals["graph_replays"] == 0 and totals["graph_eager_calls"] == 0:
+    print("WARNING: no graph counters in the smoke log; cannot confirm replay")
+    sys.exit(0)
+if totals["graph_capture_failures"] or totals["graph_replays"] == 0:
+    sys.exit(1)
+PYEOF
+  fi
 fi
 stage_done 9
 

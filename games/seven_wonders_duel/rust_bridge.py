@@ -487,6 +487,37 @@ class _RustFlatBatchAdapter:
         return batch, legal_lengths, legal_actions, tensor_seconds, h2d_seconds
 
     def __call__(self, payload):
+        if not self.cuda_graphs:
+            return self._call(payload)
+        from .cuda_graphs import GPU_LOCK
+
+        # The whole call, not just the forward: this adapter's H2D copies and
+        # gather ops on another thread are exactly the concurrent CUDA work
+        # that invalidates a capture (see `cuda_graphs.GPU_LOCK`). The graph's
+        # outputs are also views into shared static buffers, valid only until
+        # the next replay, so the copy to the host must finish under the lock.
+        with GPU_LOCK:
+            result = self._call(payload)
+            self._record_graph_metrics()
+        return result
+
+    def _graphed_wrappers(self):
+        from .cuda_graphs import GraphedForward
+
+        children = getattr(self.evaluator.model, "models", None)
+        candidates = (
+            list(children) if isinstance(children, torch_module_list()) else [self._model]
+        )
+        return [m for m in candidates if isinstance(m, GraphedForward)]
+
+    def _record_graph_metrics(self):
+        # Absolute counts, refreshed every call. run07 passed --cuda-graphs and
+        # silently ran eager because none of this reached the training log.
+        wrappers = self._graphed_wrappers()
+        for name in ("replays", "eager_calls", "captures", "capture_failures"):
+            self.total_metrics[f"graph_{name}"] = sum(getattr(w, name) for w in wrappers)
+
+    def _call(self, payload):
         import torch
 
         rows = int(payload["rows"])

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import threading
 
 import pytest
 import torch
@@ -173,3 +174,55 @@ def test_embedder_over_projection_budget_captures_and_matches():
         got = graphed(batch)
     assert graphed.captures == 1 and graphed.eager_calls == 0
     torch.testing.assert_close(got["policy"], want["policy"], atol=1e-4, rtol=1e-4)
+
+
+class _DeepModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(torch.nn.Linear(64, 64) for _ in range(6))
+
+    def forward(self, batch):
+        x = batch["x"]
+        for layer in self.layers:
+            x = torch.relu(layer(x))
+        return {"y": x.sum(-1)}
+
+
+@cuda
+def test_concurrent_threads_still_capture():
+    """run07: several shard threads disabled graphs for the whole run.
+
+    Without the shared lock this exact setup leaves every wrapper eager with 0
+    replays ("operation not permitted when stream is capturing"). The eager
+    noise stands in for another adapter's H2D/gather work, which the adapter
+    runs under the same lock.
+    """
+
+    from .cuda_graphs import GPU_LOCK
+
+    torch.manual_seed(0)
+    wrappers = [GraphedForward(_DeepModel().cuda().eval()) for _ in range(4)]
+    errors: list[str] = []
+
+    def work(graphed):
+        try:
+            with torch.no_grad():
+                for step in range(24):
+                    batch = {"x": torch.randn(8 + 32 * (step % 6), 4, 64, device="cuda")}
+                    with GPU_LOCK:
+                        want = graphed.model(batch)["y"]
+                        got = graphed(batch)["y"].clone()
+                        torch.randn(256, 256, device="cuda").sum().item()
+                    torch.testing.assert_close(got, want)
+        except Exception as error:  # noqa: BLE001 -- surfaced below
+            errors.append(repr(error))
+
+    threads = [threading.Thread(target=work, args=(w,)) for w in wrappers]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    for graphed in wrappers:
+        assert graphed.capture_failures == 0 and not graphed._disabled
+        assert graphed.eager_calls == 0 and graphed.replays == 24

@@ -35,8 +35,21 @@ Contract for callers:
 from __future__ import annotations
 
 import contextlib
+import threading
 
 import torch
+
+#: Process-wide lock for GPU work while graphs are on. A capture is broken by
+#: ANY concurrent CUDA work in the process, not just work on its own stream:
+#: another thread's eager op on the legacy default stream fails it with
+#: "operation not permitted when stream is capturing", and the first failure
+#: leaves the allocator recording ("already recording to mempool_id"). With
+#: several shard threads calling adapters at once this disabled graphs for the
+#: whole of run07 (setup.log; reproduced with 4 threads on the laptop: 0
+#: replays). Re-entrant, so the adapter can hold it around a whole call and the
+#: wrapper can take it again inside. Contract: concurrent CUDA work in a process
+#: that captures graphs must hold this lock.
+GPU_LOCK = threading.RLock()
 
 #: Smallest row bucket. Below this the saving per call is the same and more
 #: buckets only cost memory and capture time.
@@ -81,6 +94,7 @@ class GraphedForward(torch.nn.Module):
         self.replays = 0
         self.eager_calls = 0
         self.captures = 0
+        self.capture_failures = 0
 
     def __getattr__(self, name):
         # Callers read model attributes (`action_residual`, head switches)
@@ -91,6 +105,10 @@ class GraphedForward(torch.nn.Module):
             return getattr(super().__getattr__("model"), name)
 
     def forward(self, batch: dict) -> dict:
+        with GPU_LOCK:
+            return self._forward_locked(batch)
+
+    def _forward_locked(self, batch: dict) -> dict:
         rows = _rows_of(batch)
         if (
             self._disabled
@@ -140,6 +158,9 @@ class GraphedForward(torch.nn.Module):
             else contextlib.nullcontext()
         )
         static_in = {name: value.clone() for name, value in padded.items()}
+        # Drain work queued before the lock was taken, so nothing in flight can
+        # touch the capture.
+        torch.cuda.synchronize()
         original_stream = torch.cuda.current_stream()
         try:
             side = torch.cuda.Stream()
@@ -162,6 +183,7 @@ class GraphedForward(torch.nn.Module):
                 static_out = self.model(static_in)
         except Exception as error:  # noqa: BLE001 -- any failure means eager
             _recover_from_failed_capture(original_stream, self._pool)
+            self.capture_failures += 1
             self._failed.add(key)
             self._disabled = True
             print(f"cuda graphs: capture failed at {key[0]} rows, running EAGER from "
