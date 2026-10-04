@@ -478,6 +478,10 @@ the test, not a diagnosis.
    benefit. Laptop, any time.
 9. Great Library and Mausoleum: every time one is built, evaluate all options
    (G4b) as ONE simulation, not 5 or N. Library 0.6/0.3/0.1 over token values; Mausoleum best child.
+10. (2026-10-04) G2: do NOT mask W4's victory type on proof rows. Missed
+    certain wins (e.g. an extra-turn wonder uncovering a face-up winning card,
+    then not taking it) stay undetected: strong players take them and the
+    audit found all 54 taken. Revisit only if G0 shows otherwise.
 
 ## Review of WORLD_CLASS_MODEL_EVOLUTION_PLAN workstreams (2026-09-30)
 
