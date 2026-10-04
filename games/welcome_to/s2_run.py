@@ -63,6 +63,9 @@ _GENERATION_FIELDS = (
     "curriculum_source_plan_rate",
     "assisted_games",
     "assisted_learner_plans_per_game",
+    "deal_curriculum_games",
+    "deal_three_plans_rate",
+    "deal_plan_ending_fraction",
     "learner_plans_per_game",
     "learner_two_plans_rate",
     "learner_three_plans_rate",
@@ -113,12 +116,33 @@ def _curriculum_args(run: Path, iteration: int, args: argparse.Namespace) -> lis
     finished in the previous iteration (curriculum.py).  Iteration 1 has no
     source and plays ordinary games."""
     source = _iteration_dir(run, iteration - 1) / "trajectories.jsonl"
-    if args.restart_fraction <= 0.0 or iteration <= 1:
-        return []
-    return [
-        "--restart-sources", str(source),
-        "--restart-fraction", str(args.restart_fraction),
-    ]
+    out: list[str] = []
+    fraction = helper_share(args.restart_fraction, iteration, args)
+    if fraction > 0.0 and iteration > 1:
+        out += ["--restart-sources", str(source), "--restart-fraction", f"{fraction:.6f}"]
+    deal = helper_share(args.deal_fraction, iteration, args)
+    weights = _iteration_dir(run, iteration - 1) / "trajectories.jsonl.metrics.json"
+    if deal > 0.0 and iteration > 1 and weights.is_file():
+        out += ["--deal-fraction", f"{deal:.6f}", "--deal-weights", str(weights)]
+    return out
+
+
+def helper_share(base: float, iteration: int, args: argparse.Namespace) -> float:
+    """A training helper's share this iteration (owner, 2026-10-03: helpers
+    teach concepts early, then switch off so the model learns on its own).
+
+    With ``--helpers-end-iteration E`` the share falls linearly from ``base`` at
+    iteration 1 to zero at iteration E, and stays zero; 0 (the default) keeps
+    every helper at its base share for the whole run.
+    """
+    end = args.helpers_end_iteration
+    if base <= 0.0:
+        return 0.0
+    if end <= 0:
+        return base
+    if iteration >= end:
+        return 0.0
+    return base * (end - iteration) / (end - 1)
 
 
 def assist_fraction(iteration: int, args: argparse.Namespace) -> float:
@@ -197,7 +221,11 @@ def run_iteration(run: Path, iteration: int, args: argparse.Namespace) -> dict[s
             raise RuntimeError(f"generation for iteration {iteration} exited {code}")
         timings["generation_seconds"] = time.perf_counter() - started
 
-    if args.pairs_roots > 0 and not (directory / paired_targets.PAIRS_FILE).exists():
+    if (
+        args.pairs_roots > 0
+        and iteration >= args.pairs_start_iteration
+        and not (directory / paired_targets.PAIRS_FILE).exists()
+    ):
         started = time.perf_counter()
         paired_targets.build(
             directory,
@@ -207,6 +235,7 @@ def run_iteration(run: Path, iteration: int, args: argparse.Namespace) -> dict[s
             futures=args.pairs_futures,
             seed=seed,
             simulations=args.simulations,
+            plan_aware_share=helper_share(args.pairs_plan_aware, iteration, args),
         )
         timings["pairs_seconds"] = time.perf_counter() - started
 
@@ -336,6 +365,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
         help="paired placement roots built per iteration (paired_targets.py); 0 = off",
     )
     parser.add_argument("--pairs-futures", type=int, default=48)
+    parser.add_argument("--pairs-start-iteration", type=int, default=1,
+                        help="first iteration that builds paired targets")
+    parser.add_argument("--pairs-plan-aware", type=float, default=0.0,
+                        help="share of live-pool-plan paired roots whose learner playouts follow "
+                        "the pool rule (a helper: follows --helpers-end-iteration)")
+    parser.add_argument("--deal-fraction", type=float, default=0.0,
+                        help="share of games with weighted plan deals (a helper)")
+    parser.add_argument("--helpers-end-iteration", type=int, default=0,
+                        help="iteration at which every helper (restarts, deal curriculum, "
+                        "pool-rule playouts) reaches zero; 0 keeps them constant")
     parser.add_argument("--pairs-alternatives", type=int, default=2)
     parser.add_argument("--pairs-weight", type=float, default=1.0)
     parser.add_argument("--pairs-window", type=int, default=4)

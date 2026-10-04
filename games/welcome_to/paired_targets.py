@@ -50,7 +50,7 @@ from games.welcome_to import network as nw
 from games.welcome_to import rust_search, self_play, sibling_probe, training
 
 PAIRS_FILE = "pairs.pt"
-_KEEP = ("game_seed", "players", "turn", "candidates", "afterstates", "scores", "ranks", "blend")
+_KEEP = ("game_seed", "players", "turn", "candidates", "afterstates", "scores", "ranks", "blend", "steered")
 
 
 def build(
@@ -63,6 +63,7 @@ def build(
     seed: int = 0,
     simulations: int = 200,
     device: str = "cuda",
+    plan_aware_share: float = 0.0,
 ) -> Path:
     """Write ``iteration_dir/pairs.pt``; resumable through per-chunk saves."""
     from games.welcome_to import s2_promotion, s2_train
@@ -77,6 +78,7 @@ def build(
         "alternatives": alternatives,
         "futures": futures,
         "seed": seed,
+        "plan_aware_share": plan_aware_share,
     }
     work = iteration_dir / "pairs_work"
     work.mkdir(exist_ok=True)
@@ -107,6 +109,19 @@ def build(
     selected = sibling_probe.select_roots(
         wanted, packed, max_candidates=1 + alternatives, seed=seed
     )[:roots]
+    if plan_aware_share > 0.0:
+        # Pool-rule playouts (owner, 2026-10-03): for a share of the roots where
+        # the learner holds a live pool plan, its continuation follows the pool
+        # rule, so the labels can show what keeping the pool alive is worth when
+        # it is followed up. A helper: its share follows the helper schedule.
+        from games.welcome_to import pool_rescue
+        from games.welcome_to import snapshot as snap
+
+        steer_rng = random.Random(seed ^ 0x504F4F4C)
+        for root in selected:
+            state = snap.from_snapshot(root.snapshot)
+            if pool_rescue.needed_streets(state, 0)[2] and steer_rng.random() < plan_aware_share:
+                root.steered = True
     started = time.perf_counter()
     sibling_probe.rollout_roots(
         selected, packed, cfg, futures, seed, checkpoint_dir=work
@@ -116,6 +131,7 @@ def build(
         "futures": futures,
         "seconds": time.perf_counter() - started,
         "roots": [{name: getattr(root, name) for name in _KEEP} for root in selected],
+        "steered_roots": sum(root.steered for root in selected),
     }
     temporary = out.with_suffix(".tmp")
     torch.save(payload, temporary)

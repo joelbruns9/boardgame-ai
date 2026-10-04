@@ -115,6 +115,9 @@ class Root:
     seat_ranks: Optional[np.ndarray] = None   # (C, F, players, MAX_RANKS)
     blend: Optional[np.ndarray] = None        # (C, F) learner terminal blend
     afterstates: list = field(default_factory=list)
+    #: The learner's continuation follows the pool rule (paired_targets'
+    #: plan-aware playouts); every other seat stays on argmax policy.
+    steered: bool = False
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -172,8 +175,11 @@ def select_roots(
     return roots
 
 
-def _finish_all(states: list, players: list[int], packed, chunk: int = 4096) -> None:
-    """Advance every state to the end with every seat on argmax policy."""
+def _finish_all(
+    states: list, players: list[int], packed, chunk: int = 4096, steer: Optional[list[bool]] = None
+) -> None:
+    """Advance every state to the end with every seat on argmax policy; where
+    ``steer[i]``, the learner's moves pass through the pool rule."""
     live = list(range(len(states)))
     while live:
         still = []
@@ -186,6 +192,8 @@ def _finish_all(states: list, players: list[int], packed, chunk: int = 4096) -> 
             )
             for i, policy, legal in zip(ids, policies, legals):
                 choice = max(legal, key=lambda m: (float(policy[m]), -m))
+                if steer is not None and steer[i] and int(states[i].actor) == 0:
+                    choice = _POOL_STEER(states[i], int(choice))
                 states[i].apply_macro(int(choice))
                 if not states[i].is_terminal:
                     still.append(i)
@@ -197,6 +205,22 @@ _OUTCOME_FIELDS = ("scores", "ranks", "seat_ranks", "blend", "afterstates")
 
 def _root_key(root: Root) -> tuple:
     return (root.game_seed, root.turn, tuple(root.candidates))
+
+
+class _LazyPoolSteer:
+    """The pool rule as a move override, imported on first use."""
+
+    def __call__(self, rust_state, choice: int) -> int:
+        from games.welcome_to import pool_rescue
+
+        state = snapshot.from_snapshot(rust_state.snapshot())
+        prompt = state.phase in (pool_rescue.Phase.ACTION_POOL, pool_rescue.Phase.ACTION_PARK)
+        if prompt or pool_rescue.needed_streets(state, 0)[2]:
+            return pool_rescue.pool_choice(state, choice)
+        return choice
+
+
+_POOL_STEER = _LazyPoolSteer()
 
 
 def rollout_roots(
@@ -244,7 +268,7 @@ def rollout_roots(
 def _rollout_chunk(roots, ids, packed, cfg, futures, seed) -> None:
     import welcome_to_rust as wr
 
-    states, players, index = [], [], []
+    states, players, index, steer = [], [], [], []
     for r_id in ids:
         root = roots[r_id]
         base = wr.RustGameState.from_snapshot(root.snapshot)
@@ -255,7 +279,8 @@ def _rollout_chunk(roots, ids, packed, cfg, futures, seed) -> None:
                 states.append(drawn.step_macro(candidate))
                 players.append(root.players)
                 index.append((r_id, c_id, f))
-    _finish_all(states, players, packed)
+                steer.append(root.steered)
+    _finish_all(states, players, packed, steer=steer if any(steer) else None)
     for r_id in ids:
         root = roots[r_id]
         n = len(root.candidates)

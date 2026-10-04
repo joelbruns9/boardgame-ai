@@ -33,6 +33,7 @@ import torch
 
 from games.welcome_to import curriculum
 from games.welcome_to import datagen
+from games.welcome_to import deal_curriculum
 from games.welcome_to import encoder as enc
 from games.welcome_to import macro_codec as mc
 from games.welcome_to import mcts
@@ -941,6 +942,7 @@ def run_manifest(
     opponent_pool: Optional[Sequence[Mapping[str, Any]]] = None,
     curriculum_manifest: Optional[Mapping[str, Any]] = None,
     assist_manifest: Optional[Mapping[str, Any]] = None,
+    deal_manifest: Optional[Mapping[str, Any]] = None,
 ) -> dict:
     """Frozen semantic and scheduler identity for safe shard resume."""
     manifest = {
@@ -968,6 +970,8 @@ def run_manifest(
         manifest["curriculum"] = dict(curriculum_manifest)
     if assist_manifest is not None:
         manifest["placement_assist"] = dict(assist_manifest)
+    if deal_manifest is not None:
+        manifest["deal_curriculum"] = dict(deal_manifest)
     return manifest
 
 
@@ -1809,6 +1813,22 @@ def generate(
         for trajectory, state in zip(trajectories, final_states)
         if trajectory.assist_through is not None
     ]
+    dealt = [
+        (trajectory, state)
+        for trajectory, state in zip(trajectories, final_states)
+        if trajectory.plan_ids is not None
+    ]
+    metrics["deal_curriculum_games"] = float(len(dealt))
+    if dealt:
+        metrics["deal_learner_plans_per_game"] = sum(
+            sum(1 for slot in state.plan_turns if LEARNER_SEAT in slot) for _, state in dealt
+        ) / len(dealt)
+        metrics["deal_three_plans_rate"] = sum(
+            all(LEARNER_SEAT in slot for slot in state.plan_turns) for _, state in dealt
+        ) / len(dealt)
+        metrics["deal_plan_ending_fraction"] = sum(
+            "completed all three plans" in (state.end_of_game_reason() or "") for _, state in dealt
+        ) / len(dealt)
     metrics["assisted_games"] = float(len(helped))
     if helped:
         metrics["assisted_learner_plans_per_game"] = sum(
@@ -1943,6 +1963,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
         default=16,
         help="last turn on which an assisted game's learner placements are assisted",
     )
+    parser.add_argument(
+        "--deal-fraction",
+        type=float,
+        default=0.0,
+        help="share of games dealt plans weighted toward ones the learner "
+        "completes (deal_curriculum.py)",
+    )
+    parser.add_argument(
+        "--deal-weights",
+        help="a previous generation's metrics.json whose plan_completion_by_id "
+        "weights the forced deals",
+    )
     parser.add_argument("--opening-temperature-turns", type=int, default=10)
     parser.add_argument("--opening-temperature", type=float, default=1.0)
     parser.add_argument("--late-temperature", type=float, default=0.0)
@@ -2056,9 +2088,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
     )
     if assisted:
         print(f"placement assist: {len(assisted)} of {config.games} games, through turn {args.assist_through}")
+    forced_plans: dict = {}
+    deal_manifest = None
+    completion = (
+        deal_curriculum.completion_from_metrics(args.deal_weights)
+        if args.deal_fraction > 0.0 and args.deal_weights
+        else None
+    )
+    if completion:
+        forced_plans = deal_curriculum.plan_deals(
+            list(zip(range(config.seed, config.seed + config.games), seat_counts(config.games))),
+            completion,
+            fraction=args.deal_fraction,
+            seed=config.seed,
+            exclude=set(restarts) | set(assisted),
+        )
+        deal_manifest = {
+            "fraction": args.deal_fraction,
+            "weights": str(Path(args.deal_weights).resolve()),
+            "games": len(forced_plans),
+            "deals_sha256": deal_curriculum.deal_digest(forced_plans),
+        }
+        print(f"deal curriculum: {len(forced_plans)} of {config.games} games get weighted plan deals")
     has_existing = bool(trajectory_sources(args.out) or training_shard_paths(args.out))
     existing = read_trajectories(args.out) if has_existing else []
-    completed_seeds = validate_resume(existing, config, restarts, assisted)
+    completed_seeds = validate_resume(existing, config, restarts, assisted, forced_plans)
     existing_games = len(existing)
     existing_searched_roots = sum(len(game.searches) for game in existing)
     ensure_run_manifest(
@@ -2071,6 +2125,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
             opponent_pool=opponent_pool_manifest,
             curriculum_manifest=curriculum_manifest,
             assist_manifest=assist_manifest,
+            deal_manifest=deal_manifest,
         ),
         has_existing_games=bool(existing_games),
     )
@@ -2099,6 +2154,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
             cuda_events=args.cuda_events,
             restarts=restarts,
             assisted=assisted,
+            forced_plans=forced_plans,
         )
     finally:
         # Also drain the bounded queue and flush a short final shard on clean
