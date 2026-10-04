@@ -74,7 +74,14 @@ _GENERATION_FIELDS = (
     "learner_points_estates",
     "learner_points_plans",
     "learner_points_temp",
+    "learner_points_bis",
+    "learner_points_permits",
     "learner_points_roundabouts",
+    "learner_plan_turn_1",
+    "learner_plan_turn_2",
+    "learner_plan_turn_3",
+    "plan_completion_by_id",
+    "plan_dealt_by_id",
     "learner_score",
     "learner_margin_vs_best",
     "roundabouts_per_seat_game",
@@ -250,6 +257,11 @@ def run_iteration(run: Path, iteration: int, args: argparse.Namespace) -> dict[s
             "--seed", str(seed),
             "--out", str(candidate),
             *(
+                ["--exclude-helper-data"]
+                if args.helpers_end_iteration > 0 and iteration >= args.helpers_end_iteration
+                else []
+            ),
+            *(
                 [
                     "--pairs-weight", str(args.pairs_weight),
                     "--pairs-window", str(args.pairs_window),
@@ -298,6 +310,29 @@ def run_iteration(run: Path, iteration: int, args: argparse.Namespace) -> dict[s
     )
     after = (training_metrics.get("pairs") or {}).get("after") or {}
     pairs_line.update({f"pairs_val_{name}": value for name, value in after.items()})
+    replay = training_metrics.get("replay") or {}
+    for name in (
+        "helper_games_in_window",
+        "helper_position_share_in_window",
+        "helper_data_excluded",
+        "steered_pairs_in_window",
+    ):
+        if name in replay:
+            pairs_line[name] = replay[name]
+    pairs_file = directory / paired_targets.PAIRS_FILE
+    if pairs_file.exists():
+        payload = torch.load(pairs_file, weights_only=False)
+        for name in (
+            "requested_roots",
+            "realized_roots",
+            "roots_by_players",
+            "steered_roots",
+            "steer_calls",
+            "steer_overrides",
+            "execution_audit",
+        ):
+            if name in payload:
+                pairs_line[f"pairs_{name}"] = payload[name]
     line = {
         "iteration": iteration,
         "gated": gated,

@@ -773,6 +773,35 @@ def plan_characteristics(plan: Plan) -> tuple[float, ...]:
     return tuple(out)
 
 
+def pool_plan_streets(plan: Plan, sheet: "Sheet") -> list[int]:
+    """The streets a live pool plan can still use: streets it names (or any,
+    for "pools in two streets"), whose pool track is unfinished but can still
+    finish, and -- for "complete a street" -- that have or can still get a
+    roundabout. ``[]`` for a dead or non-pool plan.
+
+    One predicate for the encoder's pool targets and the pool rule (review
+    2026-10-03 F3: the rule's copy had dropped the roundabout condition).
+    """
+    kind = plan.kind
+    if kind not in (PlanKind.DECORATIVE, PlanKind.COMPLETE_STREET) or not feasible(plan, sheet):
+        return []
+    if kind is PlanKind.DECORATIVE:
+        what = plan.params[0]
+        if what == "park":
+            return []
+        candidates = range(NUM_STREETS) if what == "pool" else (int(plan.params[1]),)
+    else:
+        roundabout_left = sheet.can_build_roundabout()
+        candidates = [
+            x for x in range(NUM_STREETS) if sheet.has_roundabout_in_street(x) or roundabout_left
+        ]
+    return [
+        x
+        for x in candidates
+        if sheet.pools[x] < 3 and sheet.pools[x] + _pool_boxes_alive(sheet, x) >= 3
+    ]
+
+
 def pool_target_boxes(plan: Plan, sheet: "Sheet") -> list[tuple[int, int]]:
     """The empty, still-usable pool boxes a pool plan needs (encoder v4).
 
@@ -783,26 +812,7 @@ def pool_target_boxes(plan: Plan, sheet: "Sheet") -> list[tuple[int, int]]:
     :func:`_pool_boxes_alive` counts them) in every street that can still
     finish its pools and that the plan needs.
     """
-    kind = plan.kind
-    if kind not in (PlanKind.DECORATIVE, PlanKind.COMPLETE_STREET) or not feasible(plan, sheet):
-        return []   # a dead plan needs no box
-    if kind is PlanKind.DECORATIVE:
-        what = plan.params[0]
-        if what == "park":
-            return []
-        candidates = range(NUM_STREETS) if what == "pool" else (int(plan.params[1]),)
-    elif kind is PlanKind.COMPLETE_STREET:
-        roundabout_left = sheet.can_build_roundabout()
-        candidates = [
-            x for x in range(NUM_STREETS) if sheet.has_roundabout_in_street(x) or roundabout_left
-        ]
-    else:
-        return []
-    streets = [
-        x
-        for x in candidates
-        if sheet.pools[x] < 3 and sheet.pools[x] + _pool_boxes_alive(sheet, x) >= 3
-    ]
+    streets = pool_plan_streets(plan, sheet)   # [] for a dead or non-pool plan
     spans = sheet.span_if_roundabout()
     return [
         (x, y)

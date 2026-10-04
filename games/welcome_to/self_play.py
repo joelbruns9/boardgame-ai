@@ -1249,6 +1249,9 @@ _PLAN_POINT_METRICS: tuple[str, ...] = (
     "learner_three_plans_rate",
     "plan_completion_by_id",
     "plan_dealt_by_id",
+    "learner_plan_turn_1",
+    "learner_plan_turn_2",
+    "learner_plan_turn_3",
     *(f"learner_points_{name}" for name in _POINT_COMPONENTS),
 )
 
@@ -1268,16 +1271,22 @@ def _plan_and_point_metrics(final_states: Sequence[GameState]) -> dict[str, Any]
     dealt: dict[str, int] = {}
     done: dict[str, int] = {}
     counts = []
+    #: turn of the learner's 1st, 2nd and 3rd plan completion, per game
+    nth_turns: list[list[int]] = [[], [], []]
     points = {name: 0.0 for name in _POINT_COMPONENTS}
     for state in final_states:
         completed = 0
+        turns = []
         for slot, plan_id in enumerate(state.plan_ids):
             key = str(plan_id)
             dealt[key] = dealt.get(key, 0) + 1
             if LEARNER_SEAT in state.plan_turns[slot]:
                 done[key] = done.get(key, 0) + 1
                 completed += 1
+                turns.append(state.plan_turns[slot][LEARNER_SEAT])
         counts.append(completed)
+        for k, turn in enumerate(sorted(turns)):
+            nth_turns[k].append(turn)
         breakdown = state.score_breakdown(LEARNER_SEAT)
         for name in _POINT_COMPONENTS:
             points[name] += getattr(breakdown, name)
@@ -1286,6 +1295,10 @@ def _plan_and_point_metrics(final_states: Sequence[GameState]) -> dict[str, Any]
         "learner_plans_per_game": sum(counts) / games,
         "learner_two_plans_rate": sum(c == 2 for c in counts) / games,
         "learner_three_plans_rate": sum(c == 3 for c in counts) / games,
+        **{
+            f"learner_plan_turn_{k + 1}": (sum(t) / len(t) if t else None)
+            for k, t in enumerate(nth_turns)
+        },
         "plan_dealt_by_id": dict(sorted(dealt.items(), key=lambda kv: int(kv[0]))),
         "plan_completion_by_id": {
             key: done.get(key, 0) / count

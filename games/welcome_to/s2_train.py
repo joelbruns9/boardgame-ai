@@ -164,15 +164,27 @@ def split_trajectories(
     # Tiny smoke corpora can miss one side of a probabilistic split. Keep them
     # runnable with a deterministic fallback; production buffers are thousands
     # of games and do not use this branch.
-    if not validation:
-        index = min(range(len(assigned)), key=lambda i: assigned[i][1])
-        validation = [trajectories[index]]
-        train = [game for i, game in enumerate(trajectories) if i != index]
-    elif not train:
-        index = max(range(len(assigned)), key=lambda i: assigned[i][1])
-        train = [trajectories[index]]
-        validation = [game for i, game in enumerate(trajectories) if i != index]
+    #
+    # The fallback moves a whole FAMILY (review 2026-10-03 F6: moving one game
+    # put a restart and its source on opposite sides).
+    if not validation or not train:
+        families = sorted(
+            {split_family(game): digest for game, (_held, digest) in zip(trajectories, assigned)}.items(),
+            key=lambda item: item[1],
+        )
+        if len(families) < 2:
+            raise ValueError("S2 training needs at least two game families to split")
+        moved = families[0][0] if not validation else families[-1][0]
+        moving = [game for game in trajectories if split_family(game) == moved]
+        staying = [game for game in trajectories if split_family(game) != moved]
+        validation, train = (moving, staying) if not validation else (staying, moving)
     return train, validation
+
+
+def is_helper_game(game: self_play.SelfPlayTrajectory) -> bool:
+    """A game produced by a training helper: a curriculum restart, a forced
+    plan deal or a placement-assisted game (review 2026-10-03 F2)."""
+    return game.restart is not None or game.plan_ids is not None or game.assist_through is not None
 
 
 def _bounded_evaluation_set(
@@ -417,11 +429,19 @@ def evaluate(
             # can sit at "1 - positive rate" accuracy and still carry real
             # signal (review 2026-10-02 §2.2: plan_1_dies_soon, +24% Brier
             # skill at base-rate accuracy).
-            p = min(max(target_mean, 1e-12), 1.0 - 1e-12)
-            base_brier = p * (1.0 - p)
-            base_bce = -(p * math.log(p) + (1.0 - p) * math.log(1.0 - p))
-            metrics[f"brier_skill_{name}"] = 1.0 - metrics[f"brier_{name}"] / base_brier
-            metrics[f"bce_skill_{name}"] = 1.0 - metrics[f"bce_{name}"] / base_bce
+            # Undefined when every evaluated label agrees (review 2026-10-03:
+            # clipping made the denominator tiny); reported as null, with the
+            # raw losses and support beside it. The baseline is the evaluated
+            # prevalence -- descriptive, not an independently fitted forecast.
+            if 0.0 < target_mean < 1.0:
+                p = target_mean
+                base_brier = p * (1.0 - p)
+                base_bce = -(p * math.log(p) + (1.0 - p) * math.log(1.0 - p))
+                metrics[f"brier_skill_{name}"] = 1.0 - metrics[f"brier_{name}"] / base_brier
+                metrics[f"bce_skill_{name}"] = 1.0 - metrics[f"bce_{name}"] / base_bce
+            else:
+                metrics[f"brier_skill_{name}"] = float("nan")
+                metrics[f"bce_skill_{name}"] = float("nan")
             continue
         mse = sq_err[name] / count
         metrics[f"r2_{name}"] = 1.0 - mse / variance if variance > 0.0 else float("nan")
@@ -512,8 +532,14 @@ def fit(
     pairs_val: list[dict] = []
     use_pairs = bool(pairs) and config.pairs_weight > 0.0
     if use_pairs:
+        validation_families = {split_family(game) for game in val_pool}
+        training_families = {split_family(game) for game in train_set}
         pairs_train, pairs_val = paired_targets.split(
-            pairs, config.val_fraction, config.val_split_salt
+            pairs,
+            config.val_fraction,
+            config.val_split_salt,
+            validation_families=validation_families,
+            training_families=training_families,
         )
         pairs_val = sorted(pairs_val, key=lambda r: (r["game_seed"], r["turn"]))[
             : config.pairs_max_eval_roots
@@ -818,6 +844,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
         "--max-eval-games", type=int, default=S2TrainConfig().max_eval_games
     )
     parser.add_argument("--seed", type=int, default=S2TrainConfig().seed)
+    parser.add_argument("--exclude-helper-data", action="store_true",
+                        help="drop helper games (restarts, forced deals, assisted) from the "
+                        "replay and steered roots from the paired window (review F2)")
     parser.add_argument("--pairs-weight", type=float, default=0.0,
                         help="weight of paired placement targets (paired_targets.py); 0 = off")
     parser.add_argument("--pairs-window", type=int, default=4,
@@ -840,6 +869,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
     else:
         corpus = s2_replay.explicit_replay(args.trajectories)
     trajectories = corpus.trajectories
+    trajectory_iterations = corpus.trajectory_iterations
+    helper_games = sum(is_helper_game(game) for game in trajectories)
+    helper_positions = sum(len(g.searches) for g in trajectories if is_helper_game(g))
+    total_positions = sum(len(g.searches) for g in trajectories)
+    if args.exclude_helper_data:
+        kept = [i for i, game in enumerate(trajectories) if not is_helper_game(game)]
+        trajectories = [trajectories[i] for i in kept]
+        if trajectory_iterations is not None:
+            trajectory_iterations = [trajectory_iterations[i] for i in kept]
+    helper_report = {
+        "helper_games_in_window": float(helper_games),
+        "helper_position_share_in_window": helper_positions / max(1, total_positions),
+        "helper_data_excluded": bool(args.exclude_helper_data),
+    }
     optimizer_state = None
     optimizer_parameter_names = None
     optimizer_steps_completed = 0
@@ -882,7 +925,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
             parser.error("--pairs-weight needs --replay-root")
         through = args.replay_through_iteration or max(corpus.trajectory_iterations)
         pairs = paired_targets.load_window(Path(args.replay_root), through, args.pairs_window)
-        print(f"paired targets: {len(pairs)} roots from the last {args.pairs_window} iterations")
+        steered = sum(bool(r.get("steered")) for r in pairs)
+        helper_report["steered_pairs_in_window"] = float(steered)
+        if args.exclude_helper_data:
+            pairs = [r for r in pairs if not r.get("steered")]
+        print(f"paired targets: {len(pairs)} roots from the last {args.pairs_window} iterations "
+              f"({steered} steered{', excluded' if args.exclude_helper_data else ''})")
     net, optimizer, metrics = fit(
         trajectories,
         net=net,
@@ -892,8 +940,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
         optimizer_parameter_names=optimizer_parameter_names,
         optimizer_steps_completed=optimizer_steps_completed,
         training_runs_completed=training_runs_completed,
-        replay_metrics=corpus.metrics(),
-        trajectory_iterations=corpus.trajectory_iterations,
+        replay_metrics={**corpus.metrics(), **helper_report},
+        trajectory_iterations=trajectory_iterations,
         pairs=pairs,
     )
     path = save_checkpoint(

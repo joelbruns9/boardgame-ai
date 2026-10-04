@@ -45,7 +45,6 @@ from games.welcome_to import macro_codec as mc
 from games.welcome_to import placement_assist as pa
 from games.welcome_to import plans as pl
 from games.welcome_to import self_play, snapshot
-from games.welcome_to.constants import NUM_STREETS
 from games.welcome_to.game import GameState, Phase
 
 ARMS: tuple[str, ...] = ("normal", "pool")
@@ -60,10 +59,6 @@ _PASS_POOL = mc.from_primitive(codec.A_PASS_POOL)
 _PASS_PARK = mc.from_primitive(codec.A_PASS_PARK)
 
 
-def _alive_pool_boxes(sheet, x: int) -> int:
-    return pl._pool_boxes_alive(sheet, x)
-
-
 def needed_streets(state: GameState, seat: int = 0) -> tuple[set[int], set[int], list[int]]:
     """(streets needing pools, streets needing parks, live pool-plan slots)."""
     sheet = state.sheets[seat]
@@ -75,24 +70,19 @@ def needed_streets(state: GameState, seat: int = 0) -> tuple[set[int], set[int],
         if not pl.feasible(plan, sheet):
             continue
         live.append(slot)
-        complete_pools = sheet.street_pools_complete()
-        complete_parks = sheet.street_parks_complete()
-        if plan.kind is pl.PlanKind.DECORATIVE and plan.params[0] == "pool":
-            streets = [x for x in range(NUM_STREETS) if sheet.pools[x] + _alive_pool_boxes(sheet, x) >= 3]
-            pools |= {x for x in streets if not complete_pools[x]}
-        elif plan.kind is pl.PlanKind.DECORATIVE:  # pool&park in street params[1]
-            x = plan.params[1]
-            if not complete_pools[x]:
-                pools.add(x)
-            if not complete_parks[x]:
-                parks.add(x)
-        else:  # COMPLETE_STREET: any street that can still finish pools
-            for x in range(NUM_STREETS):
-                if sheet.pools[x] + _alive_pool_boxes(sheet, x) >= 3:
-                    if not complete_pools[x]:
-                        pools.add(x)
-                    if not complete_parks[x]:
-                        parks.add(x)
+        # The encoder's predicate (review F3): viable streets only -- for
+        # "complete a street" that includes having or still getting a roundabout.
+        viable = pl.pool_plan_streets(plan, sheet)
+        pools |= set(viable)
+        if plan.kind is pl.PlanKind.COMPLETE_STREET or plan.params[0] == "pool&park":
+            complete_parks = sheet.street_parks_complete()
+            if plan.kind is pl.PlanKind.DECORATIVE:
+                # the named street; its pools may already be complete
+                named = int(plan.params[1])
+                if not complete_parks[named]:
+                    parks.add(named)
+            else:
+                parks |= {x for x in viable if not complete_parks[x]}
     return pools, parks, live
 
 

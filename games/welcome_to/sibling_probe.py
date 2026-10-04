@@ -118,6 +118,12 @@ class Root:
     #: The learner's continuation follows the pool rule (paired_targets'
     #: plan-aware playouts); every other seat stays on argmax policy.
     steered: bool = False
+    #: Execution audit (review 2026-10-03 Q1): for a steered root, the same
+    #: candidates and futures played out WITHOUT steering, and whether the
+    #: learner finished a pool plan in each version.
+    unsteered_scores: Optional[np.ndarray] = None   # (C, F, players)
+    pool_done: Optional[np.ndarray] = None          # (C, F) bool, as labelled
+    unsteered_pool_done: Optional[np.ndarray] = None
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -200,7 +206,10 @@ def _finish_all(
         live = still
 
 
-_OUTCOME_FIELDS = ("scores", "ranks", "seat_ranks", "blend", "afterstates")
+_OUTCOME_FIELDS = (
+    "scores", "ranks", "seat_ranks", "blend", "afterstates",
+    "unsteered_scores", "pool_done", "unsteered_pool_done",
+)
 
 
 def _root_key(root: Root) -> tuple:
@@ -208,15 +217,23 @@ def _root_key(root: Root) -> tuple:
 
 
 class _LazyPoolSteer:
-    """The pool rule as a move override, imported on first use."""
+    """The pool rule as a move override, imported on first use; counts the
+    learner decisions it saw and changed."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.overrides = 0
 
     def __call__(self, rust_state, choice: int) -> int:
         from games.welcome_to import pool_rescue
 
+        self.calls += 1
         state = snapshot.from_snapshot(rust_state.snapshot())
         prompt = state.phase in (pool_rescue.Phase.ACTION_POOL, pool_rescue.Phase.ACTION_PARK)
         if prompt or pool_rescue.needed_streets(state, 0)[2]:
-            return pool_rescue.pool_choice(state, choice)
+            picked = pool_rescue.pool_choice(state, choice)
+            self.overrides += picked != choice
+            return picked
         return choice
 
 
@@ -231,6 +248,7 @@ def rollout_roots(
     seed: int,
     chunk_roots: int = 50,
     checkpoint_dir: Optional[Path] = None,
+    recipe: str = "",
 ) -> None:
     """Fill each root's outcome arrays: candidates x futures, paired draws.
 
@@ -245,8 +263,12 @@ def rollout_roots(
         path = None if checkpoint_dir is None else checkpoint_dir / f"chunk_{start:06d}.pt"
         if path is not None and path.exists():
             saved = torch.load(path, weights_only=False)
-            if saved["keys"] != [_root_key(roots[i]) for i in ids] or saved["futures"] != futures:
-                raise ValueError(f"{path} was written for different roots; use a new --out")
+            if (
+                saved["keys"] != [_root_key(roots[i]) for i in ids]
+                or saved["futures"] != futures
+                or saved.get("recipe", "") != recipe
+            ):
+                raise ValueError(f"{path} was written for different roots or settings; use a new --out")
             for i, outcome in zip(ids, saved["outcomes"]):
                 for name in _OUTCOME_FIELDS:
                     setattr(roots[i], name, outcome[name])
@@ -258,11 +280,21 @@ def rollout_roots(
                 {
                     "keys": [_root_key(roots[i]) for i in ids],
                     "futures": futures,
+                    "recipe": recipe,
                     "outcomes": [{name: getattr(roots[i], name) for name in _OUTCOME_FIELDS} for i in ids],
                 },
                 temporary,
             )
             temporary.replace(path)
+
+
+def _learner_pool_plan_done(final) -> bool:
+    from games.welcome_to import pool_rescue
+
+    return any(
+        pid in pool_rescue.POOL_PLAN_IDS and 0 in final.plan_turns[slot]
+        for slot, pid in enumerate(final.plan_ids)
+    )
 
 
 def _rollout_chunk(roots, ids, packed, cfg, futures, seed) -> None:
@@ -278,8 +310,14 @@ def _rollout_chunk(roots, ids, packed, cfg, futures, seed) -> None:
             for c_id, candidate in enumerate(root.candidates):
                 states.append(drawn.step_macro(candidate))
                 players.append(root.players)
-                index.append((r_id, c_id, f))
+                index.append((r_id, c_id, f, True))
                 steer.append(root.steered)
+                if root.steered:
+                    # the same future, unsteered: the execution audit
+                    states.append(drawn.step_macro(candidate))
+                    players.append(root.players)
+                    index.append((r_id, c_id, f, False))
+                    steer.append(False)
     _finish_all(states, players, packed, steer=steer if any(steer) else None)
     for r_id in ids:
         root = roots[r_id]
@@ -288,9 +326,19 @@ def _rollout_chunk(roots, ids, packed, cfg, futures, seed) -> None:
         root.ranks = np.zeros((n, futures, training.MAX_RANKS), dtype=np.float32)
         root.seat_ranks = np.zeros((n, futures, root.players, training.MAX_RANKS), dtype=np.float32)
         root.blend = np.zeros((n, futures), dtype=np.float32)
-    for state, (r_id, c_id, f) in zip(states, index):
+        root.pool_done = np.zeros((n, futures), dtype=bool)
+        if root.steered:
+            root.unsteered_scores = np.zeros((n, futures, root.players), dtype=np.float32)
+            root.unsteered_pool_done = np.zeros((n, futures), dtype=bool)
+    for state, (r_id, c_id, f, labelled) in zip(states, index):
         root = roots[r_id]
         final = snapshot.from_snapshot(state.snapshot())
+        pool_done = _learner_pool_plan_done(final)
+        if not labelled:
+            root.unsteered_scores[c_id, f] = final.scores()
+            root.unsteered_pool_done[c_id, f] = pool_done
+            continue
+        root.pool_done[c_id, f] = pool_done
         root.scores[c_id, f] = final.scores()
         dists = training.rank_distributions(final)
         root.seat_ranks[c_id, f] = dists

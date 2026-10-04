@@ -56,7 +56,7 @@ def test_build_writes_paired_roots_from_ordinary_games_and_resumes(iteration):
         assert r["ranks"].shape == (len(r["candidates"]), 3, 4)
         assert len(r["afterstates"]) == len(r["candidates"])
     stamp = path.stat().st_mtime_ns
-    assert pt.build(directory, checkpoint, roots=6, alternatives=2, futures=3, seed=5, device="cpu") == path
+    assert pt.build(directory, checkpoint, roots=6, alternatives=2, futures=3, seed=5, device="cpu", simulations=2) == path
     assert path.stat().st_mtime_ns == stamp, "an existing pairs.pt is reused, not rebuilt"
     window = pt.load_window(root, 1, 4)
     assert [(r["game_seed"], r["turn"], r["candidates"]) for r in window] == [
