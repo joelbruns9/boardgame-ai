@@ -125,7 +125,7 @@ rate, turn of each plan completion. Ordinary games only, as today.
   owner in a terminal:
 
   ```
-  .\.venv\Scripts\python.exe -m games.welcome_to.s2_run --run-dir runs/welcome_to_s2/v4_package_01 --iterations 20 --restart-fraction 0.2 --deal-fraction 0.25 --pairs-roots 300 --pairs-start-iteration 3 --pairs-plan-aware 0.3 --helpers-end-iteration 12 --pairs-benchmark runs/welcome_to_s2/v3_curriculum_01/_sibling_probe_48/dataset.pt
+  .\.venv\Scripts\python.exe -m games.welcome_to.s2_run --run-dir runs/welcome_to_s2/v4_package_01 --iterations 20 --restart-fraction 0.2 --deal-fraction 0.25 --pairs-roots 300 --pairs-start-iteration 3 --pairs-plan-aware 0.3 --helpers-end-iteration 12 --gate-games 200 --inflight 512 --pairs-benchmark runs/welcome_to_s2/v3_curriculum_01/_sibling_probe_48/dataset.pt
   ```
 
 ## 5. Build order and size
