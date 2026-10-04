@@ -286,9 +286,16 @@ positives, 3 inside pending choices). RICCP, run07 iter 60
 | seconds to ~4k sims | 4.2-5.0 | 2.0-3.2 | -- |
 
 **Default ON 2026-10-04 (owner).** Laptop self-play A/B: -4.5% sims/s (CPU-bound).
+
+**Layer 1b BUILT 2026-10-04: proven LOSSES** (`phase_e.guaranteed_loss_now` ->
+`tactics::guaranteed_loss_now`; on with the flag, own switch
+`set_exact_tactics_losses`). Gate: 0 mismatches / 10,463 positions, 95 losses
+(28 inside the mover's pending choice). RICCP ~4k: University abandoned 3/3
+seeds (win-only 2/3), already at ~1k; root 59-62%. Self-play vs win-only:
++7.5..+13% sims/s in 3/3 interleaved pairs (noisy) -- no measurable cost.
 Advisor host: `SWD_ADVISOR_EXACT_TACTICS`, default on.
 
-Not yet: opponent must-block threats,
+Not yet:
 extra-turn and civilian last-card wins, and bounded tactical search (layer 2)
 are not built; no broad suite or game-level measurement.
 

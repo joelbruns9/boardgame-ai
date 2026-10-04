@@ -131,3 +131,43 @@ def test_search_backs_up_the_exact_value_through_a_proven_child(positions):
     assert edge_mean(True) == pytest.approx(exact, abs=1e-12)
     # Off: the same edge is a network-valued subtree, not the exact result.
     assert edge_mean(False) != pytest.approx(exact, abs=1e-6)
+
+
+# --- layer 1b: proven losses -------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def loss_positions(positions):
+    """Played positions, plus each one with the track pushed to the OPPONENT's
+    doorstep: proven losses are rare on played lines and common there."""
+
+    states = list(positions[::2])
+    for state in positions[::3]:
+        if state.phase is not Phase.PLAY_AGE:
+            continue
+        pushed = state.clone()
+        pushed.conflict_position = -7 if state_actor(pushed) == 0 else 7
+        states.append(pushed)
+    return states
+
+
+def test_rust_loss_agrees_with_the_python_reference(loss_positions):
+    counts = Counter()
+    mismatches = []
+    for state in loss_positions:
+        if state.phase is Phase.COMPLETE:
+            continue
+        expected = pe.guaranteed_loss_now(state)
+        proven = rust_game_from_state(state).guaranteed_loss_now()
+        counts["positions"] += 1
+        counts["losses"] += expected
+        if (proven is not None) != expected:
+            mismatches.append((state.age, state_actor(state), expected))
+            continue
+        if proven is not None:
+            value, outlook = proven
+            # Actor frame: the MOVER loses.
+            assert value == (-1.0 if state_actor(state) == 0 else 1.0)
+            assert not pe.guaranteed_win_now(state)
+    assert not mismatches, mismatches[:10]
+    assert counts["losses"] >= 10, counts

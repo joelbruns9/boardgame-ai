@@ -819,6 +819,17 @@ impl RustGame {
         })
     }
 
+    /// G4 layer 1b: `(value_p0, outlook)` when every action of the mover
+    /// leaves the opponent a guaranteed win (`tactics::guaranteed_loss_now`).
+    fn guaranteed_loss_now(&self) -> Option<(f64, Vec<f64>)> {
+        tactics::guaranteed_loss_now(&self.state, tactics::PENDING_DEPTH).map(|terminal| {
+            (
+                eval::terminal_value_p0(&terminal),
+                eval::terminal_outlook_p0(&terminal).to_vec(),
+            )
+        })
+    }
+
     fn legal_action_indices(&self) -> Vec<usize> {
         codec::legal_action_indices(&self.state)
     }
@@ -3181,6 +3192,18 @@ fn exact_tactics() -> bool {
 }
 
 #[pyfunction]
+/// G4 layer 1b: also prove LOSSES (every move hands the opponent a forced
+/// win). Consulted only while `set_exact_tactics(True)`; on by default.
+fn set_exact_tactics_losses(enabled: bool) {
+    tactics::set_losses_enabled(enabled);
+}
+
+#[pyfunction]
+fn exact_tactics_losses() -> bool {
+    tactics::losses_enabled()
+}
+
+#[pyfunction]
 /// Set the cheap-move root width. See `self_play::set_cheap_top_k`.
 fn set_cheap_top_k(width: usize) {
     self_play::set_cheap_top_k(width);
@@ -3604,6 +3627,12 @@ mod seven_wonders_rust {
 
     #[pymodule_export]
     use super::exact_tactics;
+
+    #[pymodule_export]
+    use super::set_exact_tactics_losses;
+
+    #[pymodule_export]
+    use super::exact_tactics_losses;
 
     #[pymodule_export]
     use super::set_endgame_cost_model;

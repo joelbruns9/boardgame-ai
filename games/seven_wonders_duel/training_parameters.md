@@ -1785,6 +1785,14 @@ sims, 3 x 32 games per arm, interleaved) ran 1,182 vs 1,238 sims/s median,
 of network rows. That setup is CPU-bound; on a box whose search threads idle,
 expect less.
 
+**Layer 1b, proven losses** (on with the flag; `swr.set_exact_tactics_losses`
+turns it off alone): a node where EVERY move, under every reveal, leaves the
+opponent a guaranteed win is a proven loss (`phase_e.guaranteed_loss_now` is
+the reference; 0 mismatches on 10,463 positions incl. 95 losses). RICCP: the
+losing University move is abandoned in 3/3 seeds at ~4k sims (2/3 win-only)
+and already at ~1k. Self-play A/B vs win-only: faster in all 3 interleaved
+pairs (+7.5% to +13%, noisy run) -- no measurable cost.
+
 ### `--cuda-graphs`, `--no-cuda-graphs`
 
 **Default:** off.

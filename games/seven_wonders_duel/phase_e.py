@@ -248,6 +248,85 @@ def _chain_is_losing(child: GameState, actor: int, depth: int = PENDING_DEPTH) -
     return guaranteed_win_now(child, depth)
 
 
+def _resolved_children(state: GameState, index: int):
+    """Every consistent child of one action, or None when the outcomes cannot
+    be enumerated (an Age deal) or applied without reading hidden state.
+
+    None means "cannot prove": callers proving a LOSS must treat it as an
+    escape, never skip it -- an action the predicate cannot see through is
+    exactly one the mover might survive.
+    """
+
+    action = decode_action(state, index)
+    specs = chance_signature(state, action)
+    if any(spec.kind is ChanceKind.AGE_DEAL for spec in specs):
+        return None
+    children = []
+    for outcomes, _probability, _key in enumerate_chains(state, specs):
+        clone = state.clone()
+        clone.search_barrier = True
+        try:
+            apply_action(
+                clone, decode_action(clone, index), chance_outcomes=outcomes or None
+            )
+        except HiddenInformationError:
+            return None
+        children.append(clone)
+    return children
+
+
+def _outcome_lost(child: GameState, actor: int, depth: int) -> bool:
+    """After `actor`'s action resolved: is `actor` now certainly lost?
+
+    Lost = the game ended for the opponent, or every option of `actor`'s own
+    pending choice is lost, or the opponent moves next and has a guaranteed
+    win (`guaranteed_win_now`). An extra turn keeps the initiative: not lost.
+    Conservative wherever `_chain_is_losing` skips -- it is a trap DETECTOR,
+    this is a PROOF.
+    """
+
+    if child.phase is Phase.COMPLETE:
+        return child.winner is not None and child.winner != actor
+    if state_actor(child) == actor:
+        if child.pending_choice is None or depth <= 0:
+            return False
+        for index in legal_action_indices(child):
+            grandchildren = _resolved_children(child, index)
+            if grandchildren is None:
+                return False
+            if not all(_outcome_lost(g, actor, depth - 1) for g in grandchildren):
+                return False
+        return True
+    return guaranteed_win_now(child, depth)
+
+
+def guaranteed_loss_now(state: GameState, depth: int = PENDING_DEPTH) -> bool:
+    """G4 layer 1b: EVERY action of the mover, under EVERY consistent chance
+    outcome, leaves the opponent a guaranteed win next move -- so the position
+    is lost with certainty. The Python reference for `tactics.rs`.
+
+    Screened by `threat_possible` for the OPPONENT: the mover's own action can
+    add to the opponent's symbols or shields only by revealing a card, which
+    the screen already allows for.
+    """
+
+    if state.phase is Phase.COMPLETE:
+        return False
+    actor = state_actor(state)
+    if not threat_possible(state, 1 - actor):
+        return False
+    legal = legal_action_indices(state)
+    if not legal:
+        return False
+    for index in legal:
+        children = _resolved_children(state, index)
+        if children is None:
+            return False
+        if not all(_outcome_lost(child, actor, depth) for child in children):
+            return False
+    return True
+
+
 def analyze_position(state: GameState) -> dict | None:
     """Full mechanical trap analysis of one decision state. Returns None
     unless the position qualifies: >=1 reveal-bearing action with a losing
