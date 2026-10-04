@@ -713,8 +713,19 @@ class SevenWondersAdvisor:
         device: str = "cpu",
         allow_encoder_migration: bool | None = None,
         exact_endgame: bool = False,
+        exact_tactics: bool = True,
     ):
         self._injected = evaluator
+        # G4: search treats a node whose mover has a guaranteed win this turn
+        # as proven. The switch is PROCESS-WIDE in the Rust extension, so the
+        # host sets it once here rather than per request.
+        try:
+            import seven_wonders_rust as swr
+        except ImportError:  # pragma: no cover - Python-only search has no G4
+            self._exact_tactics = False
+        else:
+            swr.set_exact_tactics(bool(exact_tactics))
+            self._exact_tactics = bool(swr.exact_tactics())
         self._default_checkpoint = default_checkpoint
         self._device = device
         # Exact endgame annotation is opt-in at the host boundary. Once enabled,

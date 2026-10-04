@@ -24,3 +24,22 @@ def _install_control_table():
     except Exception:
         return
     ensure_rust_table()
+
+
+@pytest.fixture(autouse=True)
+def _exact_tactics_off():
+    """Every test starts with G4's process-wide switch OFF.
+
+    Constructing an advisor (or running `phase_d.main`) turns it on for the
+    whole process, and the exact Python/Rust equivalence gates assume plain
+    search. Tests that want it on set it themselves.
+    """
+
+    try:
+        import seven_wonders_rust as swr
+    except ImportError:
+        yield
+        return
+    swr.set_exact_tactics(False)
+    yield
+    swr.set_exact_tactics(False)

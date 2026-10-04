@@ -688,7 +688,7 @@ class PhaseDConfig:
     derive_backend: str = "rust"
     """Replay/encoding implementation: production Rust or Python reference."""
 
-    exact_tactics: bool = False
+    exact_tactics: bool = True
     """G4, as APPLIED (`configure_exact_tactics`): Rust search treats a node
     whose mover has a guaranteed win this turn as proven -- exact value, no
     network call. Recorded so a run's manifest says which searcher it had."""
@@ -7488,12 +7488,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--exact-tactics",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="G4: Rust search marks a node whose mover has a guaranteed military "
         "or science win this turn (own pending choices included, every chance "
         "outcome checked) as proven: exact value, never sent to the network, "
         "never averaged with network estimates. Applies to every Rust search in "
-        "the process -- self-play, gates, reanalysis. Off until measured",
+        "the process -- self-play, gates, reanalysis. Default on; costs ~4.5%% "
+        "sims/s on a CPU-bound laptop (run07 iter 60 self-play A/B)",
     )
     parser.add_argument(
         "--cheap-top-k",

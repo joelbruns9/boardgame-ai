@@ -38,6 +38,8 @@ from games.advisor import create_advisor_app
 from .advisor_adapter import SevenWondersAdvisor
 
 EXACT_ENDGAME_DEFAULT = True
+#: G4 proven-node search (`tactics.rs`). Process-wide in the Rust extension.
+EXACT_TACTICS_DEFAULT = True
 
 
 def _flag(name: str, *, default: bool = False) -> bool:
@@ -53,6 +55,9 @@ adapter = SevenWondersAdvisor(
     allow_encoder_migration=_flag("SWD_ADVISOR_ALLOW_MIGRATION"),
     exact_endgame=_flag(
         "SWD_ADVISOR_EXACT_ENDGAME", default=EXACT_ENDGAME_DEFAULT
+    ),
+    exact_tactics=_flag(
+        "SWD_ADVISOR_EXACT_TACTICS", default=EXACT_TACTICS_DEFAULT
     ),
 )
 

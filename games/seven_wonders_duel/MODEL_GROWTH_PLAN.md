@@ -285,9 +285,12 @@ positives, 3 inside pending choices). RICCP, run07 iter 60
 | University top move, ~4k | Build University x3 | changed in 2/3 seeds | unchanged |
 | seconds to ~4k sims | 4.2-5.0 | 2.0-3.2 | -- |
 
-Not yet: the advisor host does not set the switch; opponent must-block threats,
+**Default ON 2026-10-04 (owner).** Laptop self-play A/B: -4.5% sims/s (CPU-bound).
+Advisor host: `SWD_ADVISOR_EXACT_TACTICS`, default on.
+
+Not yet: opponent must-block threats,
 extra-turn and civilian last-card wins, and bounded tactical search (layer 2)
-are not built; no broad suite or game-level measurement, hence off.
+are not built; no broad suite or game-level measurement.
 
 Measure at the **predecessor decision that loses the game** (University), not
 only the tactical leaf. Validate correctness broadly and measure native

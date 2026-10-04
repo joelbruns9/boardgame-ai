@@ -1766,7 +1766,8 @@ gives the full preflight if a buffer's provenance is uncertain.
 
 ### `--exact-tactics`, `--no-exact-tactics`
 
-**Default:** off.
+**Default:** on (owner decision 2026-10-04). The advisor host follows
+`SWD_ADVISOR_EXACT_TACTICS` (default on).
 
 G4 (`MODEL_GROWTH_PLAN.md`, `tactics.rs`). Rust search marks a non-root node
 whose mover has a guaranteed military or science win THIS turn -- through
@@ -1778,8 +1779,11 @@ has no such mode. Gated against `phase_e.guaranteed_win_now` (0 mismatches on
 11,566 bot-game positions). On RICCP (run07 iter 60, ~4k sims) the Great
 Library move's value goes 6.9% -> ~50% (true 51.4%), the losing University
 decision's root estimate 88% -> ~65% with the top move changing in 2 of 3
-seeds, and searches run ~1.6x faster. Not yet measured on a broad suite or in
-games, hence off.
+seeds. Throughput: self-play A/B on the laptop (run07 iter 60, bf16, 100/400
+sims, 3 x 32 games per arm, interleaved) ran 1,182 vs 1,238 sims/s median,
+-4.5% (range -1.5% to -9%); proven leaves were ~2% of simulations and saved ~1%
+of network rows. That setup is CPU-bound; on a box whose search threads idle,
+expect less.
 
 ### `--cuda-graphs`, `--no-cuda-graphs`
 
