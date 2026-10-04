@@ -268,6 +268,27 @@ Already shown causal (Library 6.94% -> 46.36%). Build natively:
   bounds on chance nodes (unresolved mass `m` widens the interval by at most
   `2m`; a win in one world is not a proof at the chance parent).
 
+**Layer 1 BUILT 2026-10-04** (`--exact-tactics`, OFF by default; `tactics.rs`,
+`tree_resumable.rs`, `test_exact_tactics.py`): proven-node marker for an
+immediate guaranteed win, a port of `phase_e.guaranteed_win_now` (own pending
+chains, every chance outcome, military/science only). A proven node is searched
+like a terminal -- never expanded or evaluated, never averaged with NN values.
+Gate: 0 mismatches vs the Python reference on 11,566 bot-game positions (192
+positives, 3 inside pending choices). RICCP, run07 iter 60
+(`riccp_923216750_review/g4_native_tactics.py`):
+
+| | baseline | native G4 | prototype override |
+|---|---|---|---|
+| Library Q, ~4k sims, 3 seeds | 6.6-6.9% | 49.2-50.5% | 32.9% |
+| Library Q, 16k | 6.9% | 51.1% (true 51.4%) | 46.4% |
+| University root value, ~4k | 88-89% | 64-66% | (76% at 16k) |
+| University top move, ~4k | Build University x3 | changed in 2/3 seeds | unchanged |
+| seconds to ~4k sims | 4.2-5.0 | 2.0-3.2 | -- |
+
+Not yet: the advisor host does not set the switch; opponent must-block threats,
+extra-turn and civilian last-card wins, and bounded tactical search (layer 2)
+are not built; no broad suite or game-level measurement, hence off.
+
 Measure at the **predecessor decision that loses the game** (University), not
 only the tactical leaf. Validate correctness broadly and measure native
 throughput before default-on. Difference from W11 (null): exact values, never a

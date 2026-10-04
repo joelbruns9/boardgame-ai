@@ -1764,6 +1764,23 @@ but the stored trajectory and final digests go unchecked for those rows, and it
 warns once per source when it happens. Running `--derive-backend python` once
 gives the full preflight if a buffer's provenance is uncertain.
 
+### `--exact-tactics`, `--no-exact-tactics`
+
+**Default:** off.
+
+G4 (`MODEL_GROWTH_PLAN.md`, `tactics.rs`). Rust search marks a non-root node
+whose mover has a guaranteed military or science win THIS turn -- through
+their own pending choices (Mausoleum retrieval, science-pair token, Law), and
+across every chance outcome of the winning action -- as proven: exact value,
+never sent to the network, never averaged with network estimates afterwards.
+Process-wide, so it covers self-play, gates and reanalysis; the Python searcher
+has no such mode. Gated against `phase_e.guaranteed_win_now` (0 mismatches on
+11,566 bot-game positions). On RICCP (run07 iter 60, ~4k sims) the Great
+Library move's value goes 6.9% -> ~50% (true 51.4%), the losing University
+decision's root estimate 88% -> ~65% with the top move changing in 2 of 3
+seeds, and searches run ~1.6x faster. Not yet measured on a broad suite or in
+games, hence off.
+
 ### `--cuda-graphs`, `--no-cuda-graphs`
 
 **Default:** off.

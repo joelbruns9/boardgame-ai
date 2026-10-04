@@ -27,6 +27,7 @@ mod rules;
 mod self_play;
 mod solver;
 mod state;
+mod tactics;
 mod tree;
 mod tree_resumable;
 
@@ -806,6 +807,18 @@ impl RustGame {
     }
 
     /// Sorted codec indices of exactly the engine's legal actions.
+    /// G4: `(value_p0, outlook)` when the mover has a guaranteed win this
+    /// turn (`tactics::guaranteed_win_now`), whatever the global switch says.
+    /// The gate against `phase_e.guaranteed_win_now` reads this.
+    fn guaranteed_win_now(&self) -> Option<(f64, Vec<f64>)> {
+        tactics::guaranteed_win_now(&self.state, tactics::PENDING_DEPTH).map(|terminal| {
+            (
+                eval::terminal_value_p0(&terminal),
+                eval::terminal_outlook_p0(&terminal).to_vec(),
+            )
+        })
+    }
+
     fn legal_action_indices(&self) -> Vec<usize> {
         codec::legal_action_indices(&self.state)
     }
@@ -1891,6 +1904,7 @@ fn scheduler_result_to_py(
     metrics.set_item("requested_nn_leaves", m.requested_nn_leaves)?;
     metrics.set_item("unique_nn_leaves", m.unique_nn_leaves)?;
     metrics.set_item("terminal_leaves", m.terminal_leaves)?;
+    metrics.set_item("proven_leaves", m.proven_leaves)?;
     metrics.set_item("collisions", m.collisions)?;
     metrics.set_item("global_batches", m.global_batches)?;
     metrics.set_item("global_rows", m.global_rows)?;
@@ -3155,6 +3169,18 @@ fn derive_records(
 }
 
 #[pyfunction]
+/// G4: mark non-root search nodes whose mover has a guaranteed win this turn as
+/// proven (exact value, no network call). Process-wide; OFF by default.
+fn set_exact_tactics(enabled: bool) {
+    tactics::set_enabled(enabled);
+}
+
+#[pyfunction]
+fn exact_tactics() -> bool {
+    tactics::enabled()
+}
+
+#[pyfunction]
 /// Set the cheap-move root width. See `self_play::set_cheap_top_k`.
 fn set_cheap_top_k(width: usize) {
     self_play::set_cheap_top_k(width);
@@ -3572,6 +3598,12 @@ mod seven_wonders_rust {
 
     #[pymodule_export]
     use super::set_endgame_solver;
+
+    #[pymodule_export]
+    use super::set_exact_tactics;
+
+    #[pymodule_export]
+    use super::exact_tactics;
 
     #[pymodule_export]
     use super::set_endgame_cost_model;

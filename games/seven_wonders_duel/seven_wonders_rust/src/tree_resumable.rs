@@ -76,6 +76,11 @@ pub struct Node {
     pub visits: u32,
     pub value_sum_p0: f64,
     pub incomplete: u32,
+    /// G4: the mover has a guaranteed win this turn (`tactics`), so the node's
+    /// value is EXACT. Searched like a terminal: never expanded, never sent to
+    /// the network, never averaged with network estimates. Only ever set on
+    /// children (`make_child`) -- the root is the decision being made.
+    pub proven: Option<(f64, Outlook)>,
     /// F4.5 forced-child cache. Force expansion seeds the child's value/visit
     /// exactly as before but retains priors for the first ordinary visit.
     cached_evaluation: Option<(f64, Vec<f64>, Option<Outlook>)>,
@@ -103,8 +108,30 @@ impl Node {
             visits: 0,
             value_sum_p0: 0.0,
             incomplete: 0,
+            proven: None,
             cached_evaluation: None,
         }
+    }
+
+    /// A non-root node, checked for an exact immediate win when G4 is on.
+    fn make_child(state: GameState) -> Self {
+        let mut node = Self::make(state);
+        if !node.terminal {
+            node.proven = crate::tactics::proven_value(&node.state);
+        }
+        node
+    }
+
+    /// The value this node is known to have without asking the network: a
+    /// finished game's result, or a proven immediate win.
+    fn exact(&self) -> Option<(f64, Outlook)> {
+        if self.terminal {
+            return Some((
+                terminal_value_p0(&self.state),
+                crate::eval::terminal_outlook_p0(&self.state),
+            ));
+        }
+        self.proven
     }
 
     fn value_p0(&self) -> f64 {
@@ -360,7 +387,7 @@ fn closed_child(arena: &mut Arena, node_id: NodeId, edge_idx: usize, rng: &mut R
     child_state
         .apply_with_chance(&action, &outcomes)
         .expect("sampled chance outcome must be valid");
-    let child_id = arena.push(Node::make(child_state));
+    let child_id = arena.push(Node::make_child(child_state));
     arena.nodes[node_id].edges[edge_idx].children.push((
         key,
         Child {
@@ -394,8 +421,7 @@ fn select_leaf(
     let mut forced = Some(forced_edge);
     loop {
         let node = &arena.nodes[node_id];
-        if node.terminal {
-            let value = terminal_value_p0(&node.state);
+        if let Some((value, outlook)) = node.exact() {
             return (
                 PendingSimulation {
                     path,
@@ -405,11 +431,12 @@ fn select_leaf(
                     immediate_value: None,
                     immediate_outlook: None,
                 },
-                // EXACT, not predicted: a finished game knows how it ended.
+                // EXACT, not predicted: a finished game knows how it ended,
+                // and a proven node (G4) how it will.
                 Some(ImmediateLeaf {
                     value_p0: value,
                     priors: None,
-                    outlook: Some(crate::eval::terminal_outlook_p0(&node.state)),
+                    outlook: Some(outlook),
                 }),
             );
         }
@@ -660,7 +687,7 @@ fn materialize_forced_root(
             child_state
                 .apply_with_chance(&action, &outcomes)
                 .expect("enumerated outcome must be valid");
-            let child_id = arena.push(Node::make(child_state));
+            let child_id = arena.push(Node::make_child(child_state));
             forced_nodes.push(child_id);
             arena.nodes[root_id].edges[edge_idx].children.push((
                 key,
@@ -785,7 +812,7 @@ fn materialize_paired_age_deals(
             child_state
                 .apply_with_chance(&action, outcomes)
                 .expect("paired AgeDeal outcome must be valid for every root action");
-            let child_id = arena.push(Node::make(child_state));
+            let child_id = arena.push(Node::make_child(child_state));
             nodes.push(child_id);
             arena.nodes[root_id].edges[edge_idx].children.push((
                 key.clone(),
@@ -820,6 +847,9 @@ pub struct SearchMetrics {
     pub requested_nn_leaves: usize,
     pub unique_nn_leaves: usize,
     pub terminal_leaves: usize,
+    /// Of `terminal_leaves`, those that were G4-proven nodes rather than
+    /// finished games.
+    pub proven_leaves: usize,
     pub collisions: usize,
     pub leaf_waves: usize,
     pub max_wave_paths: usize,
@@ -957,12 +987,10 @@ fn settle_terminal_forced(
 ) -> PyResult<Vec<NodeId>> {
     let mut remaining = Vec::new();
     for node_id in nodes {
-        if !arena.nodes[node_id].terminal {
+        let Some((value_p0, outlook)) = arena.nodes[node_id].exact() else {
             remaining.push(node_id);
             continue;
-        }
-        let value_p0 = terminal_value_p0(&arena.nodes[node_id].state);
-        let outlook = crate::eval::terminal_outlook_p0(&arena.nodes[node_id].state);
+        };
         // The seeded sum is the edge's probability-weighted Q, which the
         // searcher reads: utility. The CACHE keeps the raw pair, because
         // whoever settles it later shapes it again.
@@ -1493,6 +1521,9 @@ impl SearchSession {
                     self.metrics.cached_forced_leaves += 1;
                 } else {
                     self.metrics.terminal_leaves += 1;
+                    if self.arena.nodes[pending.leaf_id].proven.is_some() {
+                        self.metrics.proven_leaves += 1;
+                    }
                 }
                 if !self.cfg.conflict_free_waves {
                     self.settle_simulation(pending, value_p0, outlook)?;

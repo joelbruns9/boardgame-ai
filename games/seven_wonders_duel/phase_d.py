@@ -688,6 +688,11 @@ class PhaseDConfig:
     derive_backend: str = "rust"
     """Replay/encoding implementation: production Rust or Python reference."""
 
+    exact_tactics: bool = False
+    """G4, as APPLIED (`configure_exact_tactics`): Rust search treats a node
+    whose mover has a guaranteed win this turn as proven -- exact value, no
+    network call. Recorded so a run's manifest says which searcher it had."""
+
     value_target_contract: str = VALUE_TARGET_CONTRACT_DEFAULT
     """G2: what every value head trains on, per proof type
     (`train.value_targets`). "g2": the flat and W4 heads share proofs, the
@@ -1677,6 +1682,21 @@ def _configure_cheap_top_k(width: int) -> None:
     except ImportError:  # pragma: no cover - Python backend needs no bridge
         return
     swr.set_cheap_top_k(int(width))
+
+
+def configure_exact_tactics(enabled: bool) -> bool:
+    """G4: mark search nodes whose mover has a guaranteed win this turn as
+    proven (`tactics.rs`). Process-wide, so it covers self-play, gates and
+    reanalysis alike -- every RUST search. Returns what took effect, read back;
+    False when there is no Rust bridge (the Python searcher has no such mode).
+    """
+
+    try:
+        import seven_wonders_rust as swr
+    except ImportError:  # pragma: no cover - Python backend needs no bridge
+        return False
+    swr.set_exact_tactics(bool(enabled))
+    return bool(swr.exact_tactics())
 
 
 def configure_solver_threads(threads: int, scheduler_workers: int = 1) -> None:
@@ -7466,6 +7486,16 @@ def build_parser() -> argparse.ArgumentParser:
         "the loss weight against the policy head's 1.0. 1.0 is historical.",
     )
     parser.add_argument(
+        "--exact-tactics",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="G4: Rust search marks a node whose mover has a guaranteed military "
+        "or science win this turn (own pending choices included, every chance "
+        "outcome checked) as proven: exact value, never sent to the network, "
+        "never averaged with network estimates. Applies to every Rust search in "
+        "the process -- self-play, gates, reanalysis. Off until measured",
+    )
+    parser.add_argument(
         "--cheap-top-k",
         type=int,
         default=0,
@@ -7958,6 +7988,7 @@ def main(argv=None) -> int:
     _configure_pack_pool(args.pack_threads)
     set_temperature_schedule(args.temperature_floor, args.temperature_anneal_moves)
     _configure_cheap_top_k(args.cheap_top_k)
+    applied_exact_tactics = configure_exact_tactics(args.exact_tactics)
     configure_forced_playouts(args.forced_playout_k)
     configure_solver_threads(args.solver_threads, args.rust_scheduler_workers)
     # Read back what the generator is actually running under, so the manifest
@@ -7978,6 +8009,7 @@ def main(argv=None) -> int:
     )
     applied_cost_model = configure_endgame_cost_model(args.endgame_cost_model)
     config = PhaseDConfig(
+        exact_tactics=applied_exact_tactics,
         endgame_cost_model=applied_cost_model,
         solver_fallback_research=args.solver_fallback_research,
         full_search_every_games=args.full_search_every_games,

@@ -1488,6 +1488,8 @@ pub struct SchedulerMetrics {
     pub requested_nn_leaves: usize,
     pub unique_nn_leaves: usize,
     pub terminal_leaves: usize,
+    /// G4: of `terminal_leaves`, the proven-win nodes (`tactics`).
+    pub proven_leaves: usize,
     pub collisions: usize,
     pub global_batches: usize,
     pub global_rows: usize,
@@ -1687,6 +1689,7 @@ impl SchedulerMetrics {
             requested_nn_leaves: _,
             unique_nn_leaves: _,
             terminal_leaves: _,
+            proven_leaves: _,
             collisions: _,
             global_batches: _,
             global_rows: _,
@@ -1763,6 +1766,7 @@ impl SchedulerMetrics {
         self.requested_nn_leaves += other.requested_nn_leaves;
         self.unique_nn_leaves += other.unique_nn_leaves;
         self.terminal_leaves += other.terminal_leaves;
+        self.proven_leaves += other.proven_leaves;
         self.collisions += other.collisions;
         self.global_batches += other.global_batches;
         self.global_rows += other.global_rows;
@@ -2398,6 +2402,7 @@ fn absorb_slot_metrics(metrics: &mut SchedulerMetrics, slot: &GameSlot) {
     metrics.requested_nn_leaves += slot.requested_nn_leaves;
     metrics.unique_nn_leaves += slot.unique_nn_leaves;
     metrics.terminal_leaves += slot.terminal_leaves;
+    metrics.proven_leaves += slot.proven_leaves;
     metrics.collisions += slot.collisions;
     metrics.forced_rows += slot.forced_rows;
     metrics.fixed_support_edges += slot.fixed_support_edges;
@@ -2475,6 +2480,7 @@ struct GameSlot {
     requested_nn_leaves: usize,
     unique_nn_leaves: usize,
     terminal_leaves: usize,
+    proven_leaves: usize,
     collisions: usize,
     forced_rows: usize,
     forced_rows_by_kind: [usize; 4],
@@ -2531,6 +2537,7 @@ impl GameSlot {
             requested_nn_leaves: 0,
             unique_nn_leaves: 0,
             terminal_leaves: 0,
+            proven_leaves: 0,
             collisions: 0,
             forced_rows: 0,
             forced_rows_by_kind: [0; 4],
@@ -2770,6 +2777,7 @@ impl GameSlot {
             self.requested_nn_leaves += metrics.requested_nn_leaves;
             self.unique_nn_leaves += metrics.unique_nn_leaves;
             self.terminal_leaves += metrics.terminal_leaves;
+            self.proven_leaves += metrics.proven_leaves;
             self.collisions += metrics.collisions;
             self.forced_rows += metrics.forced_outcome_rows;
             self.fixed_support_edges += metrics.fixed_support_edges;
