@@ -118,3 +118,48 @@ def test_rust_derivation_rejects_unknown_digest_version():
 
     with pytest.raises(ValueError, match="unsupported buffer digest version"):
         derive_records_rust([record])
+
+
+def _with_fast_proofs(record, count: int = 9):
+    """Mark the last `count` cheap-search moves as solver-proven (G1 rows)."""
+
+    moves = list(record.moves)
+    fast = [m.i for m in moves if m.policy_excluded and m.sims > 0][-count:]
+    for index in fast:
+        moves[index] = replace(
+            moves[index], solver_value=0.25, solver_regime="exact_expectimax"
+        )
+    return replace(record, moves=tuple(moves))
+
+
+@pytest.mark.parametrize("cap", [0, 4, 100])
+def test_g1_retained_proofs_match_across_backends(cap):
+    from .dataset import retained_proof_moves
+
+    records = [_with_fast_proofs(_record(seed)) for seed in (13, 29)]
+    rust_rows = derive_records_rust(records, retain_proofs_per_game=cap, batch_games=2)
+    for record, (rust_examples, _stats) in zip(records, rust_rows):
+        python_examples = examples_from_record(record, retain_proofs_per_game=cap)
+        _assert_examples_equal(python_examples, rust_examples)
+        kept = retained_proof_moves(record, cap)
+        assert len(kept) == min(cap, 9)
+        flagged = {e.move_index for e in rust_examples if e.retained_proof}
+        assert flagged == kept
+        for example in python_examples + rust_examples:
+            if example.retained_proof:
+                # Value-only: the proof survives, the cheap search's labels do not.
+                assert example.solver_value == 0.25
+                assert not example.has_policy
+                assert example.root_value is None and example.root_outlook is None
+        baseline = examples_from_record(record)
+        assert len(python_examples) == len(baseline) + len(kept)
+
+
+def test_g1_cap_spreads_from_the_earliest_proof():
+    from .dataset import retained_proof_moves
+
+    record = _with_fast_proofs(_record(47))
+    proven = [m.i for m in record.moves if m.solver_value is not None]
+    kept = retained_proof_moves(record, 4)
+    assert proven[0] in kept and len(kept) == 4
+    assert retained_proof_moves(record, 0) == set()

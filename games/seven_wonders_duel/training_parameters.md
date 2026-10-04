@@ -92,6 +92,7 @@ two is visible.
   --iterations 200 --games-per-iteration 1000 --seed-games 5000 `
   --d-model 384 --layers 8 --heads 6 --precision bf16 `
   --learning-rate 5e-5 --train-steps 190 --train-warmup-steps 63 `
+  --retain-proofs-per-game 4 `
   --train-batch-size 512 `
   --cheap-sims-min 100 --cheap-sims-max 100 `
   --full-sims-min 1600 --full-sims-max 1600 `
@@ -109,7 +110,7 @@ two is visible.
   --solver-fallback-research `
   --selfplay-generator-mode soft_gate `
   --bootstrap-policy auto_first_trained `
-  --promotion-every 5 --promotion-min-lcb 0.50 --revert-max-ucb 0.48 `
+  --promotion-every 10 --promotion-min-lcb 0.50 --revert-max-ucb 0.48 `
   --revert-reset-after 3 --probation-reset-after 4 `
   --gate-ladder-games 200 600 1000 1500 `
   --gate-ladder-step-up-after 2 --gate-ladder-floor-games 10000 `
@@ -127,8 +128,8 @@ two is visible.
   --memory-budget-gb 0 --vram-budget-gb 0 --memory-headroom-gb 2 `
   --rust-scheduler-workers 4 `
   --rust-slots 256 --rust-global-batch-cap 2048 --rust-max-inflight-batches 1 `
-  --gate-slots 144 --gate-global-batch-cap 1024 `
-  --gate-sims 64 `
+  --gate-slots 256 --gate-global-batch-cap 2048 `
+  --gate-sims 800 `
   --weight-decay 0.5 --value-bootstrap 0.5 --short-term-value-weight 0.25 `
   --min-buffer-positions 200000 `
   --replay-window-coefficient 1000 --replay-window-exponent 0.6 `

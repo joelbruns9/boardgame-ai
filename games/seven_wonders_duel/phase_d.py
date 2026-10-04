@@ -86,6 +86,9 @@ from .dataset import (
     examples_from_records,
     project_examples,
     is_fast_search_move,
+    RETAIN_PROOFS_PER_GAME_DEFAULT,
+    emits_example,
+    retained_proof_moves,
     usable_root_outlook,
 )
 from .game import Phase
@@ -667,6 +670,17 @@ class PhaseDConfig:
     Turning this on restores the pre-2026-07-25 behaviour; it roughly
     quadruples buffer size, so ``--train-steps`` must rise with it to keep
     ``samples_per_new_position`` in range.
+    """
+
+    retain_proofs_per_game: int = RETAIN_PROOFS_PER_GAME_DEFAULT
+    """G1: solver-proven cheap-search rows kept per game as VALUE-ONLY rows.
+
+    The fast-move drop above also discarded ~78% of the solver's proofs (run07:
+    ~6.5k per iteration, 530 of them from 1,600-sim league moves whose policy
+    was excluded for routing, not for being cheap). Their policy labels stay
+    off; their cheap-search bootstrap is dropped too. 0 restores the old rule.
+    Capped per game because a game's proofs are consecutive plies of one
+    endgame; the default 4 adds ~+21% rows (`dataset.retained_proof_moves`).
     """
 
     derive_backend: str = "rust"
@@ -4739,6 +4753,7 @@ class PhaseDLoop:
 
         cache = self._example_cache
         fast = self.config.record_fast_moves
+        retain = self.config.retain_proofs_per_game
         # W7: the SAME record yields different examples per model -- the policy
         # label is routed, and `value_soft`'s root differs between the model
         # whose lambda produced it and everyone else. But the expensive part of
@@ -4757,15 +4772,15 @@ class PhaseDLoop:
         rust_derived_games = 0
         used: set[tuple] = set()
         out: list[Example] = []
-        keyed_records: list[tuple[tuple[str, bool], GameRecord]] = []
-        missing: OrderedDict[tuple[str, bool], GameRecord] = OrderedDict()
+        keyed_records: list[tuple[tuple[str, bool, int], GameRecord]] = []
+        missing: OrderedDict[tuple[str, bool, int], GameRecord] = OrderedDict()
         for record in records:
             digest = record.source_digest
             if digest is None:
                 digest = hashlib.sha256(
                     to_json_line(record).encode("utf-8")
                 ).hexdigest()
-            key = (digest, fast)
+            key = (digest, fast, retain)
             keyed_records.append((key, record))
             if key not in cache or key not in self._example_cache_game_stats:
                 missing.setdefault(key, record)
@@ -4782,7 +4797,7 @@ class PhaseDLoop:
             if self.config.derive_backend == "rust"
         ]
         derived_by_key: dict[
-            tuple[str, bool], tuple[list[Example], GameDerivationStats]
+            tuple[str, bool, int], tuple[list[Example], GameDerivationStats]
         ] = {}
         for key, record in python_items:
             summaries: list[GameDerivationStats] = []
@@ -4790,6 +4805,7 @@ class PhaseDLoop:
                 record,
                 record_fast_moves=fast,
                 on_derived=summaries.append,
+                retain_proofs_per_game=retain,
             )
             if len(summaries) != 1:
                 raise AssertionError(
@@ -4801,6 +4817,7 @@ class PhaseDLoop:
             rust_rows = derive_records_rust(
                 [record for _key, record in rust_items],
                 record_fast_moves=fast,
+                retain_proofs_per_game=retain,
             )
             if len(rust_rows) != len(rust_items):
                 raise AssertionError("Rust example derivation lost record alignment")
@@ -6566,12 +6583,16 @@ class PhaseDLoop:
         if minimum <= 0:
             return ""
         keep_fast = self.config.record_fast_moves
-        positions = sum(
-            1
-            for record in records
-            for move in record.moves
-            if keep_fast or not is_fast_search_move(move)
-        )
+        positions = 0
+        for record in records:
+            retained = (
+                set() if keep_fast
+                else retained_proof_moves(record, self.config.retain_proofs_per_game)
+            )
+            positions += sum(
+                1 for move in record.moves
+                if emits_example(move, record_fast_moves=keep_fast, retained=retained)
+            )
         if positions >= minimum:
             return ""
         return (
@@ -7659,6 +7680,14 @@ def build_parser() -> argparse.ArgumentParser:
         "so --train-steps must rise with it",
     )
     parser.add_argument(
+        "--retain-proofs-per-game",
+        type=int,
+        default=RETAIN_PROOFS_PER_GAME_DEFAULT,
+        help="G1: keep up to N solver-proven cheap-search rows per game as "
+        "value-only rows (no policy label, no cheap bootstrap); 0 restores "
+        f"the old drop. Default {RETAIN_PROOFS_PER_GAME_DEFAULT} (~+21%% rows on run07)",
+    )
+    parser.add_argument(
         "--derive-backend",
         choices=("rust", "python"),
         default="rust",
@@ -8000,6 +8029,7 @@ def main(argv=None) -> int:
         vram_budget_gb=args.vram_budget_gb,
         memory_headroom_gb=args.memory_headroom_gb,
         record_fast_moves=args.record_fast_moves,
+        retain_proofs_per_game=args.retain_proofs_per_game,
         derive_backend=args.derive_backend,
         eval_search_mode=args.eval_search_mode,
         generation_backend=args.generation_backend,

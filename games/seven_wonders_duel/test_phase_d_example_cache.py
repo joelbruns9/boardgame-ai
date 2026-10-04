@@ -396,6 +396,16 @@ def test_record_fast_moves_is_part_of_the_key(tmp_path, records):
     assert loop.last_example_cache_stats["replayed_games"] == len(records)
 
 
+def test_retain_proofs_per_game_is_part_of_the_key(tmp_path, records):
+    """G1: a different retention cap emits different rows, so it re-derives."""
+
+    loop = _loop(tmp_path)
+    loop._cached_examples(records)
+    loop.config.retain_proofs_per_game = 0
+    loop._cached_examples(records)
+    assert loop.last_example_cache_stats["replayed_games"] == len(records)
+
+
 def test_same_trajectory_with_different_targets_does_not_share_an_entry(
     tmp_path, records
 ):

@@ -102,7 +102,9 @@ def test_the_launch_configuration_matches_the_locked_decisions(setup_text):
 
 def test_the_run03_lifecycle_defaults_match_the_documented_command(setup_text):
     expected = {
-        "PROMOTION_EVERY": "5",
+        # 10 since 2026-10-03: gates run at 800 sims (was 64), so half as often.
+        # training_parameters.md's laptop command still records run03's 5.
+        "PROMOTION_EVERY": "10",
         "BOOTSTRAP_POLICY": "auto_first_trained",
         "PROBATION_RESET_AFTER": "4",
         "REVERT_RESET_AFTER": "3",

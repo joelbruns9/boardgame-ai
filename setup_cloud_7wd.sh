@@ -267,6 +267,14 @@ TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-512}"
 # 0.19 x games: ~19.4 recorded positions per game (measured with
 # --record-fast-moves off), 5 passes each, at batch 512. Warmup is a third of
 # the budget because the parser's default 100 can exceed the whole of it.
+#
+# G1 (2026-10-04): RETAIN_PROOFS_PER_GAME keeps up to N solver-proven cheap
+# rows per game as value-only rows. At the default 4 that is +21-22% rows on
+# run07's buffers, ~15.1 -> ~18.4 per game. run07 recorded 15.1, not the 19.4
+# above, so 0.19 x games was ~6.4 passes there and is ~5.3 with retention --
+# back on target, so the factor is unchanged. RETAIN_PROOFS_PER_GAME=0 restores
+# the old drop.
+RETAIN_PROOFS_PER_GAME="${RETAIN_PROOFS_PER_GAME:-4}"
 TRAIN_STEPS="${TRAIN_STEPS:-$(( (GAMES_PER_ITERATION * 19 + 99) / 100 ))}"
 TRAIN_WARMUP_STEPS="${TRAIN_WARMUP_STEPS:-$(( TRAIN_STEPS / 3 ))}"
 HOF_FRACTION="${HOF_FRACTION:-0.15}"
@@ -1130,6 +1138,7 @@ TRAIN_CMD=(
   --precision "$PRECISION"
   --learning-rate "$LEARNING_RATE"
   --train-steps "$TRAIN_STEPS"
+  --retain-proofs-per-game "$RETAIN_PROOFS_PER_GAME"
   --train-warmup-steps "$TRAIN_WARMUP_STEPS"
   --train-batch-size "$TRAIN_BATCH_SIZE"
   --schedule-basis games

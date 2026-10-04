@@ -1349,6 +1349,12 @@ def train_steps(
     control_labels = control_table_for(model)
     window_start = time.time()
     window_steps = 0
+    # G1: presentations actually drawn per row class, so a retention change is
+    # judged by what training saw rather than by what the buffer held.
+    retained_rows = [bool(getattr(e, "retained_proof", False)) for e in train_examples]
+    any_retained = any(retained_rows)
+    sampled_rows = 0
+    sampled_retained = 0
 
     def learning_rate(step: int) -> float:
         if not warm and warmup_steps > 0 and step < warmup_steps:
@@ -1365,6 +1371,9 @@ def train_steps(
         for group in optimizer.param_groups:
             group["lr"] = current_lr
         sampled = rng.choices(population, k=batch_size)
+        sampled_rows += len(sampled)
+        if any_retained:
+            sampled_retained += sum(retained_rows[i] for i in sampled)
         batch = (
             batch_getter(sampled, device)
             if batch_getter is not None
@@ -1428,6 +1437,8 @@ def train_steps(
                 running_grad_norm / norm_steps if norm_steps else None
             ),
             "grad_overflow_steps": overflow_steps,
+            "sampled_rows": sampled_rows,
+            "sampled_retained_proof_rows": sampled_retained,
         }
         running = {}
         running_grad_norm = 0.0

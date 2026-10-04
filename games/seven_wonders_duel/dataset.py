@@ -194,6 +194,12 @@ class Example:
     #: model's view without replaying the game again -- see
     #: `project_examples`, and `phase_d._cached_examples` for why that matters.
     move_index: int | None = None
+    #: G1: a CHEAP-search row kept only because the solver proved its value
+    #: (`retained_proof_moves`). It trains value alone: no policy label (the
+    #: move is policy-excluded) and no cheap-search bootstrap (`root_value` and
+    #: `root_outlook` are dropped), so its value target is the proof plus the
+    #: realised outcome. Counted per sampled batch in `train_steps`.
+    retained_proof: bool = False
 
     def __post_init__(self) -> None:
         """Make the arrays read-only as well as the fields.
@@ -648,6 +654,42 @@ def is_fast_search_move(move) -> bool:
     return move.policy_excluded and move.sims > 0
 
 
+#: G1 default: how many solver-proven cheap-search rows one game may keep. 0
+#: restores the old drop-every-cheap-move rule. Measured on run07 iterations 60
+#: and 100: uncapped retention adds +43-44% to the base rows, almost all of them
+#: consecutive plies of ONE endgame per game (most games hold 6-11); a cap of 4
+#: adds +21-22%.
+RETAIN_PROOFS_PER_GAME_DEFAULT = 4
+
+
+def retained_proof_moves(record, cap: int) -> set[int]:
+    """Move indices of the cheap-search rows G1 keeps as value-only proof rows.
+
+    `is_fast_search_move` drops every cheap move, which also discarded ~78% of
+    the solver's proofs (`MODEL_GROWTH_PLAN.md` G1): the policy label of a cheap
+    search is untrustworthy, the proven value is not. Up to `cap` per game,
+    evenly spaced over the game's proven cheap plies and always including the
+    earliest -- the furthest from the end, so the hardest the solver settled.
+    """
+
+    if cap <= 0:
+        return set()
+    proven = [
+        move.i for move in record.moves
+        if is_fast_search_move(move) and move.solver_value is not None
+    ]
+    if len(proven) <= cap:
+        return set(proven)
+    step = len(proven) / cap
+    return {proven[int(k * step)] for k in range(cap)}
+
+
+def emits_example(move, *, record_fast_moves: bool, retained: set[int]) -> bool:
+    """Whether a recorded move becomes a training row (both derive backends)."""
+
+    return record_fast_moves or not is_fast_search_move(move) or move.i in retained
+
+
 #: Extra loss weight a single GAME's solved rows share between them.
 #:
 #: Kingdomino uses `endgame_oversample = 2.0`, i.e. "count these rows twice".
@@ -860,6 +902,7 @@ def examples_from_record(
     record_fast_moves: bool = False,
     on_derived: Callable[[GameDerivationStats], None] | None = None,
     derived_for: str = GENERAL_ROUTE,
+    retain_proofs_per_game: int = 0,
 ) -> list[Example]:
     """Replay one game (through the VERIFIED buffer.replay path — mask hashes,
     actors, chance log, trajectory and final digests all checked) and emit an
@@ -892,6 +935,10 @@ def examples_from_record(
     archive_seats = archive_policy_seats(record.agents)
 
     legal_by_move: dict[int, np.ndarray] = {}
+    retained = (
+        set() if record_fast_moves
+        else retained_proof_moves(record, retain_proofs_per_game)
+    )
 
     def featurize(game, move):
         nonlocal maximum_track
@@ -903,8 +950,9 @@ def examples_from_record(
             legal_action_indices(game), dtype=np.int16
         )
         # Replay still steps through this move -- only the example is dropped.
-        if not record_fast_moves and is_fast_search_move(move):
+        if not emits_example(move, record_fast_moves=record_fast_moves, retained=retained):
             return
+        kept_proof = move.i in retained
         actor = (
             game.pending_choice.player
             if game.pending_choice is not None
@@ -942,8 +990,8 @@ def examples_from_record(
                     and move_target_route(move) == derived_for
                 ),
                 actor,
-                *bootstrap_root_value(move),
-                move.root_outlook,
+                *((None, False) if kept_proof else bootstrap_root_value(move)),
+                None if kept_proof else move.root_outlook,
                 move.solver_value,
                 move.solver_regime == "exact",
                 move.i,
@@ -1045,6 +1093,7 @@ def examples_from_record(
                 reanalysis=reanalysis,
                 root_value_shaped=root_value_shaped,
                 move_index=move_index,
+                retained_proof=move_index in retained,
             )
         )
     return _with_short_term(examples, record)
@@ -1088,7 +1137,10 @@ def _rust_chance_log(record: GameRecord) -> list[tuple[int, list[int]]]:
 
 
 def _examples_from_rust_payload(
-    record: GameRecord, payload: dict, derived_for: str = GENERAL_ROUTE
+    record: GameRecord,
+    payload: dict,
+    derived_for: str = GENERAL_ROUTE,
+    retained: set[int] | frozenset[int] = frozenset(),
 ) -> tuple[list[Example], GameDerivationStats]:
     """Turn one packed Rust replay into the exact public ``Example`` objects."""
 
@@ -1194,9 +1246,11 @@ def _examples_from_rust_payload(
                     and move_target_route(move) == derived_for
                 ),
                 value_class=_actor_value_class(record.winner, actor),
-                root_value=bootstrap_root_value(move)[0],
-                root_value_shaped=bootstrap_root_value(move)[1],
-                root_outlook=move.root_outlook,
+                root_value=None if move.i in retained else bootstrap_root_value(move)[0],
+                root_value_shaped=(
+                    False if move.i in retained else bootstrap_root_value(move)[1]
+                ),
+                root_outlook=None if move.i in retained else move.root_outlook,
                 solver_value=move.solver_value,
                 solver_exact=move.solver_regime == "exact",
                 value_weight=row_weights.get(move.i, (1.0, 1.0))[0],
@@ -1217,6 +1271,7 @@ def _examples_from_rust_payload(
                 search_victory=getattr(move, "search_victory", None),
                 reanalysis=bool(getattr(move, "reanalysis", False)),
                 move_index=move.i,
+                retained_proof=move.i in retained,
             )
         )
 
@@ -1271,6 +1326,7 @@ def derive_records_rust(
     record_fast_moves: bool = False,
     batch_games: int = 32,
     derived_for: str = GENERAL_ROUTE,
+    retain_proofs_per_game: int = 0,
 ) -> list[tuple[list[Example], GameDerivationStats]]:
     """Rust-default replay/encode path, aligned one result per input game.
 
@@ -1310,9 +1366,17 @@ def derive_records_rust(
         games = [rust_game_for_record(record) for record in batch]
         actions = [[move.action for move in record.moves] for record in batch]
         actors = [[move.actor for move in record.moves] for record in batch]
-        include = [
-            [record_fast_moves or not is_fast_search_move(move) for move in record.moves]
+        retained_by_game = [
+            set() if record_fast_moves
+            else retained_proof_moves(record, retain_proofs_per_game)
             for record in batch
+        ]
+        include = [
+            [
+                emits_example(move, record_fast_moves=record_fast_moves, retained=kept)
+                for move in record.moves
+            ]
+            for record, kept in zip(batch, retained_by_game)
         ]
         chance_logs = [_rust_chance_log(record) for record in batch]
         expected_results = [
@@ -1356,8 +1420,8 @@ def derive_records_rust(
         if len(payloads) != len(batch):
             raise ReplayMismatchError("Rust derivation returned the wrong game count")
         output.extend(
-            _examples_from_rust_payload(record, payload, derived_for)
-            for record, payload in zip(batch, payloads)
+            _examples_from_rust_payload(record, payload, derived_for, kept)
+            for record, payload, kept in zip(batch, payloads, retained_by_game)
         )
     return output
 
@@ -1397,7 +1461,9 @@ def project_examples(examples, record, derived_for: str):
                 f"example references move {example.move_index}, which the record "
                 "does not contain"
             )
-        root_value, shaped = bootstrap_root_value(move)
+        root_value, shaped = (
+            (None, False) if example.retained_proof else bootstrap_root_value(move)
+        )
         projected.append(
             dataclasses.replace(
                 example,
@@ -1415,7 +1481,11 @@ def project_examples(examples, record, derived_for: str):
 
 
 def examples_from_records(
-    records, *, record_fast_moves: bool = False, derived_for: str = GENERAL_ROUTE
+    records,
+    *,
+    record_fast_moves: bool = False,
+    derived_for: str = GENERAL_ROUTE,
+    retain_proofs_per_game: int = 0,
 ) -> list[Example]:
     out: list[Example] = []
     for record in records:
@@ -1424,6 +1494,7 @@ def examples_from_records(
                 record,
                 record_fast_moves=record_fast_moves,
                 derived_for=derived_for,
+                retain_proofs_per_game=retain_proofs_per_game,
             )
         )
     return out
