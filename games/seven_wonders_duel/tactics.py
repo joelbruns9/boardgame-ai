@@ -250,3 +250,81 @@ def forced_loss(state: GameState, depth: int = PENDING_DEPTH) -> bool:
     return bool(legal) and all(
         _every_child(state, index, lambda c: _lost(c, actor, depth)) for index in legal
     )
+
+
+def classify_actions(state: GameState) -> list[int]:
+    """G0: every legal action labelled exactly -- `+1` when it forces a win
+    before the opponent moves again, `-1` when every outcome leaves the
+    opponent a forced win, `0` when neither is proven. Aligned to
+    `legal_action_indices`. The reference for `tactics::classify_actions`."""
+
+    if state.phase is Phase.COMPLETE:
+        return []
+    mover = state_actor(state)
+    opponent = 1 - mover
+    present = _present_cards(state)
+    can_win = _within_reach(state, mover, 1) or _replay_reach(state, mover, EXTRA_TURNS)
+    can_lose = (
+        _within_reach(state, opponent, 1)
+        or _replay_reach(state, opponent, EXTRA_TURNS)
+        or (state.age == 3 and present <= 2)
+        or (
+            state.age == 3
+            and present <= 2 + EXTRA_TURNS
+            and _can_replay(state, opponent)
+        )
+    )
+    labels = []
+    for index in legal_action_indices(state):
+        if can_win and _every_child(
+            state, index, lambda c: _won(c, mover, PENDING_DEPTH, EXTRA_TURNS)
+        ):
+            labels.append(1)
+        elif can_lose and _every_child(
+            state, index, lambda c: _lost(c, mover, PENDING_DEPTH)
+        ):
+            labels.append(-1)
+        else:
+            labels.append(0)
+    return labels
+
+
+def losing_mass(state: GameState) -> list[tuple[float, bool] | None]:
+    """G0 reveal traps: per legal action, `(losing mass, reveals)` -- the
+    probability over its chance outcomes that the opponent is then left a
+    `forced_win`, and whether it reveals a card -- or None when the outcomes
+    cannot be enumerated (an Age deal) or applied. The reference for
+    `tactics::losing_mass`."""
+
+    if state.phase is Phase.COMPLETE:
+        return []
+    mover = state_actor(state)
+    opponent = 1 - mover
+    present = _present_cards(state)
+    can_lose = (
+        _within_reach(state, opponent, 1)
+        or _replay_reach(state, opponent, EXTRA_TURNS)
+        or (state.age == 3 and present <= 2)
+        or (state.age == 3 and present <= 2 + EXTRA_TURNS and _can_replay(state, opponent))
+    )
+    out: list[tuple[float, bool] | None] = []
+    for index in legal_action_indices(state):
+        specs = chance_signature(state, decode_action(state, index))
+        if any(spec.kind is ChanceKind.AGE_DEAL for spec in specs):
+            out.append(None)
+            continue
+        reveals = any(spec.kind is ChanceKind.CARD_REVEAL for spec in specs)
+        if not can_lose:
+            out.append((0.0, reveals))
+            continue
+        mass = 0.0
+        failed = False
+        for outcomes, probability, _key in enumerate_chains(state, specs):
+            child = _child(state, index, outcomes)
+            if child is None:
+                failed = True
+                break
+            if _lost(child, mover, PENDING_DEPTH):
+                mass += probability
+        out.append(None if failed else (mass, reveals))
+    return out

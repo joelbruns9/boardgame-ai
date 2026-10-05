@@ -835,6 +835,17 @@ impl RustGame {
         })
     }
 
+    /// G0: per legal action `(losing mass, reveals)` or None
+    /// (`tactics::losing_mass`).
+    fn losing_mass(&self) -> Vec<Option<(f64, bool)>> {
+        tactics::losing_mass(&self.state)
+    }
+
+    /// G0: `+1` / `-1` / `0` per legal action (`tactics::classify_actions`).
+    fn classify_actions(&self) -> Vec<i8> {
+        tactics::classify_actions(&self.state)
+    }
+
     /// G4 layer 1b: `(value_p0, outlook)` when every action of the mover
     /// leaves the opponent a guaranteed win (`tactics::guaranteed_loss_now`).
     fn guaranteed_loss_now(&self) -> Option<(f64, Vec<f64>)> {

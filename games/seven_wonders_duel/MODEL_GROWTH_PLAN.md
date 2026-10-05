@@ -160,6 +160,25 @@ not new cases. The audit also found every one of those 54 wins was **taken**, so
 the real benefit must come from earlier evaluations and decisions -- the
 predecessor class matters most.
 
+**BUILT 2026-10-04** (`tactical_suite.py`, `test_tactical_suite.py`, 7 tests):
+`harvest` files buffer positions into own_win / forced_loss / must_block (exact
+per-action labels from `RustGame.classify_actions`, reference
+`tactics.classify_actions`), reveal_trap (`phase_e.analyze_position`), solver
+(recorded proofs), predecessor (the mover's previous decision before walking
+into a forced loss), quiet (motif in reach, nothing forced) and ordinary
+(uniform); games sealed 20% by hash. `evaluate` scores the raw net and/or search
+at given budgets (exact tactics on by default): value MAE / bias,
+overconfident-wrong on proven results, found-win / blunder rates and policy
+mass, trap picks and expected losing mass, ECE for the realized-outcome
+classes; rows AND unique games, each class also split near_end (<= 2 plies
+to the end: mostly the game-ending move) vs deep. Reveal traps use the Rust
+`losing_mass` (the Python `phase_e.analyze_position` cost ~2.4 h per buffer);
+harvest runs ~45 s per 1,000-game buffer. Smoke (iters 99-100, 60 cases per
+class, run07 iter 60): must_block/deep blunders 23.5% raw / 11.8% at 64 sims;
+reveal_trap picks 42% / 33%; predecessor value bias +0.24 / +0.08. Not yet:
+the unplayed-alternatives class,
+sims-to-refute, burial correctness, family-level sealing beyond whole games.
+
 ## G0b -- Controlled attribution study (replaces the clairvoyant oracle)
 
 r1's "actual reveal known in advance" axis gives the player information it did

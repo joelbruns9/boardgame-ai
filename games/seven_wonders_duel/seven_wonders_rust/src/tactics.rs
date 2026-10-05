@@ -303,6 +303,87 @@ pub fn guaranteed_loss_now(state: &GameState, depth: usize) -> Option<GameState>
     witness
 }
 
+/// G0: every legal action of the mover, labelled exactly: `+1` when it forces
+/// a win before the opponent moves again, `-1` when every outcome leaves the
+/// opponent a forced win, `0` when neither is proven. Aligned to
+/// `legal_action_indices`. `tactics.classify_actions`.
+pub fn classify_actions(state: &GameState) -> Vec<i8> {
+    if state.phase == Phase::Complete {
+        return Vec::new();
+    }
+    let mover = actor(state);
+    let can_win = within_reach(state, mover, 1) || replay_reach(state, mover, EXTRA_TURNS);
+    let present = present_cards(state);
+    let can_lose = within_reach(state, 1 - mover, 1)
+        || replay_reach(state, 1 - mover, EXTRA_TURNS)
+        || (state.age == 3 && present <= 2)
+        || (state.age == 3 && present <= 2 + EXTRA_TURNS && can_replay(state, 1 - mover));
+    legal_action_indices(state)
+        .into_iter()
+        .map(|index| {
+            if can_win
+                && every_child(state, index, |child| {
+                    won(child, mover, PENDING_DEPTH, EXTRA_TURNS)
+                })
+                .is_some()
+            {
+                1
+            } else if can_lose
+                && every_child(state, index, |child| lost(child, mover, PENDING_DEPTH)).is_some()
+            {
+                -1
+            } else {
+                0
+            }
+        })
+        .collect()
+}
+
+/// G0 reveal traps: per legal action, `(losing mass, reveals)` -- the
+/// probability, over the action's chance outcomes, that the opponent is then
+/// left a forced win, and whether the action reveals a card -- or None when
+/// the outcomes cannot be enumerated (an Age deal) or applied. Every outcome
+/// is checked (no early exit: the mass is the quantity). `tactics.losing_mass`.
+pub fn losing_mass(state: &GameState) -> Vec<Option<(f64, bool)>> {
+    if state.phase == Phase::Complete {
+        return Vec::new();
+    }
+    let mover = actor(state);
+    let present = present_cards(state);
+    let can_lose = within_reach(state, 1 - mover, 1)
+        || replay_reach(state, 1 - mover, EXTRA_TURNS)
+        || (state.age == 3 && present <= 2)
+        || (state.age == 3 && present <= 2 + EXTRA_TURNS && can_replay(state, 1 - mover));
+    legal_action_indices(state)
+        .into_iter()
+        .map(|index| {
+            let action = decode_action(state, index);
+            let specs = chance::chance_signature(state, &action);
+            if specs.iter().any(|spec| spec.kind == ChanceKind::AgeDeal) {
+                return None;
+            }
+            let reveals = specs.iter().any(|spec| spec.kind == ChanceKind::CardReveal);
+            if !can_lose {
+                return Some((0.0, reveals));
+            }
+            let chains = if specs.is_empty() {
+                vec![(Vec::new(), 1.0)]
+            } else {
+                chance::enumerate_chains_unkeyed(state, &specs)
+            };
+            let mut mass = 0.0;
+            for (outcomes, probability) in chains {
+                let mut child = state.clone();
+                child.apply_with_chance(&action, &outcomes).ok()?;
+                if lost(&child, mover, PENDING_DEPTH).is_some() {
+                    mass += probability;
+                }
+            }
+            Some((mass, reveals))
+        })
+        .collect()
+}
+
 /// `(value_p0, outlook)` for a node the switch says to check, or None: a
 /// guaranteed win for the mover, else a guaranteed loss.
 pub fn proven_value(state: &GameState) -> Option<(f64, crate::eval::Outlook)> {
