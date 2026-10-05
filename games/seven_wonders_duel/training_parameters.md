@@ -1806,10 +1806,12 @@ solved interior nodes per 32 games.
 Mausoleum retrieval or Great Library token choice reached as a leaf is
 expanded over ALL its options in one request (one simulation; each option
 seeded at its value), and from then on reports its best option's current Q.
-Library token afterstates are shared across offers (the unused-token pool,
-which nothing reads after the draw, is canonicalized). Each such leaf costs one
-network row per option: self-play ~-4% sims/s vs off in total (G4 without G4b
-~-2%). RICCP: the Library value reaches the true 51.4% by ~1k sims.
+A Great Library build no longer samples its 3-of-5 draw: each card reveal gets
+one node holding the whole pool, valued by the exact expected best of a random
+offer (0.6 / 0.3 / 0.1 over the sorted tokens). RICCP: the Library value is
+within ~0.5 pt of the true 51.4% from ~1k sims. Self-play ~-2.5% sims/s vs off
+for the whole G4 + G4b package. Each such leaf costs one
+network row per option.
 
 ### `--cuda-graphs`, `--no-cuda-graphs`
 

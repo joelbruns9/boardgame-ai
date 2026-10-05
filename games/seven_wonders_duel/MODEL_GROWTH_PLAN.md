@@ -365,9 +365,26 @@ under a specialist leaf bias and at the root:
 - The node becomes a `max_node`: every later backup through it passes up the
   best option's CURRENT Q (refined below visited options, cached elsewhere),
   so the max is recomputed, never locked in (contract points 2 and 3).
-- Library: the per-offer max sits under the build's sampled chance edge, whose
-  average over offers estimates `0.6*v1 + 0.3*v2 + 0.1*v3` without a separate
-  formula node; the analytic combination was not built.
+- Library (first version): the per-offer max sat under the build's sampled
+  chance edge, whose noisy running average only converged to the formula.
+  **Replaced 2026-10-04 by the exact formula:** the build
+  edge samples only its card reveal; each reveal gets ONE `LibraryOffer` node
+  whose choice holds the whole pool (built through the engine with any valid
+  draw, options then widened), expanded over every token, reporting
+  `sum_k w_k v_(k)`, `w_k = C(n-k, d-1)/C(n, d)` (0.6/0.3/0.1 for 3 of 5), from
+  current token values on every backup. Fan-out: reveals x 10 offers ->
+  reveals. Never G4-proven from its own (non-real) state; solved only when all
+  tokens are exact. Forced root expansion enumerates reveals only; an offer
+  node drops its forced network seed on first visit. Not representable (and
+  left to sampling): empty pool, or the Library on the last card of Age I/II.
+  With one offer node per reveal, G8.0 sharing has little left to share.
+  Inside an offer node, selection skips options whose value is already exact
+  (the first build kept re-visiting a proven Law token: 55% of sims hit exact
+  leaves while the 0.3/0.1-weighted tokens went unrefined). RICCP Library Q:
+  ~1k 50.9-52.0%, ~4k 51.4-51.8%, 16k 51.5% (true 51.4%; sampled draws gave
+  45-53% at 1k); University corrected 3/3; ~6.8 s per 4k sims there (dense in
+  Library/Mausoleum nodes). Self-play vs off: ~-2.5% sims/s (-1.2 / -3.8 /
+  -2.3% per pair; sampled-draw G4b was ~-4%).
 - Metrics: `option_expansions`, `option_rows`, `shared_afterstates` (self-play
   and `RustPuctSearch.tactics_metrics()`).
 - Tests: `test_exact_tactics.py` (G4b / G8.0 sections), passing.

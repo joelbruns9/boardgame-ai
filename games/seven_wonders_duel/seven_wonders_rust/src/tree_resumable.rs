@@ -67,6 +67,22 @@ impl Edge {
     }
 }
 
+/// How a node's value is reported upward (G4b).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Combine {
+    /// Ordinary MCTS: the running average of what came back.
+    Plain,
+    /// A decision among the options it holds (Mausoleum retrieval, a real
+    /// Library offer): the best option.
+    Max,
+    /// A Great Library node holding the WHOLE pool: the chooser will be
+    /// offered a random `offered`-subset, so the value is the exact
+    /// expectation of the best offered option -- `sum_k w_k * v_(k)` over the
+    /// options sorted for the chooser, `w_k = C(n-k, d-1) / C(n, d)`
+    /// (0.6 / 0.3 / 0.1 for 3 of 5).
+    LibraryOffer { offered: usize },
+}
+
 pub struct Node {
     pub state: GameState,
     pub actor: usize,
@@ -81,10 +97,10 @@ pub struct Node {
     /// the network, never averaged with network estimates. Only ever set on
     /// children (`make_child`) -- the root is the decision being made.
     pub proven: Option<(f64, Outlook)>,
-    /// G4b: an option-expanded pending node (Mausoleum retrieval). Every backup
-    /// through it passes up the MAX of its options' current Q in the chooser's
+    /// G4b: how an option-expanded pending node reports its value. Every backup
+    /// through it passes up its options' COMBINED current Q in the chooser's
     /// frame instead of the value that arrived from below.
-    pub max_node: bool,
+    pub combine: Combine,
     /// F4.5 forced-child cache. Force expansion seeds the child's value/visit
     /// exactly as before but retains priors for the first ordinary visit.
     cached_evaluation: Option<(f64, Vec<f64>, Option<Outlook>)>,
@@ -113,7 +129,7 @@ impl Node {
             value_sum_p0: 0.0,
             incomplete: 0,
             proven: None,
-            max_node: false,
+            combine: Combine::Plain,
             cached_evaluation: None,
         }
     }
@@ -156,6 +172,12 @@ pub struct Arena {
     /// offer that contains token `t` after reveal `r` shares ONE node for
     /// "took `t`". See `canonical_library_afterstate`.
     library_afterstates: HashMap<String, NodeId>,
+    /// G4b: build Great Library edges as one `LibraryOffer` node per reveal
+    /// instead of sampling the 3-of-5 draw. Set once per search, from the
+    /// exact-tactics switch and the leaf bias.
+    library_offers: bool,
+    /// G4b: Library offer nodes built in this search.
+    library_offer_nodes: usize,
 }
 
 impl Arena {
@@ -168,6 +190,8 @@ impl Arena {
             nodes: vec![root],
             root_id: 0,
             library_afterstates: HashMap::new(),
+            library_offers: false,
+            library_offer_nodes: 0,
         }
     }
 
@@ -212,13 +236,50 @@ impl Arena {
         best
     }
 
+    /// G4b: `(best edge, combined value_p0)` of a node under its `combine`
+    /// rule, from its edges' CURRENT Q. A `LibraryOffer` needs every option
+    /// seeded; otherwise there is nothing to combine yet.
+    fn combined_value(&self, node_id: NodeId) -> Option<(usize, f64)> {
+        let node = &self.nodes[node_id];
+        match node.combine {
+            Combine::Plain => None,
+            Combine::Max => self.best_option(node_id),
+            Combine::LibraryOffer { offered } => {
+                if node.edges.is_empty() || node.edges.iter().any(|e| e.visits == 0) {
+                    return None;
+                }
+                let sign = if node.actor == 0 { 1.0 } else { -1.0 };
+                let mut ranked: Vec<(usize, f64)> = (0..node.edges.len())
+                    .map(|i| (i, self.edge_q_p0(node_id, i)))
+                    .collect();
+                ranked.sort_by(|a, b| (sign * b.1).total_cmp(&(sign * a.1)));
+                let weights = offer_weights(ranked.len(), offered);
+                let value = ranked
+                    .iter()
+                    .zip(&weights)
+                    .map(|((_, q), w)| w * q)
+                    .sum();
+                Some((ranked[0].0, value))
+            }
+        }
+    }
+
     fn select(&self, node_id: NodeId, c_puct: f64) -> usize {
         let node = &self.nodes[node_id];
         let sign = if node.actor == 0 { 1.0 } else { -1.0 };
         let total = ((node.visits + node.incomplete).max(1) as f64).sqrt();
+        // G4b: in a Library offer node an option whose value is already exact
+        // has nothing left to learn, and the formula's uncertainty sits in the
+        // options that are not -- so visits go only to those. (A max node does
+        // not need this: an exact WINNING option solves it outright.)
+        let skip_exact = matches!(node.combine, Combine::LibraryOffer { .. })
+            && (0..node.edges.len()).any(|i| edge_exact(self, node_id, i).is_none());
         let mut best = 0;
         let mut best_score = f64::NEG_INFINITY;
         for (i, edge) in node.edges.iter().enumerate() {
+            if skip_exact && edge_exact(self, node_id, i).is_some() {
+                continue;
+            }
             let q = sign * self.edge_q_p0(node_id, i);
             let score = q + c_puct * edge.prior * total
                 / (1.0 + edge.visits as f64 + edge.incomplete as f64);
@@ -388,13 +449,19 @@ fn closed_child(arena: &mut Arena, node_id: NodeId, edge_idx: usize, rng: &mut R
         children[selected].1.samples += 1;
         return children[selected].1.node_id;
     }
-    let (outcomes, probability, key) = {
+    let library = library_reveal_specs(
+        arena,
+        &arena.nodes[node_id].state,
+        &arena.nodes[node_id].edges[edge_idx].specs,
+    );
+    let (mut outcomes, mut probability, mut key) = {
         let node = &arena.nodes[node_id];
         let edge = &node.edges[edge_idx];
-        if edge.specs.is_empty() {
+        let specs = library.as_deref().unwrap_or(&edge.specs);
+        if specs.is_empty() {
             (Vec::new(), Some(1.0), Vec::new())
         } else {
-            chance::sample_outcomes(&node.state, &edge.specs, rng)
+            chance::sample_outcomes(&node.state, specs, rng)
         }
     };
     if let Some(child_idx) = arena.nodes[node_id].edges[edge_idx]
@@ -407,6 +474,41 @@ fn closed_child(arena: &mut Arena, node_id: NodeId, edge_idx: usize, rng: &mut R
         return child.node_id;
     }
 
+    if library.is_some() {
+        let built = {
+            let node = &arena.nodes[node_id];
+            let edge = &node.edges[edge_idx];
+            make_library_child(&node.state, edge.action_index, &edge.specs, &outcomes)
+        };
+        if let Some(library_node) = built {
+            arena.library_offer_nodes += 1;
+            let child_id = arena.push(library_node);
+            arena.nodes[node_id].edges[edge_idx].children.push((
+                key,
+                Child {
+                    probability,
+                    node_id: child_id,
+                    samples: 1,
+                },
+            ));
+            return child_id;
+        }
+        // Not representable after all (should not happen once the public
+        // checks pass): take the ordinary sampled draw, keyed by its full
+        // outcome so it cannot collide with a reveal-keyed offer node.
+        let node = &arena.nodes[node_id];
+        (outcomes, probability, key) =
+            chance::sample_outcomes(&node.state, &node.edges[edge_idx].specs, rng);
+        if let Some(child_idx) = arena.nodes[node_id].edges[edge_idx]
+            .children
+            .iter()
+            .position(|(candidate, _)| *candidate == key)
+        {
+            let child = &mut arena.nodes[node_id].edges[edge_idx].children[child_idx].1;
+            child.samples += 1;
+            return child.node_id;
+        }
+    }
     let (mut child_state, action_index) = {
         let node = &arena.nodes[node_id];
         (node.state.clone(), node.edges[edge_idx].action_index)
@@ -469,7 +571,14 @@ fn select_leaf(
             );
         }
         if node.edges.is_empty() {
-            let cached = arena.nodes[node_id].cached_evaluation.take();
+            let mut cached = arena.nodes[node_id].cached_evaluation.take();
+            // G4b: a Library offer node seeded by forced root expansion
+            // drops its cached row -- a network read of a five-option choice,
+            // which is not a real position -- so this visit takes the
+            // all-options expansion instead. The seed stays in its stats.
+            if matches!(arena.nodes[node_id].combine, Combine::LibraryOffer { .. }) {
+                cached = None;
+            }
             return (
                 PendingSimulation {
                     path,
@@ -545,15 +654,109 @@ fn backup(arena: &mut Arena, pending: PendingSimulation, value_p0: f64) {
         // G4b: an option-expanded node reports its best option's CURRENT Q --
         // refined where search went below it, the cached network value
         // elsewhere -- so the max is recomputed rather than locked in.
-        if arena.nodes[step.node_id].max_node {
-            if let Some((_, best)) = arena.best_option(step.node_id) {
-                value_p0 = best;
-            }
+        if let Some((_, combined)) = arena.combined_value(step.node_id) {
+            value_p0 = combined;
         }
         let node = &mut arena.nodes[step.node_id];
         node.visits += 1;
         node.value_sum_p0 += value_p0;
     }
+}
+
+fn binomial(n: usize, k: usize) -> f64 {
+    if k > n {
+        return 0.0;
+    }
+    (0..k).fold(1.0, |acc, i| acc * (n - i) as f64 / (i + 1) as f64)
+}
+
+/// G4b: probability that the k-th best of `n` options (k = 1..n) is the best
+/// one in a uniformly random offer of `offered` of them: `C(n-k, d-1) / C(n,
+/// d)`. Sums to 1; 0.6 / 0.3 / 0.1 / 0 / 0 for 3 of 5; all mass on the best
+/// when everything is offered.
+fn offer_weights(n: usize, offered: usize) -> Vec<f64> {
+    let d = offered.min(n).max(1);
+    let total = binomial(n, d);
+    (1..=n)
+        .map(|k| binomial(n - k, d - 1) / total)
+        .collect()
+}
+
+/// G4b: the Great Library edge's child for one reveal outcome: the post-build
+/// position whose pending choice holds the WHOLE drawable pool, marked
+/// `LibraryOffer`, or None when the edge is not a Library build this can
+/// represent (the build exhausts the Age, or an option would draw chance).
+///
+/// Built through the engine with ANY valid draw -- the drawn subset only
+/// decides which options are offered, and the options are then widened to the
+/// pool. Never given a G4 proof from its own state: a five-option Library
+/// choice is not a real position, so its value comes only from the real token
+/// afterstates below it.
+fn make_library_child(
+    state: &GameState,
+    action_index: usize,
+    specs: &[ChanceSpec],
+    reveal_outcomes: &[Vec<usize>],
+) -> Option<Node> {
+    let pool = crate::pool::unseen_pool(state).offboard_progress;
+    let offered = pool.len().min(3);
+    if offered == 0 {
+        return None;
+    }
+    let mut reveals = reveal_outcomes.iter();
+    let mut outcomes = Vec::with_capacity(specs.len());
+    for spec in specs {
+        match spec.kind {
+            ChanceKind::GreatLibraryDraw => outcomes.push(pool[..offered].to_vec()),
+            ChanceKind::AgeDeal => return None,
+            _ => outcomes.push(reveals.next()?.clone()),
+        }
+    }
+    let action = decode_action(state, action_index);
+    let mut child = state.clone();
+    child.apply_with_chance(&action, &outcomes).ok()?;
+    let pending = child.pending_choice.as_mut()?;
+    if pending.kind != PendingChoiceKind::ChooseUnusedProgress {
+        return None;
+    }
+    let mut options = pool.clone();
+    options.sort_unstable();
+    pending.options = options;
+    for index in legal_action_indices(&child) {
+        let option = decode_action(&child, index);
+        if !chance::chance_signature(&child, &option).is_empty() {
+            return None;
+        }
+    }
+    let mut node = Node::make(child);
+    node.combine = Combine::LibraryOffer { offered };
+    Some(node)
+}
+
+/// The reveal specs of a Great Library edge with the draw split off, when the
+/// search represents that edge by `LibraryOffer` nodes. Decided from public
+/// facts, so every reveal of one edge gets the same representation: a
+/// non-empty pool, and not the last card of Age I/II (resolving the token
+/// would then deal the next Age, a chance event inside the choice).
+fn library_reveal_specs(arena: &Arena, state: &GameState, specs: &[ChanceSpec]) -> Option<Vec<ChanceSpec>> {
+    if !arena.library_offers
+        || !specs.iter().any(|s| s.kind == ChanceKind::GreatLibraryDraw)
+        || specs.iter().any(|s| s.kind == ChanceKind::AgeDeal)
+        || crate::pool::unseen_pool(state).offboard_progress.is_empty()
+    {
+        return None;
+    }
+    let present = state.tableau.slots.iter().filter(|slot| slot.present).count();
+    if state.age < 3 && present <= 1 {
+        return None;
+    }
+    Some(
+        specs
+            .iter()
+            .filter(|s| s.kind != ChanceKind::GreatLibraryDraw)
+            .cloned()
+            .collect(),
+    )
 }
 
 /// G8.0: the position after taking a Great Library token, with the part that
@@ -616,6 +819,25 @@ fn solve_node(arena: &Arena, node_id: NodeId) -> Option<(f64, Outlook)> {
     let node = &arena.nodes[node_id];
     if node.edges.is_empty() || node.edges.len() != node.legal.len() {
         return None;
+    }
+    if let Combine::LibraryOffer { offered } = node.combine {
+        // The chooser gets a random subset, so one winning option proves
+        // nothing: every option must be exact, then the offer formula holds.
+        let sign = if node.actor == 0 { 1.0 } else { -1.0 };
+        let mut exact: Vec<(f64, Outlook)> = (0..node.edges.len())
+            .map(|i| edge_exact(arena, node_id, i))
+            .collect::<Option<_>>()?;
+        exact.sort_by(|a, b| (sign * b.0).total_cmp(&(sign * a.0)));
+        let weights = offer_weights(exact.len(), offered);
+        let mut value = 0.0;
+        let mut outlook = [0.0; 7];
+        for ((v, o), w) in exact.iter().zip(&weights) {
+            value += w * v;
+            for k in 0..7 {
+                outlook[k] += w * o[k];
+            }
+        }
+        return Some((value, outlook));
     }
     let sign = if node.actor == 0 { 1.0 } else { -1.0 };
     let mut best: Option<(f64, Outlook)> = None;
@@ -768,7 +990,7 @@ fn materialize_forced_root(
                 "forced expansion re-entered an already-closed edge; a fixed                  support cannot be extended or replaced in place",
             ));
         }
-        let (state, action_index, specs) = {
+        let (state, action_index, full_specs) = {
             let root = &arena.nodes[root_id];
             (
                 root.state.clone(),
@@ -776,12 +998,20 @@ fn materialize_forced_root(
                 root.edges[edge_idx].specs.clone(),
             )
         };
-        let bound = forced_chain_bound(&specs)?;
+        // G4b: a Great Library edge enumerates its REVEALS only; each reveal
+        // gets one `LibraryOffer` node holding the whole pool.
+        let library = library_reveal_specs(arena, &state, &full_specs);
+        let specs = library.clone().unwrap_or_else(|| full_specs.clone());
+        let bound = forced_chain_bound(&full_specs)?;
         let signature: Vec<_> = specs
             .iter()
             .map(|spec| (spec.kind as u8, spec.context.clone()))
             .collect();
         let (capped, enumerated) = enumeration_cache.entry(signature).or_insert_with(|| {
+            if specs.is_empty() {
+                // A reveal-free Library build: one offer node, certain.
+                return (false, vec![(Vec::new(), 1.0, Vec::new())]);
+            }
             match chance::balanced_double_reveal_chains(
                 &state,
                 &specs,
@@ -799,7 +1029,7 @@ fn materialize_forced_root(
                 enumerated.len()
             )));
         }
-        let metric_kind = if specs
+        let metric_kind = if full_specs
             .iter()
             .any(|spec| spec.kind == ChanceKind::GreatLibraryDraw)
         {
@@ -844,11 +1074,26 @@ fn materialize_forced_root(
             {
                 continue;
             }
-            let mut child_state = state.clone();
-            child_state
-                .apply_with_chance(&action, &outcomes)
-                .expect("enumerated outcome must be valid");
-            let child_id = arena.push(Node::make_child(child_state));
+            let child_node = match library {
+                Some(_) => make_library_child(&state, action_index, &full_specs, &outcomes)
+                    .ok_or_else(|| {
+                        PyRuntimeError::new_err(
+                            "a Great Library edge passed the public checks but could not \
+                             be built as an offer node",
+                        )
+                    })?,
+                None => {
+                    let mut child_state = state.clone();
+                    child_state
+                        .apply_with_chance(&action, &outcomes)
+                        .expect("enumerated outcome must be valid");
+                    Node::make_child(child_state)
+                }
+            };
+            if library.is_some() {
+                arena.library_offer_nodes += 1;
+            }
+            let child_id = arena.push(child_node);
             forced_nodes.push(child_id);
             arena.nodes[root_id].edges[edge_idx].children.push((
                 key,
@@ -1652,7 +1897,9 @@ impl SearchSession {
             ));
             edge.visits = 1;
             edge.value_sum_p0 = value;
-            node.max_node = true;
+            if node.combine == Combine::Plain {
+                node.combine = Combine::Max;
+            }
         }
         Ok(())
     }
@@ -1664,7 +1911,7 @@ impl SearchSession {
         leaf_id: NodeId,
         rows: &HashMap<NodeId, (f64, Vec<f64>, Option<Outlook>)>,
     ) -> Option<(f64, Option<Outlook>)> {
-        let (edge_idx, value) = self.arena.best_option(leaf_id)?;
+        let (edge_idx, value) = self.arena.combined_value(leaf_id)?;
         let (_, child) = self.arena.nodes[leaf_id].edges[edge_idx].children.first()?;
         let outlook = match rows.get(&child.node_id) {
             Some((_, _, outlook)) => *outlook,
@@ -1954,6 +2201,12 @@ impl SearchSession {
         &self.metrics
     }
 
+    /// G4b: Library offer nodes built so far (they live in the arena, which
+    /// owns their construction).
+    pub fn library_offer_nodes(&self) -> usize {
+        self.arena.library_offer_nodes
+    }
+
     pub fn sims_done(&self) -> usize {
         self.sims_completed
     }
@@ -2224,7 +2477,7 @@ impl SearchSession {
                 // Decided when the leaf was selected, not re-derived here: the
                 // two must be the same fact whichever path settles it.
                 Some(value) => (value, pending.immediate_outlook),
-                None if self.arena.nodes[pending.leaf_id].max_node => self
+                None if self.arena.nodes[pending.leaf_id].combine != Combine::Plain => self
                     .option_leaf_value(pending.leaf_id, &option_rows)
                     .expect("an option-expanded leaf has seeded options"),
                 None => {
@@ -2447,6 +2700,7 @@ fn begin_search_from_root_inner(
         ));
     }
     let mut arena = Arena::new(root);
+    arena.library_offers = crate::tactics::enabled() && !cfg.leaf_bias.is_active();
     let root_id = arena.root_id;
     let root_outlook = root_evaluation.outlook_p0;
     let (raw_root_value_p0, root_priors) = (root_evaluation.value_p0, root_evaluation.priors);
@@ -2559,6 +2813,7 @@ pub fn search_closed_batched<E: Eval>(
         ));
     }
     let mut arena = Arena::new(root);
+    arena.library_offers = crate::tactics::enabled() && !cfg.leaf_bias.is_active();
     let root_id = arena.root_id;
     let root_leaf = eval.evaluate(&arena.nodes[root_id].state)?;
     let root_outlook = root_leaf.outlook_p0;
@@ -2662,6 +2917,31 @@ pub fn digest(arena: &Arena, out: &mut Vec<f64>) {
         }
     }
     visit(arena, arena.root_id, out);
+}
+
+#[cfg(test)]
+mod offer_weight_tests {
+    use super::offer_weights;
+
+    #[test]
+    fn three_of_five_is_point_six_point_three_point_one() {
+        let w = offer_weights(5, 3);
+        let expected = [0.6, 0.3, 0.1, 0.0, 0.0];
+        for (got, want) in w.iter().zip(expected) {
+            assert!((got - want).abs() < 1e-12, "{w:?}");
+        }
+    }
+
+    #[test]
+    fn weights_sum_to_one_and_full_offers_take_the_best() {
+        for n in 1..=8 {
+            for d in 1..=n {
+                let w = offer_weights(n, d);
+                assert!((w.iter().sum::<f64>() - 1.0).abs() < 1e-12, "{n} {d}");
+            }
+            assert_eq!(offer_weights(n, n)[0], 1.0);
+        }
+    }
 }
 
 #[cfg(test)]

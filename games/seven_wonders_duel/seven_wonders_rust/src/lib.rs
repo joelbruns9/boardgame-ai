@@ -550,6 +550,7 @@ impl RustPuctSearch {
             ("option_expansions", m.option_expansions),
             ("option_rows", m.option_rows),
             ("shared_afterstates", m.shared_afterstates),
+            ("library_offer_nodes", self.session.library_offer_nodes()),
             ("requested", m.requested_nn_leaves),
             ("terminal", m.terminal_leaves),
         ])

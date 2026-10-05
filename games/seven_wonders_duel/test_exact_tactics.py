@@ -350,7 +350,11 @@ def test_the_unused_token_pool_is_invisible_to_the_network(positions):
     assert checked >= 10
 
 
-def test_library_afterstates_are_shared_across_offers():
+def test_a_library_build_is_one_offer_node_over_the_whole_pool():
+    """G4b Library: the 3-of-5 draw is not sampled. A reveal-free build has ONE
+    child, an offer node holding all five tokens, expanded over every token and
+    valued by the exact best-of-offer expectation (0.6 / 0.3 / 0.1)."""
+
     found = _library_root(pe.fresh_bot_records(120, seed=1357))
     if found is None:
         pytest.skip("no reveal-free Great Library build in the fixture")
@@ -366,8 +370,9 @@ def test_library_afterstates_are_shared_across_offers():
             swr.set_exact_tactics(False)
 
     on, off = run(True), run(False)
-    assert off["shared_afterstates"] == 0
-    assert on["option_expansions"] >= 2
-    # Two offers after the same reveal overlap in at least one token, so a
-    # second expansion must reuse an afterstate rather than evaluate it again.
-    assert on["shared_afterstates"] >= 1
+    assert off["library_offer_nodes"] == 0
+    # Reveal-free: the root's draw collapses to ONE offer node where the
+    # sampled representation grows up to ten offer children. (Deeper lines
+    # where the Library is built later add their own, hence >=.)
+    assert on["library_offer_nodes"] >= 1
+    assert on["option_expansions"] >= 1
