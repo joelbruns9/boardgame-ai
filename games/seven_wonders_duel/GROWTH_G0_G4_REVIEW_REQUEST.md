@@ -14,7 +14,7 @@ is the reviewer's entry point; the plan is the long record.
 | `62d0a68`, `4979084`, `c54c4e3`, `d90270d` | **G4** exact tactics in search: proven wins, proven losses, extra-turn and civilian wins, proof propagation (MCTS-Solver), default on | `tactics.py` (Python reference), `seven_wonders_rust/src/tactics.rs`, `tree_resumable.rs`, `phase_d.py`, `advisor_adapter.py`, `web_app.py`, `conftest.py` |
 | `8bb906c`, `5807469` | **G4b + G8.0** option expansion of Mausoleum / Great Library choices; Library valued by the exact best-of-offer formula | `tree_resumable.rs` (`Combine`, `LibraryOffer`, `make_library_child`, `offer_weights`, option children) |
 | `798dfdb` | **G0** tactical suite | `tactical_suite.py`, `tactics.py` (`classify_actions`, `losing_mass`), `tactics.rs` |
-| `adc40bf` | **G3** priority sampling (off by default) + offline A/B script | `priority_sampling.py`, `train.py` (`sample_weights`), `phase_d.py`, `g3_offline_ab.py` |
+| `adc40bf` + fix | **G3** priority sampling (off by default) + offline A/B script | `priority_sampling.py`, `train.py` (`sample_weights`), `phase_d.py`, `g3_offline_ab.py` |
 
 ## Already gated -- please do not re-verify by hand
 
@@ -99,8 +99,11 @@ G0 smoke (iters 99-100, 60 cases/class): must_block/deep blunders 23.5% raw,
 
 ## Known limitations (not asking for these to be found)
 
-- **G3's tests (`test_priority_sampling.py`) were written but not yet run**;
-  G3 code has not been executed at all.
+- G3 has unit tests only (`test_priority_sampling.py`, 9 passing) -- no
+  training run yet. Running them found one bug, fixed in the commit after
+  `adc40bf`: proof rows were raised to the cap BEFORE the mean was taken, so
+  they sat at ~1.8x instead of 2x; priorities are now mean-normalised first and
+  `mixture` caps without re-normalising.
 - No game-level strength measurement of any of this; G4 default-on is an
   owner decision on the RICCP evidence plus throughput.
 - G0 lacks the plan's unplayed-alternatives class, sims-to-refute, burial

@@ -106,29 +106,34 @@ def _normalised(values: np.ndarray) -> np.ndarray:
 
 
 def priorities(signals: Signals, cap: float = CAP_DEFAULT) -> np.ndarray:
-    """Per-row priority, mean-normalised, before the cap: the average of the
-    normalised signals a row carries (1.0 when it carries none), with proof
-    rows raised to the cap."""
+    """Per-row priority RELATIVE TO THE MEAN: the average of the normalised
+    signals a row carries (1.0 when it carries none), rescaled to mean 1, then
+    proof rows raised to `cap`. Normalised before the raise, so the raise does
+    not move the mean it is measured against -- doing it the other way round
+    left proof rows at ~1.8x instead of the 2x cap."""
 
     stacked = np.vstack([_normalised(signals.surprise), _normalised(signals.value_correction)])
     counts = (~np.isnan(stacked)).sum(axis=0)
     sums = np.nansum(stacked, axis=0)
     prio = np.where(counts > 0, sums / np.maximum(counts, 1), 1.0)
-    prio = np.where(signals.proof, np.maximum(prio, cap * prio.mean()), prio)
-    return prio
+    mean = prio.mean()
+    prio = prio / mean if mean > 0 else np.ones_like(prio)
+    return np.where(signals.proof, np.maximum(prio, cap), prio)
 
 
 def mixture(prio: np.ndarray, *, uniform_share: float = UNIFORM_SHARE_DEFAULT,
             cap: float = CAP_DEFAULT) -> np.ndarray:
     """Sampling probabilities: `uniform_share` uniform plus the rest in
-    proportion to priority capped at `cap` x the mean priority. Sums to 1."""
+    proportion to `prio` capped at `cap`. `prio` is relative to the mean, as
+    `priorities` returns it, so the cap is "`cap` x the mean priority". Sums
+    to 1."""
 
     if not 0.0 <= uniform_share <= 1.0:
         raise ValueError("uniform_share must be in [0, 1]")
     if cap < 1.0:
         raise ValueError("cap must be >= 1 (it is relative to the mean)")
     n = len(prio)
-    capped = np.minimum(prio / prio.mean(), cap)
+    capped = np.minimum(prio, cap)
     return uniform_share / n + (1.0 - uniform_share) * capped / capped.sum()
 
 

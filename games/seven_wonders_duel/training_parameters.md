@@ -1096,7 +1096,7 @@ certain-win rows. It is the A/B arm (G5). Training logs
 `sampled_certain_win_rows` per window. Validation is unchanged by the contract
 (proofs are off there and a certain row's exact target equals its realised one).
 
-### `--priority-sampling`, `--priority-uniform-share`, `--priority-cap`
+### `--priority-sampling`, `--no-priority-sampling`, `--priority-uniform-share`, `--priority-cap`
 
 **Default:** off; share `0.3`, cap `2.0`.
 

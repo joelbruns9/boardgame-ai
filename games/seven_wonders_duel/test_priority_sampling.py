@@ -36,7 +36,7 @@ def test_the_mixture_is_a_distribution_with_a_uniform_floor_and_a_cap():
         # Every row keeps at least its uniform share...
         assert p.min() >= share / n - 1e-15
         # ...and no row's priority part exceeds `cap` times the average one.
-        capped = np.minimum(prio / prio.mean(), cap)
+        capped = np.minimum(prio, cap)
         assert p.max() <= share / n + (1 - share) * cap / capped.sum() + 1e-12
     uniform = ps.mixture(ps.priorities(signals), uniform_share=1.0)
     assert np.allclose(uniform, 1 / len(uniform))
@@ -96,7 +96,8 @@ def test_row_signals_run_on_a_model_and_leave_its_mode_alone(examples):
     assert (signals.surprise[with_policy] >= 0).all()
     with_root = np.array([e.root_value is not None for e in examples])
     assert np.isnan(signals.value_correction[~with_root]).all()
-    assert signals.proof.sum() == sum(1 for i in range(n) if i % 40 == 0)
+    assert (signals.proof == np.array([ps.is_proof_row(e) for e in examples])).all()
+    assert signals.proof.sum() >= sum(1 for i in range(n) if i % 40 == 0)
 
 
 def test_the_trainer_draws_by_the_weights(examples):

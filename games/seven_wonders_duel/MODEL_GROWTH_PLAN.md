@@ -274,7 +274,7 @@ weight -- priority changes frequency only. Priority signals: policy surprise,
 search-vs-network value correction, proof membership. A/B against G1+G2 alone;
 success = G0 decisive classes improve with ordinary-state calibration unchanged.
 
-**BUILT 2026-10-04, UNTESTED** (`priority_sampling.py`, `--priority-sampling`
+**BUILT 2026-10-04** (unit-tested, no training run yet; `priority_sampling.py`, `--priority-sampling`
 off by default, `g3_offline_ab.py`, `test_priority_sampling.py`): priority =
 mean of mean-normalised policy surprise (KL target || model policy) and value
 correction (|root - model value|) from one no-gradient pass of the model about
