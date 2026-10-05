@@ -205,6 +205,10 @@ class Example:
     #: the outcome AND the victory type (`joint7_class`) are exact, not a
     #: sample. The loss replaces every blended target with them.
     certain_win: bool = False
+    #: G2b: what `apply_tactic_labels` found at this position -- 0 nothing
+    #: proven, 1 a forced win, -1 every move loses, 2 some moves lose by force
+    #: (must_block). Provenance for counting; the targets already carry it.
+    tactic: int = 0
 
     def __post_init__(self) -> None:
         """Make the arrays read-only as well as the fields.
@@ -727,6 +731,65 @@ def certain_win_moves(record, chance_counts) -> set[int]:
     return certain
 
 
+#: G2b tactic codes (`Example.tactic`).
+TACTIC_NONE, TACTIC_WIN, TACTIC_LOSS, TACTIC_BLOCK = 0, 1, -1, 2
+
+
+def apply_tactic_labels(example: Example, labels) -> Example:
+    """G2b (`MODEL_GROWTH_PLAN.md`): fold exact per-action tactics into one
+    example's targets. `labels` is `classify_actions` for the position, aligned
+    to `example.legal`: +1 the move forces a win this turn, -1 it loses by
+    force, 0 unknown.
+
+    * forced win available -> exact value +1 (an exact proof: replaces the
+      blend in every value head, pinned by G3), and the move target goes to
+      the winning moves only (renormalised; uniform over them if search put
+      no mass there);
+    * every move loses -> exact value -1, move target untouched;
+    * some moves lose by force -> those moves' target mass removed and the
+      rest renormalised (uniform over the non-losing moves if none is left).
+
+    An existing chance-free solver proof is kept (it is exact too); an
+    expectimax solver value is replaced by the exact tactic result. The
+    victory type is untouched (owner's no-masking decision, G2).
+    """
+
+    labels = np.asarray(labels, dtype=np.int8)
+    if labels.shape != example.legal.shape:
+        raise ValueError(
+            f"tactic labels for {labels.shape[0]} actions, example has {example.legal.shape[0]}"
+        )
+    wins = labels == 1
+    losses = labels == -1
+    if not wins.any() and not losses.any():
+        return example
+    fields: dict = {}
+    keep = None
+    if wins.any():
+        fields["tactic"] = TACTIC_WIN
+        value = 1.0
+        keep = wins
+    elif losses.all():
+        fields["tactic"] = TACTIC_LOSS
+        value = -1.0
+    else:
+        fields["tactic"] = TACTIC_BLOCK
+        value = None
+        keep = ~losses
+    if value is not None and not (example.solver_value is not None and example.solver_exact):
+        fields["solver_value"] = value
+        fields["solver_exact"] = True
+    if keep is not None and example.has_policy:
+        target = example.policy_target.astype(np.float32) * keep
+        total = float(target.sum())
+        if total > 0.0:
+            target = target / total
+        else:
+            target = keep.astype(np.float32) / float(keep.sum())
+        fields["policy_target"] = target.astype(np.float32)
+    return dataclasses.replace(example, **fields)
+
+
 def emits_example(move, *, record_fast_moves: bool, retained: set[int]) -> bool:
     """Whether a recorded move becomes a training row (both derive backends)."""
 
@@ -946,6 +1009,7 @@ def examples_from_record(
     on_derived: Callable[[GameDerivationStats], None] | None = None,
     derived_for: str = GENERAL_ROUTE,
     retain_proofs_per_game: int = 0,
+    tactic_labels: bool = False,
 ) -> list[Example]:
     """Replay one game (through the VERIFIED buffer.replay path — mask hashes,
     actors, chance log, trajectory and final digests all checked) and emit an
@@ -978,6 +1042,8 @@ def examples_from_record(
     archive_seats = archive_policy_seats(record.agents)
 
     legal_by_move: dict[int, np.ndarray] = {}
+    #: G2b: `classify_actions` per emitted row, by move index.
+    tactics_by_move: dict[int, list[int]] = {}
     retained = (
         set() if record_fast_moves
         else retained_proof_moves(record, retain_proofs_per_game)
@@ -996,6 +1062,12 @@ def examples_from_record(
         if not emits_example(move, record_fast_moves=record_fast_moves, retained=retained):
             return
         kept_proof = move.i in retained
+        if tactic_labels:
+            # Lazily: tactics -> search -> inference -> dataset is a cycle at
+            # module scope.
+            from .tactics import classify_actions
+
+            tactics_by_move[move.i] = classify_actions(game)
         actor = (
             game.pending_choice.player
             if game.pending_choice is not None
@@ -1146,6 +1218,10 @@ def examples_from_record(
                 certain_win=move_index in certain,
             )
         )
+    if tactic_labels:
+        examples = [
+            apply_tactic_labels(e, tactics_by_move[e.move_index]) for e in examples
+        ]
     return _with_short_term(examples, record)
 
 
@@ -1191,6 +1267,7 @@ def _examples_from_rust_payload(
     payload: dict,
     derived_for: str = GENERAL_ROUTE,
     retained: set[int] | frozenset[int] = frozenset(),
+    tactic_labels: bool = False,
 ) -> tuple[list[Example], GameDerivationStats]:
     """Turn one packed Rust replay into the exact public ``Example`` objects."""
 
@@ -1335,6 +1412,21 @@ def _examples_from_rust_payload(
             )
         )
 
+    if tactic_labels:
+        packed = np.frombuffer(payload.get("tactic_labels", b""), dtype=np.int8)
+        cursor = 0
+        labelled = []
+        for example in examples:
+            width = len(example.legal)
+            labels = packed[cursor:cursor + width]
+            if len(labels) != width:
+                raise ReplayMismatchError("Rust replay sent too few tactic labels")
+            cursor += width
+            labelled.append(apply_tactic_labels(example, labels))
+        if cursor != len(packed):
+            raise ReplayMismatchError("Rust replay sent too many tactic labels")
+        examples = labelled
+
     stats = GameDerivationStats(
         ending_age=int(stats_payload["ending_age"]),
         max_absolute_track=int(stats_payload["max_absolute_track"]),
@@ -1387,6 +1479,7 @@ def derive_records_rust(
     batch_games: int = 32,
     derived_for: str = GENERAL_ROUTE,
     retain_proofs_per_game: int = 0,
+    tactic_labels: bool = False,
 ) -> list[tuple[list[Example], GameDerivationStats]]:
     """Rust-default replay/encode path, aligned one result per input game.
 
@@ -1474,13 +1567,14 @@ def derive_records_rust(
                 chance_logs,
                 expected_results,
                 expected_digests,
+                tactic_labels=tactic_labels,
             )
         except ValueError as error:
             raise ReplayMismatchError(str(error)) from error
         if len(payloads) != len(batch):
             raise ReplayMismatchError("Rust derivation returned the wrong game count")
         output.extend(
-            _examples_from_rust_payload(record, payload, derived_for, kept)
+            _examples_from_rust_payload(record, payload, derived_for, kept, tactic_labels)
             for record, payload, kept in zip(batch, payloads, retained_by_game)
         )
     return output

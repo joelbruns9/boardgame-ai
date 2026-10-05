@@ -1096,6 +1096,20 @@ certain-win rows. It is the A/B arm (G5). Training logs
 `sampled_certain_win_rows` per window. Validation is unchanged by the contract
 (proofs are off there and a certain row's exact target equals its realised one).
 
+### `--tactic-labels`, `--no-tactic-labels`
+
+**Default:** off (until the offline A/B decides).
+
+G2b (`MODEL_GROWTH_PLAN.md`, `dataset.apply_tactic_labels`). At derivation,
+every row's legal actions are labelled with the exact one-move tactics
+(`tactics.classify_actions`, computed in Rust during replay): a forced win
+available sets an exact value +1 and limits the move target to the winning
+moves; every move losing sets an exact value -1; some moves losing by force
+strips them from the move target (renormalised). The exact values count as
+proof rows for `--priority-sampling`. One move ahead only: a move after which
+the opponent has a REPLY that leaves the mover lost is not labelled. Part of
+the example-cache key, so switching it re-derives.
+
 ### `--priority-sampling`, `--no-priority-sampling`, `--priority-uniform-share`, `--priority-cap`
 
 **Default:** off; share `0.3`, cap `2.0`.

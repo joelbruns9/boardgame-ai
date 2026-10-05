@@ -110,6 +110,22 @@ default):
 
 Steps 1-4 are laptop work and can overlap; 5+ need a box.
 
+**Revised 2026-10-05** after the first G3 offline A/B (see G3): step 4 ran on
+buffers corrected only by solver proofs and certain wins, so it could only move
+the endgame. The order is now:
+
+1. **G2b tactical relabelling** + a three-arm offline A/B (uniform without G2b
+   [done], G2b uniform, G2b + G3 priority) on the sealed G0 split. [steps 2 + 4]
+2. G4 / G4b / G8.0 search work -- DONE. [step 3]
+3. **G11 measurement** -- reanalyse cheap moves at full budget to size the
+   contamination BEYOND one move ahead, which G2b cannot see. [step 1]
+4. **Short online confirmation** on a box: self-play with G4 on (tactics-aware
+   labels natively) + G2b + G3. [step 5]
+5. **G12 restart archive / G8.2 targeted reanalysis** -- more deep and
+   predecessor-class positions. [step 6]
+
+Original order, kept for reference:
+
 1. **E0 measurement contract** + G0/G0b instruments + G11 measurement.
 2. **G1/G2 retention and target repair** -> re-derived buffer artifacts.
 3. **G4 exact tactics and G4b pending-choice expansion** with frozen weights,
@@ -274,6 +290,45 @@ place; tests in `test_g2_value_contract.py`.
 - Validation numbers are unchanged by the contract (proofs off there; a certain
   row's exact target equals its realised one).
 
+## G2b -- Tactical relabelling (owner decision 2026-10-05)
+
+G4's proof service applied to TRAINING targets, the "reusable" half of its
+title. At derivation, every buffered position gets `classify_actions` (+1 the
+move forces a win this turn, -1 it loses by force, 0 unknown) and its targets
+become a third proof type in the G2 contract:
+
+- **forced win available** -> exact value +1 (an exact proof row: replaces the
+  blend, pinned by G3); move target restricted to the winning moves;
+- **every move loses** -> exact value -1;
+- **some moves lose by force (must_block)** -> those moves get zero move
+  target, the rest renormalised (uniform over the non-losing moves if search
+  put all its mass on losing ones);
+- victory type untouched (no-masking decision, G2).
+
+Why: the G3 A/B trained on run07 labels from a search WITHOUT G4, so a missed
+immediate win or a walked-into immediate loss kept its wrong target; only the
+solver's endgame proofs and certain wins were exact, and G3 could only amplify
+those (near-end must_block blunders halved, nothing deeper moved). G2b supplies
+the exact answer at every position the games passed through.
+
+Scope limits: one move ahead only -- a move after which the opponent has a
+REPLY that leaves the mover lost (the predecessor class) is not labelled;
+reveal traps' partial losing mass is not used in v1. A partial fix for F4
+(cheap-move label contamination); deeper misses stay with G11. Once self-play
+runs with G4 on, new labels are tactics-aware anyway: G2b matters most for the
+run07 buffers and for cheap moves whose searches are too short for the check
+to fire everywhere it should.
+
+**BUILT 2026-10-05** (`--tactic-labels`, off until the A/B; `dataset.apply_tactic_labels`,
+Rust `derive_records(tactic_labels=True)`, `test_tactic_labels.py`; part of the
+example-cache key). Measured on run07 iter 100 (1,000 games, G1 cap 4): 6.4% of
+18,491 rows labelled -- 396 forced wins, 345 forced losses, 438 must_block.
+New information: must_block move targets had >5% mass on a proven-losing move
+in 107 of 255 policy rows (mean 16% moved); forced-win targets moved in 57 of
+231 (11%); 55 new exact values and 37 corrected (expectimax -> exact); every
+forced win in these games was won and every forced loss lost. Derivation 1.9 ->
+2.5 s per buffer.
+
 ## G3 -- Controlled decisive-pattern sampling
 
 Recipe to start from (Braun 4.2.4, KataGo policy-surprise weighting): 70% of
@@ -292,6 +347,19 @@ counts `sampled_proof_rows`. Phase D recomputes per training call and stores
 the report on the training row. Offline A/B: `g3_offline_ab.py --arm
 uniform|priority` warm-starts candidate_0060 on a re-derived window with run07
 loss settings; judge with `tactical_suite.py evaluate`.
+
+**First offline A/B (2026-10-05)**: candidate_0060, iterations 91-100 (1,987
+sealed games withheld), 2,000 steps per arm; proof rows drawn 1.53x (384k vs
+252k presentations), max row 1.7x, effective sample 81%. Sealed G0, 300 cases
+per class, PAIRED (`tactical_suite.py compare`, game-clustered bootstrap):
+must_block near the end halved at every budget (31.5% -> 16.7-18.5%, 8-9 fixed
+vs 0-1 broken, p 0.008-0.039); must_block overall at 64 sims 14.0 -> 10.3%
+(p 0.007); deep must_block, reveal traps, predecessor, deep own_win: no change;
+quiet value error slightly worse (+0.01-0.03, CI excludes 0); ordinary
+calibration unchanged. Reading: G3 adds no information, only frequency -- it
+amplified the exact labels that existed (endgame proofs, certain wins), which
+are near the end of the game. Hence G2b. G3 stays OFF by default; re-test it
+with G2b.
 
 ## G4 -- Exact tactics in search (reusable proof service)
 

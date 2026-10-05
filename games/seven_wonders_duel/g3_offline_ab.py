@@ -74,7 +74,8 @@ def _iterations(text: str) -> list[int]:
 
 
 def derive_window(
-    buffers_dir: Path, iterations: list[int], retain: int, log=print
+    buffers_dir: Path, iterations: list[int], retain: int, log=print,
+    *, tactic_labels: bool = False,
 ) -> tuple[list, int]:
     """`(examples, reserved_games)`: the window's rows with every G0-sealed
     game left out before it is derived."""
@@ -85,7 +86,9 @@ def derive_window(
         records = read_records(buffers_dir / f"iter_{iteration:04d}.jsonl")
         kept = [r for r in records if not sealed(r.iteration, r.seed)]
         reserved += len(records) - len(kept)
-        for rows, _stats in derive_records_rust(kept, retain_proofs_per_game=retain):
+        for rows, _stats in derive_records_rust(
+            kept, retain_proofs_per_game=retain, tactic_labels=tactic_labels
+        ):
             examples.extend(rows)
         log(f"derived iteration {iteration}: {len(examples)} rows so far, "
             f"{reserved} sealed games withheld")
@@ -103,7 +106,8 @@ def run(args) -> dict:
     model.to(args.device)
 
     examples, reserved = derive_window(
-        args.buffers_dir, _iterations(args.iterations), args.retain_proofs_per_game
+        args.buffers_dir, _iterations(args.iterations), args.retain_proofs_per_game,
+        tactic_labels=args.tactic_labels,
     )
     train_examples, val_examples = stable_game_split(
         examples, RUN07["val_fraction"], RUN07["val_split_salt"]
@@ -152,6 +156,12 @@ def run(args) -> dict:
         # read with `--split sealed` from the same hash.
         "g0_sealed_games_withheld": reserved,
         "g0_sealed_fraction": SEALED_FRACTION,
+        "tactic_labels": args.tactic_labels,
+        # G2b rows by kind, over the training rows.
+        "tactic_rows": {
+            name: sum(1 for e in train_examples if getattr(e, "tactic", 0) == code)
+            for name, code in (("win", 1), ("loss", -1), ("block", 2))
+        },
         "steps": args.steps,
         "seed": args.seed,
         "value_target_contract": args.value_target_contract,
@@ -177,6 +187,9 @@ def build_parser() -> argparse.ArgumentParser:
                         default=RETAIN_PROOFS_PER_GAME_DEFAULT)
     parser.add_argument("--value-target-contract", choices=VALUE_TARGET_CONTRACTS,
                         default=VALUE_TARGET_CONTRACT_DEFAULT)
+    parser.add_argument("--tactic-labels", action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="G2b: fold exact one-move tactics into the targets")
     parser.add_argument("--uniform-share", type=float, default=0.3)
     parser.add_argument("--cap", type=float, default=2.0)
     parser.add_argument("--out", type=Path, required=True)

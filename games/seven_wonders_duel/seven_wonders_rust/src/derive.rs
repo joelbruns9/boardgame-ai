@@ -30,6 +30,9 @@ pub(crate) struct DeriveSpec {
     pub scores: Option<(i32, i32)>,
     pub final_digest: Option<String>,
     pub trajectory_digest: Option<String>,
+    /// G2b: also label every included row's legal actions with
+    /// `tactics::classify_actions` (+1 / -1 / 0).
+    pub tactic_labels: bool,
 }
 
 #[derive(Default)]
@@ -48,6 +51,10 @@ pub(crate) struct DerivedGame {
     /// mover reached with no chance in between is certain, see
     /// `dataset.certain_win_moves`).
     move_chance_counts: Vec<u8>,
+    /// G2b: per included row, one i8 per legal action of that row's move
+    /// (concatenated in row order; lengths come from the move's legal list).
+    /// Empty unless `DeriveSpec::tactic_labels`.
+    tactic_labels: Vec<u8>,
     ending_age: u8,
     max_absolute_track: i32,
     sixth_science_symbol: bool,
@@ -146,6 +153,13 @@ fn derive_one(mut spec: DeriveSpec) -> Result<DerivedGame, String> {
         );
 
         if spec.include[move_index] {
+            if spec.tactic_labels {
+                out.tactic_labels.extend(
+                    crate::tactics::classify_actions(&spec.state)
+                        .into_iter()
+                        .map(|label| label as u8),
+                );
+            }
             encode_into(&spec.state, &mut token_buf);
             let tokens = token_buf.tokens();
             for token in tokens {
@@ -300,6 +314,7 @@ pub(crate) fn to_python(py: Python<'_>, games: Vec<DerivedGame>) -> PyResult<Vec
                 "move_chance_counts",
                 packed_bytes(py, &game.move_chance_counts),
             )?;
+            payload.set_item("tactic_labels", packed_bytes(py, &game.tactic_labels))?;
             let stats = PyDict::new(py);
             stats.set_item("ending_age", game.ending_age)?;
             stats.set_item("max_absolute_track", game.max_absolute_track)?;

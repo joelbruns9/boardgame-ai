@@ -406,6 +406,16 @@ def test_retain_proofs_per_game_is_part_of_the_key(tmp_path, records):
     assert loop.last_example_cache_stats["replayed_games"] == len(records)
 
 
+def test_tactic_labels_are_part_of_the_key(tmp_path, records):
+    """G2b: tactic labels change targets, so switching them re-derives."""
+
+    loop = _loop(tmp_path)
+    loop._cached_examples(records)
+    loop.config.tactic_labels = True
+    loop._cached_examples(records)
+    assert loop.last_example_cache_stats["replayed_games"] == len(records)
+
+
 def test_same_trajectory_with_different_targets_does_not_share_an_entry(
     tmp_path, records
 ):

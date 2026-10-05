@@ -685,6 +685,13 @@ class PhaseDConfig:
     endgame; the default 4 adds ~+21% rows (`dataset.retained_proof_moves`).
     """
 
+    tactic_labels: bool = False
+    """G2b: at derivation, label every row's legal actions with the exact
+    one-move tactics (`tactics.classify_actions`) and fold them into its
+    targets (`dataset.apply_tactic_labels`): exact value on a forced win/loss,
+    move target restricted to winning moves / stripped of losing ones. Off is
+    the A/B arm until the offline A/B decides."""
+
     derive_backend: str = "rust"
     """Replay/encoding implementation: production Rust or Python reference."""
 
@@ -4822,6 +4829,7 @@ class PhaseDLoop:
         cache = self._example_cache
         fast = self.config.record_fast_moves
         retain = self.config.retain_proofs_per_game
+        tactics = self.config.tactic_labels
         # W7: the SAME record yields different examples per model -- the policy
         # label is routed, and `value_soft`'s root differs between the model
         # whose lambda produced it and everyone else. But the expensive part of
@@ -4840,15 +4848,17 @@ class PhaseDLoop:
         rust_derived_games = 0
         used: set[tuple] = set()
         out: list[Example] = []
-        keyed_records: list[tuple[tuple[str, bool, int], GameRecord]] = []
-        missing: OrderedDict[tuple[str, bool, int], GameRecord] = OrderedDict()
+        keyed_records: list[tuple[tuple[str, bool, int, bool], GameRecord]] = []
+        missing: OrderedDict[tuple[str, bool, int, bool], GameRecord] = OrderedDict()
         for record in records:
             digest = record.source_digest
             if digest is None:
                 digest = hashlib.sha256(
                     to_json_line(record).encode("utf-8")
                 ).hexdigest()
-            key = (digest, fast, retain)
+            # The derivation switches are in the key: an example derived
+            # without tactic labels is a different example.
+            key = (digest, fast, retain, tactics)
             keyed_records.append((key, record))
             if key not in cache or key not in self._example_cache_game_stats:
                 missing.setdefault(key, record)
@@ -4865,7 +4875,7 @@ class PhaseDLoop:
             if self.config.derive_backend == "rust"
         ]
         derived_by_key: dict[
-            tuple[str, bool, int], tuple[list[Example], GameDerivationStats]
+            tuple[str, bool, int, bool], tuple[list[Example], GameDerivationStats]
         ] = {}
         for key, record in python_items:
             summaries: list[GameDerivationStats] = []
@@ -4874,6 +4884,7 @@ class PhaseDLoop:
                 record_fast_moves=fast,
                 on_derived=summaries.append,
                 retain_proofs_per_game=retain,
+                tactic_labels=tactics,
             )
             if len(summaries) != 1:
                 raise AssertionError(
@@ -4886,6 +4897,7 @@ class PhaseDLoop:
                 [record for _key, record in rust_items],
                 record_fast_moves=fast,
                 retain_proofs_per_game=retain,
+                tactic_labels=tactics,
             )
             if len(rust_rows) != len(rust_items):
                 raise AssertionError("Rust example derivation lost record alignment")
@@ -7790,6 +7802,15 @@ def build_parser() -> argparse.ArgumentParser:
         "objective, the A/B arm",
     )
     parser.add_argument(
+        "--tactic-labels",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="G2b: fold exact one-move tactics into every row's targets at "
+        "derivation -- exact value on a forced win/loss, move target limited "
+        "to winning moves or stripped of moves that lose by force. Off until "
+        "the offline A/B decides",
+    )
+    parser.add_argument(
         "--retain-proofs-per-game",
         type=int,
         default=RETAIN_PROOFS_PER_GAME_DEFAULT,
@@ -8142,6 +8163,7 @@ def main(argv=None) -> int:
         memory_headroom_gb=args.memory_headroom_gb,
         record_fast_moves=args.record_fast_moves,
         retain_proofs_per_game=args.retain_proofs_per_game,
+        tactic_labels=args.tactic_labels,
         value_target_contract=args.value_target_contract,
         priority_sampling=args.priority_sampling,
         priority_uniform_share=args.priority_uniform_share,

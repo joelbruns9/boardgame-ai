@@ -3149,9 +3149,13 @@ fn pack_threads() -> usize {
 
 #[pyfunction]
 #[pyo3(signature = (
-    games, actions, actors, include, chance_logs, expected_results, expected_digests
+    games, actions, actors, include, chance_logs, expected_results, expected_digests,
+    tactic_labels = false
 ))]
 /// Validate, replay, and encode complete buffer records in parallel.
+/// `tactic_labels` (G2b) also labels every included row's legal actions with
+/// `tactics::classify_actions`.
+#[allow(clippy::too_many_arguments)]
 fn derive_records(
     py: Python<'_>,
     games: Vec<Py<RustGame>>,
@@ -3161,6 +3165,7 @@ fn derive_records(
     chance_logs: Vec<Vec<(u8, Vec<usize>)>>,
     expected_results: Vec<(Option<usize>, Option<u8>, Option<(i32, i32)>)>,
     expected_digests: Vec<(Option<String>, Option<String>)>,
+    tactic_labels: bool,
 ) -> PyResult<Vec<Py<PyDict>>> {
     let count = games.len();
     if actions.len() != count
@@ -3199,6 +3204,7 @@ fn derive_records(
                     scores: result.2,
                     final_digest: digests.0,
                     trajectory_digest: digests.1,
+                    tactic_labels,
                 }
             },
         )
