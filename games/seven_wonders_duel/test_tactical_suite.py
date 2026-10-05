@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import json
 import random
 
 import pytest
@@ -180,3 +181,30 @@ def test_the_network_and_search_readers_run_end_to_end(cases, records):
             assert -1.0 <= reading.value <= 1.0
     # The suite leaves the process-wide switch as it found it.
     assert swr.exact_tactics() is False
+
+
+def test_paired_compare_counts_discordant_pairs_and_clusters_by_game(tmp_path):
+    def write(path, flips):
+        with path.open("w", encoding="utf-8") as handle:
+            for i in range(40):
+                handle.write(json.dumps({
+                    "mode": "network", "id": f"c{i}", "cls": "must_block",
+                    "near_end": i < 10, "game": [1, i // 2],
+                    "value": 0.0, "abs_error": 0.5 if i in flips else 0.2,
+                    "action": 0, "blunder": i in flips,
+                }) + "\n")
+
+    a, b = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+    write(a, flips=set(range(12)))  # 12 blunders
+    write(b, flips={0, 1, 30})  # 3 blunders: 10 fixed, 1 new
+    report = ts.compare(a, b, draws=500)
+    entry = report["modes"]["network"]["must_block"]
+    assert entry["cases"] == 40 and entry["games"] == 20
+    stats = entry["blunder"]
+    assert stats["a"] == pytest.approx(12 / 40) and stats["b"] == pytest.approx(3 / 40)
+    assert (stats["only_a"], stats["only_b"]) == (10, 1)
+    assert stats["mcnemar_p"] < 0.02
+    low, high = stats["diff_ci95"]
+    assert low < -0.225 < high < 0  # mean diff -9/40, and clearly below zero
+    assert "must_block/near_end" in report["modes"]["network"]
+    assert ts._mcnemar(0, 0) == 1.0 and ts._mcnemar(5, 5) == 1.0

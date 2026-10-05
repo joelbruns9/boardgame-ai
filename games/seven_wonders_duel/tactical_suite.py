@@ -478,6 +478,7 @@ def evaluate(
     exact_tactics: bool = True,
     max_per_class: int | None = None,
     seed: int = 0,
+    readings_out: Path | None = None,
 ) -> dict:
     cases = read_cases(cases_path, split)
     if max_per_class is not None:
@@ -513,6 +514,112 @@ def evaluate(
             "seconds": round(time.time() - started, 1),
             "classes": score(cases, readings),
         }
+        if readings_out is not None:
+            write_readings(readings_out, mode, cases, readings, append=budget != sims[0])
+    return report
+
+
+def write_readings(path: Path, mode: str, cases: list[Case], readings: list[Reading],
+                   *, append: bool) -> None:
+    """One line per (mode, case): what the model read, scored per case, so two
+    checkpoints can be compared PAIRED on identical positions (`compare`)."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a" if append else "w", encoding="utf-8") as handle:
+        for case, reading in zip(cases, readings):
+            row = {
+                "mode": mode,
+                "id": case.id,
+                "cls": case.cls,
+                "near_end": case.plies_to_end is not None and case.plies_to_end <= 2,
+                "game": [case.iteration, case.seed],
+                "value": reading.value,
+                "abs_error": abs(reading.value - case.value),
+                "action": reading.action,
+            }
+            if case.cls == "own_win":
+                row["found_win"] = reading.action in case.winning
+            if case.losing:
+                row["blunder"] = reading.action in case.losing
+            if case.cls == "reveal_trap":
+                row["trap_pick"] = case.trap_mass.get(reading.action, 0.0) > 0.0
+            handle.write(json.dumps(row) + "\n")
+
+
+#: Per-case metrics `compare` pairs: binary ones are compared by discordant
+#: pairs (exact McNemar), all by a game-clustered bootstrap of the paired
+#: difference.
+PAIRED_METRICS = ("found_win", "blunder", "trap_pick", "abs_error")
+
+
+def _mcnemar(only_a: int, only_b: int) -> float:
+    """Exact two-sided McNemar p-value from the discordant counts."""
+
+    n = only_a + only_b
+    if n == 0:
+        return 1.0
+    k = min(only_a, only_b)
+    tail = sum(math.comb(n, i) for i in range(k + 1)) / 2 ** n
+    return min(1.0, 2 * tail)
+
+
+def _cluster_bootstrap(diffs_by_game: dict, *, draws: int, rng: random.Random) -> tuple:
+    """95% interval of the mean paired difference, resampling whole GAMES (a
+    game's cases are correlated -- the review's point that rows overstate
+    evidence)."""
+
+    games = list(diffs_by_game.values())
+    means = []
+    for _ in range(draws):
+        sample = [games[rng.randrange(len(games))] for _ in games]
+        total = sum(sum(g) for g in sample)
+        count = sum(len(g) for g in sample)
+        means.append(total / count)
+    means.sort()
+    return means[int(0.025 * draws)], means[int(0.975 * draws) - 1]
+
+
+def compare(a_path: Path, b_path: Path, *, draws: int = 2000, seed: int = 0) -> dict:
+    """Paired comparison of two `--save-readings` files (A = baseline, B =
+    candidate) on the cases they share, per mode, class and near-end/deep
+    split. Differences are B - A; for `abs_error` lower is better, for
+    `found_win` higher, for `blunder` / `trap_pick` lower."""
+
+    def load(path):
+        with Path(path).open(encoding="utf-8") as handle:
+            return {(r["mode"], r["id"]): r for r in map(json.loads, handle)}
+
+    a, b = load(a_path), load(b_path)
+    shared = sorted(set(a) & set(b))
+    rng = random.Random(seed)
+    groups: dict = defaultdict(list)
+    for key in shared:
+        row = a[key]
+        groups[(row["mode"], row["cls"])].append(key)
+        groups[(row["mode"], f"{row['cls']}/{'near_end' if row['near_end'] else 'deep'}")].append(key)
+    report: dict = {"a": str(a_path), "b": str(b_path), "shared_cases": len(shared), "modes": {}}
+    for (mode, cls), keys in sorted(groups.items()):
+        entry = {"cases": len(keys), "games": len({tuple(a[k]["game"]) for k in keys})}
+        for metric in PAIRED_METRICS:
+            pairs = [(a[k][metric], b[k][metric], tuple(a[k]["game"]))
+                     for k in keys if metric in a[k] and metric in b[k]]
+            if not pairs:
+                continue
+            by_game: dict = defaultdict(list)
+            for x, y, game in pairs:
+                by_game[game].append(float(y) - float(x))
+            low, high = _cluster_bootstrap(by_game, draws=draws, rng=rng)
+            stats = {
+                "a": sum(float(x) for x, _, _ in pairs) / len(pairs),
+                "b": sum(float(y) for _, y, _ in pairs) / len(pairs),
+                "diff_ci95": [low, high],
+            }
+            if metric != "abs_error":
+                only_a = sum(1 for x, y, _ in pairs if x and not y)
+                only_b = sum(1 for x, y, _ in pairs if y and not x)
+                stats.update(only_a=only_a, only_b=only_b, mcnemar_p=_mcnemar(only_a, only_b))
+            entry[metric] = stats
+        report["modes"].setdefault(mode, {})[cls] = entry
     return report
 
 
@@ -549,7 +656,15 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--exact-tactics", action=argparse.BooleanOptionalAction, default=True)
     e.add_argument("--max-per-class", type=int, default=None)
     e.add_argument("--seed", type=int, default=0)
+    e.add_argument("--save-readings", action="store_true",
+                   help="also write per-case readings next to --out "
+                   "(<out>.readings.jsonl) for a paired `compare`")
     e.add_argument("--out", type=Path, required=True)
+    c = sub.add_parser("compare", help="paired comparison of two saved readings files")
+    c.add_argument("--a", type=Path, required=True, help="baseline readings")
+    c.add_argument("--b", type=Path, required=True, help="candidate readings")
+    c.add_argument("--draws", type=int, default=2000)
+    c.add_argument("--out", type=Path, required=True)
     return parser
 
 
@@ -566,12 +681,19 @@ def main(argv=None) -> int:
         )
         print(json.dumps(summary, indent=2))
         return 0
+    if args.command == "compare":
+        report = compare(args.a, args.b, draws=args.draws)
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(json.dumps(report, indent=2))
+        print(json.dumps(report, indent=2))
+        return 0
     report = evaluate(
         args.cases, args.checkpoint,
         sims=[int(s) for s in args.sims.split(",")],
         split=args.split, device=args.device, precision=args.precision,
         exact_tactics=args.exact_tactics, max_per_class=args.max_per_class,
         seed=args.seed,
+        readings_out=args.out.with_suffix(".readings.jsonl") if args.save_readings else None,
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(report, indent=2))
