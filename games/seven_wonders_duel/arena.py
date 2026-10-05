@@ -1017,6 +1017,11 @@ def main(argv: list[str] | None = None) -> int:
             "would be stronger without the flat head.",
         )
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument(
+        "--exact-tactics", action=argparse.BooleanOptionalAction, default=True,
+        help="G4 exact tactics in BOTH sides' search, as deployed (Phase D and "
+        "the advisor default to on). Process-wide; restored on exit.",
+    )
     args = parser.parse_args(argv)
 
     for label, path in (("--a", args.a), ("--b", args.b)):
@@ -1031,38 +1036,46 @@ def main(argv: list[str] | None = None) -> int:
         if not args.quiet:
             print(message, flush=True)
 
-    report = run(
-        args.a,
-        args.b,
-        pairs=args.pairs,
-        device=args.device,
-        precision=args.precision,
-        sims=args.sims,
-        sims_a=args.sims_a,
-        sims_b=args.sims_b,
-        parity=args.parity,
-        reference=args.reference,
-        calibration_games=args.calibration_games,
-        calibration_sims=args.calibration_sims,
-        parity_tolerance=args.parity_tolerance,
-        min_sims=args.min_sims,
-        max_sims=args.max_sims,
-        top_k=args.top_k,
-        search=args.search,
-        slots=args.slots,
-        batch_cap=args.batch_cap,
-        leaf_batch=args.leaf_batch,
-        force_root_chance=args.force_root_chance,
-        age_deal_samples=args.age_deal_samples,
-        max_moves=args.max_moves,
-        seed=args.seed,
-        z=args.z,
-        migrate=args.migrate,
-        min_lcb=args.min_lcb,
-        log=log,
-        policy_source_a=args.policy_source_a,
-        policy_source_b=args.policy_source_b,
-    )
+    import seven_wonders_rust as swr
+
+    previous_tactics = swr.exact_tactics()
+    swr.set_exact_tactics(args.exact_tactics)
+    try:
+        report = run(
+            args.a,
+            args.b,
+            pairs=args.pairs,
+            device=args.device,
+            precision=args.precision,
+            sims=args.sims,
+            sims_a=args.sims_a,
+            sims_b=args.sims_b,
+            parity=args.parity,
+            reference=args.reference,
+            calibration_games=args.calibration_games,
+            calibration_sims=args.calibration_sims,
+            parity_tolerance=args.parity_tolerance,
+            min_sims=args.min_sims,
+            max_sims=args.max_sims,
+            top_k=args.top_k,
+            search=args.search,
+            slots=args.slots,
+            batch_cap=args.batch_cap,
+            leaf_batch=args.leaf_batch,
+            force_root_chance=args.force_root_chance,
+            age_deal_samples=args.age_deal_samples,
+            max_moves=args.max_moves,
+            seed=args.seed,
+            z=args.z,
+            migrate=args.migrate,
+            min_lcb=args.min_lcb,
+            log=log,
+            policy_source_a=args.policy_source_a,
+            policy_source_b=args.policy_source_b,
+        )
+    finally:
+        swr.set_exact_tactics(previous_tactics)
+    report["exact_tactics"] = args.exact_tactics
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(
