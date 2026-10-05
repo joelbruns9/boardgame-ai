@@ -17,6 +17,14 @@ it, and score the results on sealed G0:
 * ``reset-value`` -- the base with its value heads (value, joint7, margin,
   military, science, W4) re-initialised.
 
+W5's served weight (alpha) is not trained; Phase D FITS it on held-out rows
+after each training step (`action_alpha`). Pretrain does the same after every
+window, for every arm -- without it a random arm's alpha stays at its built
+zero for the whole run, so the G14 comparison would also be W5-on versus
+W5-off (review of 8014a6c, #1). ``--alpha-step`` defaults to a jump straight
+to the fitted value: windows are few, and a capped step would leave the random
+arm short of where its heads put the optimum.
+
 Each window's checkpoint is saved, so a stopped run restarts from the last
 completed window with ``--resume``.
 """
@@ -31,6 +39,7 @@ import time
 
 import torch
 
+from .action_alpha import format_alpha_fit, refit_alpha
 from .g3_offline_ab import RUN07, derive_window
 from .targeted_reanalysis import load_overlay
 from .train import (
@@ -135,6 +144,21 @@ def run(args) -> dict:
             seed=args.seed + index,
             precision=args.precision,
         )
+        alpha_fit = None
+        scorer = getattr(model, "action_scorer", None)
+        if config.get("fit_action_alpha") and scorer is not None:
+            # Before the window checkpoint, so a resumed run starts from it.
+            alpha_fit = refit_alpha(
+                model,
+                val_examples,
+                args.device,
+                alpha_max=scorer.gate_max,
+                step=args.alpha_step if args.alpha_step else scorer.gate_max,
+                batch_size=RUN07["batch_size"],
+                precision=args.precision,
+                seed=args.seed + index,
+            ).as_dict()
+            print(format_alpha_fit(alpha_fit), flush=True)
         payload = make_checkpoint(model, dict(config))
         payload["optimizer_state"] = optimizer_state
         torch.save(payload, out_dir / f"window_{tag}.pt")
@@ -148,6 +172,7 @@ def run(args) -> dict:
             "g0_sealed_games_withheld": reserved,
             "reanalysed_rows": sum(1 for e in train_examples if getattr(e, "reanalysed", False)),
             "val_total": (final.get("val") or {}).get("total"),
+            "alpha_fit": alpha_fit,
             "minutes": round((time.time() - started) / 60, 1),
         })
         state_path.write_text(json.dumps(progress, indent=2))
@@ -180,6 +205,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "a negative value to use --steps-per-window instead")
     parser.add_argument("--tactic-labels", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--reanalysis-overlay", type=Path, nargs="*", default=None)
+    parser.add_argument("--alpha-step", type=float, default=None,
+                        help="largest W5 alpha change per window (default: jump to the "
+                        "held-out fit)")
     parser.add_argument("--retain-proofs-per-game", type=int, default=4)
     parser.add_argument("--validate-every", type=int, default=500)
     parser.add_argument("--device", default="cuda")

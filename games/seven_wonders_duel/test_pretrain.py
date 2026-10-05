@@ -82,3 +82,41 @@ def test_presentations_per_row_sets_the_step_count(setup):
     expected = -(-2 * window["rows"]["train"] // 512)
     assert window["steps"] == expected
     assert window["presentations_per_row"] >= 2.0
+
+
+def test_every_arm_refits_w5_alpha_after_each_window(setup, monkeypatch):
+    """Review of 8014a6c, #1: a random arm is built with W5's gate at zero and
+    frozen; without the per-window fit it would serve W5-off for the whole
+    comparison. Every arm fits, the jump is uncapped by default, and the fitted
+    alpha is in the window checkpoint a resume starts from."""
+
+    from .action_alpha import AlphaFit
+    from .train import model_from_config
+
+    root, buffers, _base = setup
+    config = {"model": "transformer", "d_model": 32, "layers": 1, "heads": 2,
+              "action_residual": True, "fit_action_alpha": True, "action_gate_max": 2.0}
+    base = root / "w5_base.pt"
+    torch.save(make_checkpoint(model_from_config(config), config), base)
+    calls = []
+
+    def fake_refit(model, examples, device, *, alpha_max, step, **_kw):
+        calls.append((alpha_max, step))
+        previous = model.action_scorer.alpha_value()
+        applied = model.action_scorer.set_alpha(0.7)
+        return AlphaFit(previous=previous, applied=applied, fitted=0.7, positions=len(examples),
+                        loss_flat_only=1.0, loss_at_previous=1.0, loss_at_fitted=0.9,
+                        loss_w5_only=1.1)
+
+    monkeypatch.setattr(pretrain, "refit_alpha", fake_refit)
+    for init in pretrain.INITS:
+        calls.clear()
+        out = f"out_alpha_{init}"
+        summary = pretrain.run(_args(root, buffers, base, init, out))
+        assert calls == [(2.0, 2.0)] * 2
+        assert all(w["alpha_fit"]["applied"] == pytest.approx(0.7) for w in summary["windows"])
+        for name in ("pretrained.pt", "window_0002_0002.pt"):
+            saved = torch.load(root / out / name, map_location="cpu", weights_only=False)
+            model = model_from_config(saved["config"])
+            model.load_state_dict(saved["model_state"])
+            assert model.action_scorer.alpha_value() == pytest.approx(0.7, abs=1e-5)

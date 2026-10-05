@@ -1498,14 +1498,18 @@ class RustClosedSearchResult:
     disagreement a ``ValueError`` rather than a silently transposed target.
     """
 
-    __slots__ = ("root_value", "visits", "policy_target", "action_index", "sims")
+    __slots__ = ("root_value", "visits", "policy_target", "action_index", "sims",
+                 "root_outlook")
 
-    def __init__(self, root_value, visits, policy_target, action_index, sims):
+    def __init__(self, root_value, visits, policy_target, action_index, sims,
+                 root_outlook=None):
         self.root_value = root_value
         self.visits = visits
         self.policy_target = policy_target
         self.action_index = action_index
         self.sims = sims
+        #: W4's seven-way root outlook in the record's frame, when the net has W4.
+        self.root_outlook = root_outlook
 
 
 class RustClosedSearch:
@@ -1822,6 +1826,10 @@ def rust_coalesced_reanalysis_prepared(
                 policy_target={a: float(p) for a, p in zip(legal, target)},
                 action_index=int(move["action"]),
                 sims=int(move["sims"]),
+                root_outlook=(
+                    [float(x) for x in move["root_outlook"]]
+                    if move.get("root_outlook") is not None else None
+                ),
             )
         )
     return out, coalescing

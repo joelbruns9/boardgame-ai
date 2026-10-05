@@ -169,3 +169,41 @@ python -m pytest -n 4 games/seven_wonders_duel/test_tactic_labels.py \
 2. The proven-loss guard is sound and leaves no inconsistent root reader.
 3. G8.2 overlay targets are safe to train on, including the base+ leakage question.
 4. `pretrain.py` is fit to produce the warm-start checkpoint (and the three G14 arms).
+
+
+## Response to the review of 8014a6c (2026-10-05)
+
+Review: `reviews/sevenwd-g2b-g82-pretrain-8014a6c.md`. Every finding was checked
+against the code; all five hold and are fixed. The overlay had not been
+generated yet, so finding 3 is fixed at the source (the overlay now carries
+the re-search's outlook) rather than at the loss boundary.
+
+| # | finding | verdict | fix | regression test |
+|---|---|---|---|---|
+| 1 | random arm's W5 alpha frozen at 0 | valid | `pretrain.py` runs `refit_alpha` on each window's held-out rows for every arm, before the window checkpoint (so `--resume` starts from it); `--alpha-step` defaults to a jump to the fit | `test_every_arm_refits_w5_alpha_after_each_window` |
+| 2 | reply targets keep proven-losing mass | valid | `dataset.sync_reply_targets`: after G8.2 and G2b, an eligible reply label is the following row's FINAL move target (eligibility rules unchanged; unchanged rows keep their bytes), both backends | `test_reply_targets_follow_the_corrected_move_targets` |
+| 3 | W4 gets none of the re-searched value | valid | overlay schema 2 carries the re-search's `root_outlook`; `apply_reanalysis` sets it and `search_lambda=0` (the re-search is unbiased); schema-1 overlays are refused | `test_w4_trains_toward_the_re_searched_outlook`, `test_an_overlay_without_outlooks_is_refused` |
+| 4 | specialist projection enables unfiltered policies | valid | `apply_tactic_labels` filters the stored policy regardless of `has_policy` (still the loss mask) | `test_a_cached_general_row_projects_to_the_directly_derived_specialist_row` |
+| 5 | case-level McNemar on clustered cases | valid | `compare` drops `mcnemar_p`; adds `game_signflip_p` (game-level sign-flip test); fixed/broken counts kept as description | `test_fixes_concentrated_in_one_game_are_not_significant` |
+
+**Measured after the fixes.** Run07 iter 100 (unsealed games): 2,290 reply
+labels, 0 differ from the following row's final move target, 0 of the 139
+following a G2b-corrected row keep mass on a removed move. Base+'s alpha
+refitted on iters 91-100 held-out rows: 0.712 vs the 0.768 it carries
+(held-out CE flat 1.32, W5 alone 0.93, mixed 0.91) -- base+ stays the
+reanalysis teacher as is. The same numbers show finding 1 mattered: a W5-off
+random arm would have served the flat head's 1.32.
+
+**Earlier p-values withdrawn.** The case-level McNemar p-values quoted above
+and in `MODEL_GROWTH_PLAN.md` (G2b A/B, base+) overstate significance; the
+fixed/broken counts and the game-clustered intervals stand.
+
+**Design answers accepted:** proof conflicts, guard reader qualification
+(`root_completed_q` and `root_value` are not proof-authoritative), teacher
+dependence (labels are bootstrapped training data, not ground truth), reveal
+budget (measure overlap before reserving), sequential-window forgetting, and
+the arena programmatic-vs-CLI default.
+
+Tests after the fixes: 31 passed (pretrain, tactic labels, reanalysis,
+tactical suite) + 156 passed (parameter docs, Rust derivation, example cache,
+G2 contract, exact tactics, action alpha, specialist league).

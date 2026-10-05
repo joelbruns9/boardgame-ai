@@ -81,9 +81,12 @@ def test_nothing_proven_changes_nothing_and_exact_solver_values_win(records):
     labels = [0] * len(example.legal)
     labels[0] = 1
     assert apply_tactic_labels(solved, labels).solver_value == -1.0
+    # A row this route does not train on is filtered all the same: projection
+    # to another route can switch its policy on later (review of 8014a6c, #4).
     value_only = replace(example, has_policy=False)
     out = apply_tactic_labels(value_only, labels)
-    assert np.array_equal(out.policy_target, example.policy_target)
+    assert out.has_policy is False
+    assert out.policy_target[0] == pytest.approx(1.0)
     with pytest.raises(ValueError):
         apply_tactic_labels(example, [0] * (len(example.legal) + 1))
 
@@ -112,3 +115,71 @@ def test_labelled_rows_count_as_proof_rows_for_g3(records):
     for row in rows:
         if row.tactic in (TACTIC_WIN, TACTIC_LOSS):
             assert is_proof_row(row)
+
+
+def _as_searched(record, route=None):
+    """The bot game with every move recorded as a full search (uniform target),
+    so replies and policy rows exist; `route` relabels whose model it trains."""
+
+    legal = {e.move_index: e.legal for e in examples_from_record(record)}
+    moves = [
+        replace(m, sims=800, policy_excluded=False,
+                policy_target={int(a): 1.0 / len(legal[m.i]) for a in legal[m.i]},
+                **({"target_route": route} if route else {}))
+        for m in record.moves
+    ]
+    return replace(record, moves=moves)
+
+
+def test_reply_targets_follow_the_corrected_move_targets(records):
+    """Review of 8014a6c, #2: a reply label is the FOLLOWING row's final move
+    target, so it never keeps mass G2b removed from that row."""
+
+    from .dataset import sync_reply_targets  # noqa: F401  (the contract under test)
+
+    searched = [_as_searched(r) for r in records]
+    rust = derive_records_rust(searched, tactic_labels=True, batch_games=4)
+    synced = 0
+    for record, (rust_rows, _stats) in zip(searched, rust):
+        python_rows = examples_from_record(record, tactic_labels=True)
+        for rows in (python_rows, rust_rows):
+            by_move = {e.move_index: e for e in rows}
+            for row in rows:
+                if row.reply_target is None:
+                    continue
+                following = by_move[row.move_index + 1]
+                assert np.array_equal(row.reply_legal, following.legal)
+                assert np.allclose(row.reply_target, following.policy_target)
+                if following.tactic in (TACTIC_WIN, TACTIC_BLOCK):
+                    synced += 1
+        for a, b in zip(python_rows, rust_rows):
+            assert (a.reply_target is None) == (b.reply_target is None)
+            if a.reply_target is not None:
+                assert np.allclose(a.reply_target, b.reply_target)
+    assert synced, "no corrected reply exercised"
+    # Without corrections the replies are byte-identical to the raw pairing.
+    plain = examples_from_record(searched[0])
+    for row in plain:
+        if row.reply_target is not None:
+            assert row.reply_target.sum() == pytest.approx(1.0)
+
+
+def test_a_cached_general_row_projects_to_the_directly_derived_specialist_row(records):
+    """Review of 8014a6c, #4: Phase D caches the general derivation and
+    projects it for a specialist; the projected policy must be the one direct
+    derivation for that specialist produces."""
+
+    from .dataset import project_examples
+
+    checked = 0
+    for record in records:
+        science = _as_searched(record, route="science")
+        cached = examples_from_record(science, tactic_labels=True)
+        direct = examples_from_record(science, tactic_labels=True, derived_for="science")
+        projected = project_examples(cached, science, "science")
+        for p, d in zip(projected, direct):
+            assert p.has_policy == d.has_policy
+            assert np.allclose(p.policy_target, d.policy_target)
+            if d.tactic == TACTIC_BLOCK and d.has_policy:
+                checked += 1
+    assert checked, "no specialist must_block row exercised"

@@ -782,7 +782,11 @@ def apply_tactic_labels(example: Example, labels) -> Example:
     if value is not None and not (example.solver_value is not None and example.solver_exact):
         fields["solver_value"] = value
         fields["solver_exact"] = True
-    if keep is not None and example.has_policy:
+    # Filtered whether or not THIS route trains on the row's policy: a cached
+    # general row is re-labelled for a specialist by `project_examples`, which
+    # turns `has_policy` on without re-running this (review of 8014a6c, #4).
+    # `has_policy` stays the loss mask; the stored target is always clean.
+    if keep is not None and example.policy_target is not None:
         target = example.policy_target.astype(np.float32) * keep
         total = float(target.sum())
         if total > 0.0:
@@ -812,9 +816,56 @@ def apply_reanalysis(example: Example, entry: dict) -> Example:
         has_policy=True,
         root_value=float(entry["root_value"]),
         root_value_shaped=False,
-        root_outlook=None,
+        # The re-search's own W4 outlook (overlay schema 2). W4's outcome target
+        # is built from the outlook, never from the scalar, so dropping the old
+        # one without a replacement left W4 on the realised result alone (review
+        # of 8014a6c, #3). None only when the searching net has no W4 head.
+        root_outlook=entry.get("root_outlook"),
+        # The re-search ran at lambda 0; the recorded move's lambda would make
+        # `usable_root_outlook` refuse the new, unbiased outlook.
+        search_lambda=0.0,
         reanalysed=True,
     )
+
+
+def sync_reply_targets(examples: list[Example], before: dict) -> list[Example]:
+    """Point each reply target at the FOLLOWING row's corrected move target.
+
+    `reply_targets` pairs over the raw record, before G8.2 and G2b replace a
+    row's move target, so a move target corrected at its own position survived
+    unchanged as the previous position's reply label -- 50 training rows in run07
+    iter 100 put mass on a proven-losing reply, one 89% (review of 8014a6c, #2).
+    Eligibility is unchanged (actor, archive, cheap-search rules stay in
+    `reply_targets`); only the label of an eligible reply follows the correction.
+    `before` maps move index to the move target as derived, so rows whose
+    following target did not change keep their reply bytes exactly.
+    """
+
+    rows = {e.move_index: e for e in examples}
+    out = []
+    for example in examples:
+        if example.reply_target is None:
+            out.append(example)
+            continue
+        following = rows.get(example.move_index + 1)
+        if following is None:
+            # An eligible reply is a full search, which always emits a row.
+            raise ReplayMismatchError(
+                f"move {example.move_index}: reply-eligible move "
+                f"{example.move_index + 1} produced no row"
+            )
+        if np.array_equal(following.policy_target, before[following.move_index]):
+            out.append(example)
+            continue
+        if not np.array_equal(following.legal, example.reply_legal):
+            raise ReplayMismatchError(
+                f"move {example.move_index}: reply legal set differs from move "
+                f"{following.move_index}'s"
+            )
+        out.append(dataclasses.replace(
+            example, reply_target=following.policy_target.astype(np.float32)
+        ))
+    return out
 
 
 def emits_example(move, *, record_fast_moves: bool, retained: set[int]) -> bool:
@@ -1249,6 +1300,7 @@ def examples_from_record(
                 certain_win=move_index in certain,
             )
         )
+    before = {e.move_index: e.policy_target for e in examples}
     if reanalysed:
         examples = [
             apply_reanalysis(e, reanalysed[e.move_index]) if e.move_index in reanalysed else e
@@ -1258,6 +1310,8 @@ def examples_from_record(
         examples = [
             apply_tactic_labels(e, tactics_by_move[e.move_index]) for e in examples
         ]
+    if reanalysed or tactic_labels:
+        examples = sync_reply_targets(examples, before)
     return _with_short_term(examples, record)
 
 
@@ -1449,6 +1503,7 @@ def _examples_from_rust_payload(
             )
         )
 
+    before = {e.move_index: e.policy_target for e in examples}
     if reanalysed:
         examples = [
             apply_reanalysis(e, reanalysed[e.move_index]) if e.move_index in reanalysed else e
@@ -1468,6 +1523,8 @@ def _examples_from_rust_payload(
         if cursor != len(packed):
             raise ReplayMismatchError("Rust replay sent too many tactic labels")
         examples = labelled
+    if reanalysed or tactic_labels:
+        examples = sync_reply_targets(examples, before)
 
     stats = GameDerivationStats(
         ending_age=int(stats_payload["ending_age"]),

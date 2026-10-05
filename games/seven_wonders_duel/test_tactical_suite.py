@@ -203,11 +203,34 @@ def test_paired_compare_counts_discordant_pairs_and_clusters_by_game(tmp_path):
     stats = entry["blunder"]
     assert stats["a"] == pytest.approx(12 / 40) and stats["b"] == pytest.approx(3 / 40)
     assert (stats["only_a"], stats["only_b"]) == (10, 1)
-    assert stats["mcnemar_p"] < 0.02
+    assert "mcnemar_p" not in stats
+    # Five games fixed (two cases each), one broken: a game-level sign flip
+    # cannot go far below 2 x (2/64).
+    assert 0.03 < stats["game_signflip_p"] < 0.12
     low, high = stats["diff_ci95"]
     assert low < -0.225 < high < 0  # mean diff -9/40, and clearly below zero
     assert "must_block/near_end" in report["modes"]["network"]
-    assert ts._mcnemar(0, 0) == 1.0 and ts._mcnemar(5, 5) == 1.0
+
+
+def test_fixes_concentrated_in_one_game_are_not_significant(tmp_path):
+    """Review of 8014a6c, #5: 10 games x 20 cases, all 20 fixes in ONE game.
+    Case-level McNemar read p = 2e-6; the game-level test must not."""
+
+    def write(path, blunders):
+        with path.open("w", encoding="utf-8") as handle:
+            for i in range(200):
+                handle.write(json.dumps({
+                    "mode": "network", "id": f"c{i}", "cls": "must_block",
+                    "near_end": False, "game": [1, i // 20], "value": 0.0,
+                    "abs_error": 0.2, "action": 0, "blunder": i in blunders,
+                }) + "\n")
+
+    a, b = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+    write(a, blunders=set(range(20)))
+    write(b, blunders=set())
+    stats = ts.compare(a, b, draws=500)["modes"]["network"]["must_block"]["blunder"]
+    assert (stats["only_a"], stats["only_b"]) == (20, 0)
+    assert stats["game_signflip_p"] > 0.5
 
 
 def test_search_never_targets_a_proven_losing_move(cases, records):

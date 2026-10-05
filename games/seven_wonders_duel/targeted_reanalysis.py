@@ -39,7 +39,8 @@ from .search import chance_signature, state_actor
 from .tactical_suite import sealed
 
 REASONS = ("pre_decisive", "reveal", "cheap")
-SCHEMA = 1
+#: 2: rows carry the re-search's W4 `root_outlook` (review of 8014a6c, #3).
+SCHEMA = 2
 
 
 @dataclass(frozen=True)
@@ -186,6 +187,7 @@ def run(
                     "reason": target.reason,
                     "sims": result.sims,
                     "root_value": result.root_value,
+                    "root_outlook": result.root_outlook,
                     "policy": {str(a): float(result.policy_target.get(a, 0.0)) for a in legal},
                 }) + "\n")
                 counts[target.reason] += 1
@@ -232,10 +234,16 @@ def load_overlay(paths) -> dict[tuple, dict]:
             for line in handle:
                 row = json.loads(line)
                 if row.get("kind") == "header":
+                    if row.get("schema", 1) < 2:
+                        raise ValueError(
+                            f"{path}: overlay schema {row.get('schema', 1)} has no W4 "
+                            "outlook; re-run targeted_reanalysis"
+                        )
                     continue
                 overlay.setdefault((row["iteration"], row["seed"]), {})[row["move"]] = {
                     "policy": {int(a): p for a, p in row["policy"].items()},
                     "root_value": row["root_value"],
+                    "root_outlook": row["root_outlook"],
                     "reason": row.get("reason"),
                 }
     return overlay

@@ -401,6 +401,9 @@ run07 buffers and for cheap moves whose searches are too short for the check
 to fire everywhere it should.
 
 **Three-arm offline A/B (2026-10-05), sealed G0, paired, 300 cases/class.**
+(p-values in this plan are case-level McNemar and overstate significance:
+cases from one game are correlated. Read the fixed/broken counts; `compare`
+now reports a game-level sign-flip p -- review of 8014a6c, #5.)
 uniform -> G2b-uniform: must_block blunders 19.0 -> 13.3% raw, 14.0 -> 7.7% at
 64 sims, 12.0 -> 5.7% at 800 (19 fixed / 0 broken at both search budgets);
 near-end 31.5 -> 7-9%; deep 10.2 -> 7.3% (64) and 7.7 -> 5.3% (800), p 0.016 /

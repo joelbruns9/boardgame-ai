@@ -57,7 +57,6 @@ from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
 import hashlib
 import json
-import math
 from pathlib import Path
 import random
 import time
@@ -546,21 +545,33 @@ def write_readings(path: Path, mode: str, cases: list[Case], readings: list[Read
             handle.write(json.dumps(row) + "\n")
 
 
-#: Per-case metrics `compare` pairs: binary ones are compared by discordant
-#: pairs (exact McNemar), all by a game-clustered bootstrap of the paired
-#: difference.
+#: Per-case metrics `compare` pairs. Inference is per GAME: a game-clustered
+#: bootstrap interval and a game-level sign-flip p-value. Binary metrics also
+#: report their fixed/broken counts, as description only -- a case-level McNemar
+#: test treated a game's correlated positions as independent (review of
+#: 8014a6c, #5: 20 fixes in one game read p = 2e-6).
 PAIRED_METRICS = ("found_win", "blunder", "trap_pick", "abs_error")
 
 
-def _mcnemar(only_a: int, only_b: int) -> float:
-    """Exact two-sided McNemar p-value from the discordant counts."""
+def _game_signflip_p(diffs_by_game: dict, *, draws: int, rng: random.Random) -> float:
+    """Two-sided p-value for "no paired difference", resampling unit the GAME.
 
-    n = only_a + only_b
-    if n == 0:
+    Under the null, A and B are exchangeable within each game, so each game's
+    summed difference is as likely negated. Monte Carlo over sign flips; the
+    +1s keep the estimate a valid p-value. Assumes games are independent of
+    each other, not cases."""
+
+    totals = [sum(g) for g in diffs_by_game.values()]
+    observed = abs(sum(totals))
+    nonzero = [t for t in totals if t]
+    if not nonzero or observed == 0.0:
         return 1.0
-    k = min(only_a, only_b)
-    tail = sum(math.comb(n, i) for i in range(k + 1)) / 2 ** n
-    return min(1.0, 2 * tail)
+    hits = 0
+    for _ in range(draws):
+        flipped = sum(t if rng.random() < 0.5 else -t for t in nonzero)
+        if abs(flipped) >= observed - 1e-12:
+            hits += 1
+    return (hits + 1) / (draws + 1)
 
 
 def _cluster_bootstrap(diffs_by_game: dict, *, draws: int, rng: random.Random) -> tuple:
@@ -613,11 +624,12 @@ def compare(a_path: Path, b_path: Path, *, draws: int = 2000, seed: int = 0) -> 
                 "a": sum(float(x) for x, _, _ in pairs) / len(pairs),
                 "b": sum(float(y) for _, y, _ in pairs) / len(pairs),
                 "diff_ci95": [low, high],
+                "game_signflip_p": _game_signflip_p(by_game, draws=draws, rng=rng),
             }
             if metric != "abs_error":
                 only_a = sum(1 for x, y, _ in pairs if x and not y)
                 only_b = sum(1 for x, y, _ in pairs if y and not x)
-                stats.update(only_a=only_a, only_b=only_b, mcnemar_p=_mcnemar(only_a, only_b))
+                stats.update(only_a=only_a, only_b=only_b)
             entry[metric] = stats
         report["modes"].setdefault(mode, {})[cls] = entry
     return report

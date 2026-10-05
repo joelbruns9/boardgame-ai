@@ -79,8 +79,10 @@ def test_the_overlay_is_well_formed_and_resumes(overlay_file):
     out, checkpoint, buffer = overlay_file
     rows = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
     assert rows[0]["kind"] == "header"
+    assert rows[0]["schema"] == tr.SCHEMA >= 2
     for row in rows[1:]:
         assert row["reason"] in tr.REASONS
+        assert "root_outlook" in row  # None: the tiny test net has no W4 head
         assert sum(row["policy"].values()) == pytest.approx(1.0, abs=1e-6)
         assert -1.0 <= row["root_value"] <= 1.0
     # A second run skips everything already written.
@@ -117,3 +119,37 @@ def test_derivation_applies_the_overlay_identically_in_both_backends(overlay_fil
         # Every re-searched move is emitted, cheap or not.
         assert set(entries) <= {e.move_index for e in rust_rows}
     assert applied == sum(len(overlay[(r.iteration, r.seed)]) for r in touched)
+
+
+def test_w4_trains_toward_the_re_searched_outlook(records):
+    """Review of 8014a6c, #3: W4's outcome target is built from the outlook,
+    not the scalar, so a re-searched row must carry the new search's outlook
+    -- and a row from a biased (lambda > 0) search must not refuse it."""
+
+    from dataclasses import replace
+
+    from .dataset import apply_reanalysis, collate, usable_root_outlook
+    from .train import value_targets
+
+    example = replace(examples_from_record(records[0])[6], search_lambda=0.4)
+    policy = {int(a): 1.0 / len(example.legal) for a in example.legal}
+
+    def outcome(outlook):
+        row = apply_reanalysis(example, {"policy": policy, "root_value": 0.0,
+                                         "root_outlook": outlook})
+        assert row.search_lambda == 0.0
+        assert usable_root_outlook(row) is not None
+        targets = value_targets(collate([row]), outlook_bootstrap=0.5,
+                                hierarchical=True)
+        return targets["hier_outcome"][0]
+
+    winning = outcome([0.3, 0.3, 0.3, 0.0, 0.0, 0.1, 0.0])
+    losing = outcome([0.0, 0.1, 0.0, 0.3, 0.3, 0.3, 0.0])
+    assert float(winning[0] - losing[0]) == pytest.approx(0.5 * 0.8, abs=1e-6)
+
+
+def test_an_overlay_without_outlooks_is_refused(tmp_path):
+    old = tmp_path / "old.jsonl"
+    old.write_text(json.dumps({"kind": "header", "schema": 1}) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="schema 1"):
+        tr.load_overlay(old)
