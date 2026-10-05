@@ -14,6 +14,13 @@ reveal_trap / forced_loss / predecessor -- while `ordinary` calibration does
 not get worse. Validation loss is printed but is NOT the judge: uniform
 validation rows are exactly what priority sampling shows less often.
 
+G0 reservation: every game G0 seals (`tactical_suite.sealed`) is dropped
+BEFORE derivation, the count is recorded, and the derived rows are asserted
+free of sealed games -- so an acceptance score on `--split sealed` never comes
+from a game either arm trained on. Harvest G0 cases from iterations the
+starting checkpoint never trained on (candidate_0060 saw iterations <= 60), or
+its own training contaminates both arms alike.
+
 Memory: ~13 KB per row, ~22k rows per run07 iteration -- a 10-iteration window
 is ~3 GB.
 """
@@ -29,6 +36,7 @@ import torch
 
 from .buffer import read_records
 from .dataset import RETAIN_PROOFS_PER_GAME_DEFAULT, derive_records_rust
+from .tactical_suite import SEALED_FRACTION, sealed
 from .train import (
     VALUE_TARGET_CONTRACT_DEFAULT,
     VALUE_TARGET_CONTRACTS,
@@ -65,14 +73,26 @@ def _iterations(text: str) -> list[int]:
     return list(range(int(lo), int(hi or lo) + 1))
 
 
-def derive_window(buffers_dir: Path, iterations: list[int], retain: int, log=print) -> list:
+def derive_window(
+    buffers_dir: Path, iterations: list[int], retain: int, log=print
+) -> tuple[list, int]:
+    """`(examples, reserved_games)`: the window's rows with every G0-sealed
+    game left out before it is derived."""
+
     examples = []
+    reserved = 0
     for iteration in iterations:
         records = read_records(buffers_dir / f"iter_{iteration:04d}.jsonl")
-        for rows, _stats in derive_records_rust(records, retain_proofs_per_game=retain):
+        kept = [r for r in records if not sealed(r.iteration, r.seed)]
+        reserved += len(records) - len(kept)
+        for rows, _stats in derive_records_rust(kept, retain_proofs_per_game=retain):
             examples.extend(rows)
-        log(f"derived iteration {iteration}: {len(examples)} rows so far")
-    return examples
+        log(f"derived iteration {iteration}: {len(examples)} rows so far, "
+            f"{reserved} sealed games withheld")
+    leaked = {(e.iteration, e.game_key) for e in examples if sealed(e.iteration, e.game_key)}
+    if leaked:
+        raise AssertionError(f"{len(leaked)} G0-sealed games reached the training window")
+    return examples, reserved
 
 
 def run(args) -> dict:
@@ -82,7 +102,9 @@ def run(args) -> dict:
     load_checkpoint(args.checkpoint, model, checkpoint=checkpoint)
     model.to(args.device)
 
-    examples = derive_window(args.buffers_dir, _iterations(args.iterations), args.retain_proofs_per_game)
+    examples, reserved = derive_window(
+        args.buffers_dir, _iterations(args.iterations), args.retain_proofs_per_game
+    )
     train_examples, val_examples = stable_game_split(
         examples, RUN07["val_fraction"], RUN07["val_split_salt"]
     )
@@ -126,6 +148,10 @@ def run(args) -> dict:
         "init": str(args.checkpoint),
         "iterations": args.iterations,
         "rows": {"train": len(train_examples), "val": len(val_examples)},
+        # The G0 reservation this run honoured: its acceptance cases must be
+        # read with `--split sealed` from the same hash.
+        "g0_sealed_games_withheld": reserved,
+        "g0_sealed_fraction": SEALED_FRACTION,
         "steps": args.steps,
         "seed": args.seed,
         "value_target_contract": args.value_target_contract,

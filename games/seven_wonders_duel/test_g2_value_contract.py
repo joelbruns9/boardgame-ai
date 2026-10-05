@@ -195,6 +195,18 @@ def test_the_utility_loss_is_minimised_at_the_proved_expectation():
     assert float(off) > float(on)
 
 
+def test_the_utility_loss_keeps_its_gradient_when_confidently_wrong():
+    """Review finding 8: a proof saying +0.8 against a head that puts ~all
+    mass on loss must still push it, and the loss must stay finite."""
+
+    logits = torch.tensor([[-40.0, -40.0, 40.0]], requires_grad=True)
+    loss = _utility_loss(torch.log_softmax(logits, dim=-1), torch.tensor([0.8]))
+    assert torch.isfinite(loss).all()
+    loss.sum().backward()
+    assert logits.grad[0, 0] < -0.1  # raise P(win)
+    assert logits.grad[0, 2] > 0.1  # lower P(loss)
+
+
 def test_validation_is_unchanged_by_the_contract(batch):
     model = _hier_model()
     outputs = model(batch)

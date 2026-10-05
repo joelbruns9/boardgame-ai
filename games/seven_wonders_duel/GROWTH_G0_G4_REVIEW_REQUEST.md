@@ -137,3 +137,35 @@ RICCP harness (GPU, minutes): `runs/seven_wonders_duel/riccp_923216750_review/g4
 3. G2's target contract, including the owner's no-masking decision.
 4. G0 is a fit instrument for judging G3.
 5. G3 is ready for the offline A/B as written.
+
+
+## Response to the review of 6ab4342 (2026-10-05)
+
+Review: `reviews/sevenwd-growth-g0-g4-6ab4342.md`. Every finding was checked
+against the code; all eight hold and are fixed. Three of them were my own
+statements written down as intended (the retained Library seed, the "2 x
+mass" regret bound, a cap test that asserted a tautology) -- retracted where
+they were written.
+
+| # | finding | verdict | fix | regression test |
+|---|---|---|---|---|
+| 1 | combine backups change the scalar but not the outlook | valid | first expansion passes the same-operator outlook (offer-weighted mix / best option); later backups through a combine node DROP that simulation's outlook; a proof reset of a root edge resets its outlook sum | `a_library_offer_passes_up_a_coherent_outlook`, `a_max_backup_drops_the_outlook_it_no_longer_describes` (Rust) |
+| 2 | stale in-flight settlement corrupts a proven ancestor | valid (needs >1 leaf in flight without conflict-free waves -- the advisor's setting) | `backup` treats a proven node on the path as authoritative: its exact value is what it and everything above receive | `a_stale_settlement_cannot_corrupt_a_proven_node`, both orders |
+| 3 | G0-sealed games can enter G3 training | valid | `g3_offline_ab.py` drops sealed games before derivation, asserts none reached the window, records the count | via `derive_window`'s assertion |
+| 4 | the cap does not bound draw frequency | valid (clip-then-renormalise: one row of 1,000 drew 700x) | water-filled in probability space; max draw rate `share + (1-share) cap` = 1.7x uniform | `test_the_bound_holds_for_sparse_and_proof_heavy_signals` |
+| 5 | the synthetic Library seed stays in the node mean | valid | attaching option children resets a parent's stats to the combined value | `a_forced_library_seed_is_replaced_by_the_option_value` |
+| 6 | proof cutoffs fire under specialist utility | valid | per-search `Arena::tactics` (switch on AND bias inactive) gates `make_child` | `a_non_proving_search_marks_nothing_proven` |
+| 7 | "no detected loss" read as "safe" | valid | `tactical_suite` docs/comments: exposure diagnostic, not regret; the 2 x mass claim removed | doc change |
+| 8 | the utility-loss clamp kills gradients when confidently wrong | valid | logaddexp on the head's log-probabilities, no clamp | `test_the_utility_loss_keeps_its_gradient_when_confidently_wrong` |
+
+Design answers accepted as given; the no-masking and certain-win-type
+qualifications are now in `MODEL_GROWTH_PLAN.md` (G2).
+
+After the fixes: Rust lib tests pass except `encoder_feature_counts_match_schema`,
+which fails identically without these changes (it needs the control table
+the Python conftest installs); Python: exact tactics, tactical suite, priority
+sampling, G2, docs, Phase D, F4 boundary, PUCT root, advisor adapter and
+specialist league files -- 265 + 10 passed. RICCP harness: bit-identical
+values to before the fixes.
+Self-play throughput vs exact tactics off after the fixes: +1.5 / -3.7 / +0.4%
+per pair (3 x 32 games per arm), i.e. unchanged from before them.

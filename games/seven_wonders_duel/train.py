@@ -107,10 +107,16 @@ def _utility_loss(log_probs: torch.Tensor, utility: torch.Tensor) -> torch.Tenso
     cross-entropies beside it.
     """
 
-    probs = log_probs.float().exp()
-    predicted = (probs[:, 0] + 0.5 * probs[:, 1]).clamp(1e-6, 1.0 - 1e-6)
+    # Both logs straight from the head's log-probabilities with logsumexp:
+    # log p = log(P(win) + P(draw)/2), log(1-p) = log(P(loss) + P(draw)/2).
+    # A clamp on p instead had zero gradient exactly where the network is
+    # most confidently wrong against the proof (review finding 8).
+    log_probs = log_probs.float()
+    half_draw = log_probs[:, 1] + math.log(0.5)
+    log_p = torch.logaddexp(log_probs[:, 0], half_draw)
+    log_not_p = torch.logaddexp(log_probs[:, 2], half_draw)
     target = ((1.0 + utility.float()) / 2.0).clamp(0.0, 1.0)
-    return -(target * predicted.log() + (1.0 - target) * (1.0 - predicted).log())
+    return -(target * log_p + (1.0 - target) * log_not_p)
 
 
 def value_targets(

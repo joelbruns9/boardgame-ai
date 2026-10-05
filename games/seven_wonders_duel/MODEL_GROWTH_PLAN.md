@@ -258,7 +258,15 @@ place; tests in `test_g2_value_contract.py`.
   fast moves are not newly retained (G1's cap only).
 - Deviation from the bullet above: a proof does not MASK W4's type. The
   realised type given the realised outcome is still a valid sample of that
-  conditional; masking would drop type supervision on ~26% of rows.
+  conditional; masking would drop type supervision on ~26% of rows. **Qualified
+  after review (6ab4342):** that conditional is the BEHAVIOUR policy's
+  P(type | outcome), not the type distribution under optimal play; joined to a
+  proof-trained outcome marginal it mixes policies (on a proved win the
+  realised loss-type conditional may have zero true mass). Kept as auxiliary
+  supervision -- do not call the joint "proof-calibrated". Likewise a
+  certain-win type label is ROUTE supervision (a type the winner could force
+  along the recorded line), not proof that every winning line has that type,
+  and must not be read as an exact specialist utility.
 - Measured on run07 iters 60 / 100 (1,000 games each, G1 cap 4): 18,384 /
   18,491 rows; exact proofs 1,186 / 1,298; expectimax 3,804 / 3,909; certain
   wins 306 / 347 (types civ/sci/mil 93/121/92 and 133/132/82; 86-90% also have a
@@ -347,6 +355,19 @@ only the tactical leaf. Validate correctness broadly and measure native
 throughput before default-on. Difference from W11 (null): exact values, never a
 rolled-forward NN evaluation.
 
+## Review of G2 / G4 / G4b / G0 / G3 at 6ab4342 (2026-10-05)
+
+`reviews/sevenwd-growth-g0-g4-6ab4342.md`: eight findings, all verified and
+fixed; response in `GROWTH_G0_G4_REVIEW_REQUEST.md`. What changed in meaning:
+combine nodes now pass up a coherent outlook (first expansion) or none (later
+backups); a proven node is authoritative for stale in-flight settlements; the
+Library offer's synthetic seed is replaced at attach; proofs are off under a
+specialist leaf bias; G0 "trap"/"blunder" are exposure diagnostics, not regret;
+G3's cap is a probability-space bound (max 1.7x uniform at the defaults);
+G3's offline A/B withholds G0-sealed games; the expectimax utility loss uses
+logsumexp. RICCP numbers were unchanged by the fixes (none of the defect paths
+fired in those two trees).
+
 ## G4b -- Pending-choice expansion for Great Library and Mausoleum (owner decision 2026-10-02)
 
 The net values **pending-choice** positions poorly (RICCP retrieval: 3.9% on a
@@ -419,8 +440,9 @@ under a specialist leaf bias and at the root:
   and `RustPuctSearch.tactics_metrics()`).
 - Tests: `test_exact_tactics.py` (G4b / G8.0 sections), passing.
 - RICCP (run07 iter 60, vs full G4 without G4b): Library Q at ~1k 45-53% (was
-  47-48%), ~4k 51.9-53.1% (was 50.5-50.8%; ~1 pt over the true 51.4% -- the
-  predicted max optimism), 16k 51.8%; University root ~4k 56-58% (was 59-62%),
+  47-48%), ~4k 51.9-53.1% (was 50.5-50.8%; ~1 pt over the true 51.4% --
+  attributed at the time to the predicted max optimism; the review showed
+  bookkeeping could also contribute, see the review-fix note), 16k 51.8%; University root ~4k 56-58% (was 59-62%),
   Build University top in 0/3 seeds; seconds per ~4k sims 3.8-5.2 (was
   1.8-2.6, baseline 4.8-6.5) -- each expansion costs one row per option.
 - Self-play vs off (laptop, 3 x 32 games per arm): ~-4% sims/s (+6.5 / -6.0 /

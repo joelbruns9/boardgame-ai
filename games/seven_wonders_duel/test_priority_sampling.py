@@ -35,11 +35,29 @@ def test_the_mixture_is_a_distribution_with_a_uniform_floor_and_a_cap():
         assert p.sum() == pytest.approx(1.0)
         # Every row keeps at least its uniform share...
         assert p.min() >= share / n - 1e-15
-        # ...and no row's priority part exceeds `cap` times the average one.
-        capped = np.minimum(prio, cap)
-        assert p.max() <= share / n + (1 - share) * cap / capped.sum() + 1e-12
+        # ...and none is drawn more than share + (1 - share) * cap times uniform.
+        assert p.max() * n <= share + (1 - share) * cap + 1e-9
     uniform = ps.mixture(ps.priorities(signals), uniform_share=1.0)
     assert np.allclose(uniform, 1 / len(uniform))
+
+
+def test_the_bound_holds_for_sparse_and_proof_heavy_signals():
+    """The review's counterexample: one surprising row among 1,000 drew
+    700x uniform under clip-then-renormalise."""
+
+    n = 1000
+    surprise = np.zeros(n)
+    surprise[0] = 1.0
+    sparse = ps.Signals(surprise, np.full(n, np.nan), np.zeros(n, dtype=bool))
+    for signals in (
+        sparse,
+        ps.Signals(surprise, np.full(n, np.nan), np.arange(n) % 100 == 0),
+        ps.Signals(surprise, np.full(n, np.nan), np.ones(n, dtype=bool)),
+    ):
+        p = ps.mixture(ps.priorities(signals), uniform_share=0.3, cap=2.0)
+        assert p.sum() == pytest.approx(1.0)
+        assert p.max() * n <= 1.7 + 1e-9
+        assert p.min() * n >= 0.3 - 1e-9
 
 
 def test_proof_rows_are_drawn_at_the_cap():

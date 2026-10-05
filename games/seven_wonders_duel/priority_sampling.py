@@ -121,20 +121,52 @@ def priorities(signals: Signals, cap: float = CAP_DEFAULT) -> np.ndarray:
     return np.where(signals.proof, np.maximum(prio, cap), prio)
 
 
+def _waterfill(prio: np.ndarray, limit: float) -> np.ndarray:
+    """A distribution proportional to `prio` with no entry above `limit`.
+
+    Entries that would exceed the limit are fixed at it and the rest are
+    re-scaled, until none exceeds it. When the rows with positive priority
+    cannot hold all the mass even at the limit (a few surprising rows among
+    many zeros), the remainder goes to every row in proportion to its
+    headroom, so the limit still holds. Needs `limit * len(prio) >= 1`.
+    """
+
+    weights = np.maximum(np.asarray(prio, dtype=float), 0.0)
+    out = np.zeros_like(weights)
+    free = weights > 0
+    remaining = 1.0
+    while remaining > 0 and free.any():
+        share = remaining * weights / weights[free].sum()
+        over = free & (share > limit)
+        if not over.any():
+            out[free] = share[free]
+            remaining = 0.0
+            break
+        out[over] = limit
+        remaining -= limit * over.sum()
+        free &= ~over
+    if remaining > 1e-15:
+        headroom = limit - out
+        out += remaining * headroom / headroom.sum()
+    return out
+
+
 def mixture(prio: np.ndarray, *, uniform_share: float = UNIFORM_SHARE_DEFAULT,
             cap: float = CAP_DEFAULT) -> np.ndarray:
-    """Sampling probabilities: `uniform_share` uniform plus the rest in
-    proportion to `prio` capped at `cap`. `prio` is relative to the mean, as
-    `priorities` returns it, so the cap is "`cap` x the mean priority". Sums
-    to 1."""
+    """Sampling probabilities: `uniform_share` uniform plus the rest by
+    priority, where no row's priority part may exceed `cap` times its uniform
+    share. The bound is in PROBABILITY space -- water-filled, not clipped then
+    re-normalised (that let one surprising row among a thousand draw ~700x
+    uniform; review finding 4) -- so the most any row is drawn is
+    `uniform_share + (1 - uniform_share) * cap` times uniform (1.7x at the
+    defaults). Sums to 1."""
 
     if not 0.0 <= uniform_share <= 1.0:
         raise ValueError("uniform_share must be in [0, 1]")
     if cap < 1.0:
-        raise ValueError("cap must be >= 1 (it is relative to the mean)")
+        raise ValueError("cap must be >= 1 (it is relative to uniform)")
     n = len(prio)
-    capped = np.minimum(prio, cap)
-    return uniform_share / n + (1.0 - uniform_share) * capped / capped.sum()
+    return uniform_share / n + (1.0 - uniform_share) * _waterfill(prio, cap / n)
 
 
 def sampling_report(probabilities: np.ndarray, signals: Signals) -> dict:

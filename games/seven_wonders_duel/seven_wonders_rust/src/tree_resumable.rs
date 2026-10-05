@@ -134,10 +134,12 @@ impl Node {
         }
     }
 
-    /// A non-root node, checked for an exact immediate win when G4 is on.
-    fn make_child(state: GameState) -> Self {
+    /// A non-root node, checked for a forced result when this search proves
+    /// (`Arena::tactics`: exact tactics on AND no specialist leaf bias -- a
+    /// win/loss proof is not a proof of a shaped specialist utility).
+    fn make_child(state: GameState, tactics: bool) -> Self {
         let mut node = Self::make(state);
-        if !node.terminal {
+        if tactics && !node.terminal {
             node.proven = crate::tactics::proven_value(&node.state);
         }
         node
@@ -176,6 +178,8 @@ pub struct Arena {
     /// instead of sampling the 3-of-5 draw. Set once per search, from the
     /// exact-tactics switch and the leaf bias.
     library_offers: bool,
+    /// G4: this search proves nodes (exact tactics on, leaf bias inactive).
+    tactics: bool,
     /// G4b: Library offer nodes built in this search.
     library_offer_nodes: usize,
 }
@@ -191,6 +195,7 @@ impl Arena {
             root_id: 0,
             library_afterstates: HashMap::new(),
             library_offers: false,
+            tactics: false,
             library_offer_nodes: 0,
         }
     }
@@ -517,7 +522,7 @@ fn closed_child(arena: &mut Arena, node_id: NodeId, edge_idx: usize, rng: &mut R
     child_state
         .apply_with_chance(&action, &outcomes)
         .expect("sampled chance outcome must be valid");
-    let child_id = arena.push(Node::make_child(child_state));
+    let child_id = arena.push(Node::make_child(child_state, arena.tactics));
     arena.nodes[node_id].edges[edge_idx].children.push((
         key,
         Child {
@@ -636,8 +641,32 @@ fn clear_incomplete(arena: &mut Arena, pending: &mut PendingSimulation) {
     pending.has_incomplete = false;
 }
 
-fn backup(arena: &mut Arena, pending: PendingSimulation, value_p0: f64) {
+/// What became of a simulation's leaf outlook on its way to the root.
+#[derive(Clone, Copy, Debug)]
+enum OutlookFate {
+    /// Nothing changed the scalar: the leaf's own outlook still describes it.
+    Leaf,
+    /// A proven node replaced the scalar with its exact value; this is the
+    /// matching witness outlook.
+    Exact(Outlook),
+    /// A combine node (G4b) replaced the scalar with a max / offer formula
+    /// over options whose outlooks are not kept: no outlook describes the
+    /// value any more, so this simulation contributes none (review finding 1).
+    Dropped,
+}
+
+/// The value that reached the root, and whether something replaced it.
+#[derive(Clone, Copy, Debug)]
+struct BackupFate {
+    value_p0: f64,
+    replaced: bool,
+    outlook: OutlookFate,
+}
+
+fn backup(arena: &mut Arena, pending: PendingSimulation, value_p0: f64) -> BackupFate {
     let mut value_p0 = value_p0;
+    let mut replaced = false;
+    let mut outlook = OutlookFate::Leaf;
     let leaf = &mut arena.nodes[pending.leaf_id];
     leaf.visits += 1;
     leaf.value_sum_p0 += value_p0;
@@ -651,16 +680,28 @@ fn backup(arena: &mut Arena, pending: PendingSimulation, value_p0: f64) {
             edge.visits += 1;
             edge.value_sum_p0 += value_p0;
         }
-        // G4b: an option-expanded node reports its best option's CURRENT Q --
-        // refined where search went below it, the cached network value
-        // elsewhere -- so the max is recomputed rather than locked in.
+        // G4b: an option-expanded node reports its options' CURRENT combined
+        // Q -- refined where search went below, cached elsewhere -- so the max
+        // is recomputed rather than locked in.
         if let Some((_, combined)) = arena.combined_value(step.node_id) {
             value_p0 = combined;
+            replaced = true;
+            outlook = OutlookFate::Dropped;
+        }
+        // A proven node is authoritative for every settlement through it,
+        // including one selected BEFORE the proof appeared (an earlier
+        // in-flight leaf): its exact value, not the stale estimate, is what
+        // its own statistics and everything above receive (review finding 2).
+        if let Some((exact, witness)) = arena.nodes[step.node_id].proven {
+            value_p0 = exact;
+            replaced = true;
+            outlook = OutlookFate::Exact(witness);
         }
         let node = &mut arena.nodes[step.node_id];
         node.visits += 1;
         node.value_sum_p0 += value_p0;
     }
+    BackupFate { value_p0, replaced, outlook }
 }
 
 fn binomial(n: usize, k: usize) -> f64 {
@@ -870,33 +911,40 @@ fn solve_node(arena: &Arena, node_id: NodeId) -> Option<(f64, Outlook)> {
 /// deterministic edge into a settled child, so no stale network estimate is
 /// averaged into either afterwards. Values here are RAW; callers run this
 /// only when the search's leaf bias is inactive, where raw is the utility.
-fn propagate_proofs(arena: &mut Arena, path: &[PathStep]) -> usize {
+/// `(nodes solved, root edge reset)`: the second is `(root edge, witness)`
+/// when a deterministic ROOT edge's statistics were reset to an exact value,
+/// so the session can reset that edge's outlook sum to match.
+fn propagate_proofs(arena: &mut Arena, path: &[PathStep]) -> (usize, Option<(usize, Outlook)>) {
     let mut solved = 0;
+    let mut root_reset = None;
     let Some(root_id) = path.first().map(|step| step.node_id) else {
-        return solved;
+        return (solved, root_reset);
     };
     for step in path.iter().rev() {
-        let Some((child_value, _)) = arena.nodes[step.chance_child_id].exact() else {
-            return solved;
+        let Some((child_value, child_outlook)) = arena.nodes[step.chance_child_id].exact() else {
+            return (solved, root_reset);
         };
         {
             let edge = &mut arena.nodes[step.node_id].edges[step.edge_id];
             if edge.specs.is_empty() {
                 edge.value_sum_p0 = edge.visits as f64 * child_value;
+                if step.node_id == root_id {
+                    root_reset = Some((step.edge_id, child_outlook));
+                }
             }
         }
         if step.node_id == root_id || arena.nodes[step.node_id].exact().is_some() {
-            return solved;
+            return (solved, root_reset);
         }
         let Some((value, outlook)) = solve_node(arena, step.node_id) else {
-            return solved;
+            return (solved, root_reset);
         };
         let node = &mut arena.nodes[step.node_id];
         node.proven = Some((value, outlook));
         node.value_sum_p0 = node.visits as f64 * value;
         solved += 1;
     }
-    solved
+    (solved, root_reset)
 }
 
 /// F4.5 semantic-safe forced-child expansion: evaluate all materialized children
@@ -1087,7 +1135,7 @@ fn materialize_forced_root(
                     child_state
                         .apply_with_chance(&action, &outcomes)
                         .expect("enumerated outcome must be valid");
-                    Node::make_child(child_state)
+                    Node::make_child(child_state, arena.tactics)
                 }
             };
             if library.is_some() {
@@ -1218,7 +1266,7 @@ fn materialize_paired_age_deals(
             child_state
                 .apply_with_chance(&action, outcomes)
                 .expect("paired AgeDeal outcome must be valid for every root action");
-            let child_id = arena.push(Node::make_child(child_state));
+            let child_id = arena.push(Node::make_child(child_state, arena.tactics));
             nodes.push(child_id);
             arena.nodes[root_id].edges[edge_idx].children.push((
                 key.clone(),
@@ -1747,12 +1795,30 @@ impl SearchSession {
             && !self.cfg.leaf_bias.is_active()
             && self.arena.nodes[pending.leaf_id].exact().is_some())
             .then(|| pending.path.clone());
-        backup(&mut self.arena, pending, utility);
+        let fate = backup(&mut self.arena, pending, utility);
         if let Some(path) = solver_path {
-            self.metrics.solved_nodes += propagate_proofs(&mut self.arena, &path);
+            let (solved, root_reset) = propagate_proofs(&mut self.arena, &path);
+            self.metrics.solved_nodes += solved;
+            if let Some((edge, witness)) = root_reset {
+                // The edge's scalar is now exact; its outlook sum must say
+                // the same thing, or the panel's split contradicts its Q.
+                let visits = self.edge_outlook_visits[edge] as f64;
+                for k in 0..7 {
+                    let reset = visits * witness[k];
+                    self.outlook_sum[k] += reset - self.edge_outlook_sum[edge][k];
+                    self.edge_outlook_sum[edge][k] = reset;
+                }
+            }
         }
-        self.unshaped_sum += value_p0;
+        // Replacement happens only in unbiased searches (proofs and combine
+        // nodes are off under a leaf bias), where utility IS the raw value.
+        self.unshaped_sum += if fate.replaced { fate.value_p0 } else { value_p0 };
         self.unshaped_visits += 1;
+        let outlook = match fate.outlook {
+            OutlookFate::Leaf => outlook,
+            OutlookFate::Exact(witness) => Some(witness),
+            OutlookFate::Dropped => None,
+        };
         if let Some(o) = outlook {
             for k in 0..7 {
                 self.outlook_sum[k] += o[k];
@@ -1829,7 +1895,7 @@ impl SearchSession {
                 wave.option_children.push((leaf_id, index, existing, false));
                 continue;
             }
-            let child_id = self.arena.push(Node::make_child(child_state));
+            let child_id = self.arena.push(Node::make_child(child_state, self.arena.tactics));
             if let Some(key) = key {
                 self.arena.library_afterstates.insert(key, child_id);
             }
@@ -1901,21 +1967,70 @@ impl SearchSession {
                 node.combine = Combine::Max;
             }
         }
+        // A parent that already carries statistics -- a Library offer node
+        // seeded by forced root expansion from a network read of its
+        // five-option state -- has them replaced by the options' combined
+        // value now that the options exist. Otherwise the artificial seed
+        // stays in the mean its incoming chance edge reads (review finding 5).
+        let mut parents: Vec<NodeId> = wave.option_children.iter().map(|&(p, ..)| p).collect();
+        parents.sort_unstable();
+        parents.dedup();
+        for parent in parents {
+            if self.arena.nodes[parent].visits == 0 {
+                continue;
+            }
+            if let Some((_, combined)) = self.arena.combined_value(parent) {
+                let node = &mut self.arena.nodes[parent];
+                node.value_sum_p0 = node.visits as f64 * combined;
+            }
+        }
         Ok(())
     }
 
-    /// G4b: the value an option-expanded leaf passes up on its first visit:
-    /// its best option's value, with that option's outlook.
+    /// G4b: the value an option-expanded leaf passes up on its first visit,
+    /// with the outlook combined by the SAME operator: the best option's for
+    /// a max node, the offer-weighted mixture for a Library offer (review
+    /// finding 1). No outlook when any option lacks one.
     fn option_leaf_value(
         &self,
         leaf_id: NodeId,
         rows: &HashMap<NodeId, (f64, Vec<f64>, Option<Outlook>)>,
     ) -> Option<(f64, Option<Outlook>)> {
-        let (edge_idx, value) = self.arena.combined_value(leaf_id)?;
-        let (_, child) = self.arena.nodes[leaf_id].edges[edge_idx].children.first()?;
-        let outlook = match rows.get(&child.node_id) {
-            Some((_, _, outlook)) => *outlook,
-            None => self.arena.nodes[child.node_id].exact().map(|(_, o)| o),
+        let (best_edge, value) = self.arena.combined_value(leaf_id)?;
+        let node = &self.arena.nodes[leaf_id];
+        let option_outlook = |edge_idx: usize| -> Option<Outlook> {
+            let (_, child) = node.edges[edge_idx].children.first()?;
+            match rows.get(&child.node_id) {
+                Some((_, _, outlook)) => *outlook,
+                None => self.arena.nodes[child.node_id].exact().map(|(_, o)| o),
+            }
+        };
+        let outlook = match node.combine {
+            Combine::LibraryOffer { offered } => {
+                let sign = if node.actor == 0 { 1.0 } else { -1.0 };
+                let mut ranked: Vec<(usize, f64)> = (0..node.edges.len())
+                    .map(|i| (i, self.arena.edge_q_p0(leaf_id, i)))
+                    .collect();
+                ranked.sort_by(|a, b| (sign * b.1).total_cmp(&(sign * a.1)));
+                let weights = offer_weights(ranked.len(), offered);
+                let mut mixed = [0.0; 7];
+                let mut complete = true;
+                for ((edge_idx, _), w) in ranked.iter().zip(&weights) {
+                    if *w == 0.0 {
+                        continue;
+                    }
+                    match option_outlook(*edge_idx) {
+                        Some(o) => {
+                            for k in 0..7 {
+                                mixed[k] += w * o[k];
+                            }
+                        }
+                        None => complete = false,
+                    }
+                }
+                complete.then_some(mixed)
+            }
+            _ => option_outlook(best_edge),
         };
         Some((value, outlook))
     }
@@ -2701,6 +2816,7 @@ fn begin_search_from_root_inner(
     }
     let mut arena = Arena::new(root);
     arena.library_offers = crate::tactics::enabled() && !cfg.leaf_bias.is_active();
+    arena.tactics = arena.library_offers;
     let root_id = arena.root_id;
     let root_outlook = root_evaluation.outlook_p0;
     let (raw_root_value_p0, root_priors) = (root_evaluation.value_p0, root_evaluation.priors);
@@ -2814,6 +2930,7 @@ pub fn search_closed_batched<E: Eval>(
     }
     let mut arena = Arena::new(root);
     arena.library_offers = crate::tactics::enabled() && !cfg.leaf_bias.is_active();
+    arena.tactics = arena.library_offers;
     let root_id = arena.root_id;
     let root_leaf = eval.evaluate(&arena.nodes[root_id].state)?;
     let root_outlook = root_leaf.outlook_p0;
@@ -3036,5 +3153,222 @@ mod forced_terminal_tests {
             .expect("settling cannot fail here")
             .is_empty());
         assert_eq!(settled, 5, "every settled child must be counted");
+    }
+}
+
+/// Regression tests for the external review of 6ab4342
+/// (`reviews/sevenwd-growth-g0-g4-6ab4342.md`), built from its probes but
+/// asserting the CORRECTED behaviour.
+#[cfg(test)]
+mod review_6ab4342_tests {
+    use super::*;
+    use crate::state::Setup;
+
+    fn node() -> Node {
+        let state = GameState::from_setup(
+            Setup {
+                first_player: 0,
+                available_progress_tokens: vec![0, 1, 2, 3, 4],
+                unused_progress_tokens: vec![5, 6, 7, 8, 9],
+                wonder_groups: [vec![0, 1, 2, 3], vec![4, 5, 6, 7]],
+                unused_wonders: vec![8, 9, 10, 11],
+                age_decks: [Vec::new(), (0..20).collect(), (0..20).collect(), (0..20).collect()],
+                removed_age_cards: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+                selected_guilds: Vec::new(),
+                unused_guilds: Vec::new(),
+            },
+            std::collections::VecDeque::new(),
+        );
+        let mut n = Node::make(state);
+        n.actor = 0;
+        n.legal.clear();
+        n
+    }
+
+    fn edge(action_index: usize, child: Option<usize>, value: f64) -> Edge {
+        Edge {
+            action_index,
+            prior: 1.0,
+            specs: vec![],
+            children: child
+                .map(|c| {
+                    vec![(
+                        vec![],
+                        Child { probability: Some(1.0), node_id: c, samples: 1 },
+                    )]
+                })
+                .unwrap_or_default(),
+            visits: u32::from(child.is_some()),
+            value_sum_p0: value,
+            incomplete: 0,
+            probability_weighted: false,
+            fixed_support: false,
+        }
+    }
+
+    fn step(parent: usize, edge_id: usize, child: usize) -> PathStep {
+        PathStep { node_id: parent, edge_id, chance_child_id: child }
+    }
+
+    fn pending(path: Vec<PathStep>, leaf: usize) -> PendingSimulation {
+        PendingSimulation {
+            path,
+            leaf_id: leaf,
+            root_edge: 0,
+            has_incomplete: false,
+            immediate_value: None,
+            immediate_outlook: None,
+        }
+    }
+
+    fn cfg() -> SearchConfig {
+        SearchConfig {
+            sims: 10,
+            top_k: 1,
+            c_puct: 1.0,
+            c_visit: 50.0,
+            c_scale: 1.0,
+            seed: 0,
+            force_expand_root_chance: false,
+            puct_root: true,
+            forced_playout_k: 0.0,
+            dirichlet_epsilon: 0.0,
+            dirichlet_alpha: 1.8,
+            age_deal_samples: 0,
+            double_reveal_offsets: 0,
+            round_robin_candidates: false,
+            conflict_free_waves: false,
+            leaf_bias: LeafBias::NONE,
+        }
+    }
+
+    fn outlook(v: f64) -> Outlook {
+        [(1.0 + v) / 2.0, 0.0, 0.0, (1.0 - v) / 2.0, 0.0, 0.0, 0.0]
+    }
+
+    fn utility(o: Outlook) -> f64 {
+        o[..3].iter().sum::<f64>() - o[3..6].iter().sum::<f64>()
+    }
+
+    /// Finding 2: a leaf selected before its ancestor was proven must not
+    /// drag the proven value, in either settlement order.
+    #[test]
+    fn a_stale_settlement_cannot_corrupt_a_proven_node() {
+        for stale_first in [false, true] {
+            let mut a = Arena::new(node());
+            for _ in 0..3 {
+                a.push(node());
+            }
+            a.nodes[0].legal = vec![0];
+            a.nodes[0].edges = vec![edge(0, Some(1), 0.0)];
+            a.nodes[1].legal = vec![0, 1];
+            a.nodes[1].edges = vec![edge(0, Some(2), 0.0), edge(1, Some(3), 0.0)];
+            a.nodes[2].proven = Some((1.0, outlook(1.0)));
+            let win = vec![step(0, 0, 1), step(1, 0, 2)];
+            let stale = vec![step(0, 0, 1), step(1, 1, 3)];
+            if stale_first {
+                backup(&mut a, pending(stale.clone(), 3), -1.0);
+            }
+            backup(&mut a, pending(win.clone(), 2), 1.0);
+            assert_eq!(propagate_proofs(&mut a, &win).0, 1);
+            backup(&mut a, pending(stale, 3), -1.0);
+            assert_eq!(a.nodes[1].exact().unwrap().0, 1.0);
+            assert_eq!(a.nodes[1].value_p0(), 1.0, "proven node Q, stale_first={stale_first}");
+            assert_eq!(a.edge_q_p0(0, 0), 1.0, "incoming edge Q, stale_first={stale_first}");
+        }
+    }
+
+    /// Finding 1a: a Library offer's first value and outlook use the same
+    /// operator -- five options worth [+1, -1, -1, -1, -1] offered three at
+    /// a time are worth 0.6 - 0.4 = 0.2, and so is their outlook.
+    #[test]
+    fn a_library_offer_passes_up_a_coherent_outlook() {
+        let mut a = Arena::new(node());
+        for _ in 0..6 {
+            a.push(node());
+        }
+        a.nodes[0].legal = vec![0];
+        a.nodes[0].edges = vec![edge(0, Some(1), 0.0)];
+        a.nodes[1].combine = Combine::LibraryOffer { offered: 3 };
+        a.nodes[1].legal = vec![0, 1, 2, 3, 4];
+        let mut rows = HashMap::new();
+        for i in 0..5 {
+            let v = if i == 0 { 1.0 } else { -1.0 };
+            a.nodes[1].edges.push(edge(i, Some(i + 2), v));
+            rows.insert(i + 2, (v, vec![], Some(outlook(v))));
+        }
+        let s = SearchSession::new(a, &cfg(), 2, vec![], None, 0.0).unwrap();
+        let (v, o) = s.option_leaf_value(1, &rows).unwrap();
+        assert!((v - 0.2).abs() < 1e-12);
+        assert!((utility(o.unwrap()) - 0.2).abs() < 1e-12);
+    }
+
+    /// Finding 1b: a later backup through a max node changes the scalar, so
+    /// that simulation's outlook is dropped rather than contradicting it.
+    #[test]
+    fn a_max_backup_drops_the_outlook_it_no_longer_describes() {
+        let mut a = Arena::new(node());
+        for _ in 0..3 {
+            a.push(node());
+        }
+        a.nodes[0].legal = vec![0];
+        a.nodes[0].edges = vec![edge(0, Some(1), 0.0)];
+        a.nodes[1].combine = Combine::Max;
+        a.nodes[1].legal = vec![0, 1];
+        a.nodes[1].edges = vec![edge(0, Some(2), 1.0), edge(1, Some(3), -1.0)];
+        let mut s = SearchSession::new(a, &cfg(), 2, vec![], None, 0.0).unwrap();
+        s.settle_simulation(
+            pending(vec![step(0, 0, 1), step(1, 1, 3)], 3),
+            -1.0,
+            Some(outlook(-1.0)),
+        )
+        .unwrap();
+        assert_eq!(s.arena.nodes[0].value_p0(), 1.0);
+        assert_eq!(s.outlook_visits, 0);
+        assert_eq!(utility(s.outlook_sum), 0.0);
+    }
+
+    /// Finding 5: the synthetic five-option network value seeded by forced
+    /// root expansion is replaced once the options are attached, so the
+    /// chance edge reads the offer formula alone.
+    #[test]
+    fn a_forced_library_seed_is_replaced_by_the_option_value() {
+        let mut a = Arena::new(node());
+        for _ in 0..6 {
+            a.push(node());
+        }
+        a.nodes[0].legal = vec![0];
+        a.nodes[0].edges = vec![edge(0, Some(1), 0.0)];
+        a.nodes[0].edges[0].probability_weighted = true;
+        a.nodes[1].combine = Combine::LibraryOffer { offered: 3 };
+        a.nodes[1].legal = vec![0, 1, 2, 3, 4];
+        a.nodes[1].visits = 1;
+        a.nodes[1].value_sum_p0 = 1.0; // the artificial seed
+        a.nodes[1].edges = (0..5).map(|i| edge(i, None, 0.0)).collect();
+        let mut s = SearchSession::new(a, &cfg(), 2, vec![], None, 0.0).unwrap();
+        let wave = PendingWave {
+            request_id: 0,
+            simulations: Vec::new(),
+            unique_leaf_ids: (2..7).collect(),
+            root_edges: Vec::new(),
+            option_children: (0..5).map(|i| (1, i, i + 2, true)).collect(),
+        };
+        let rows: HashMap<NodeId, (f64, Vec<f64>, Option<Outlook>)> =
+            (2..7).map(|c| (c, (0.0, vec![], Some(outlook(0.0))))).collect();
+        s.attach_option_children(&wave, &rows).unwrap();
+        assert_eq!(s.arena.nodes[1].value_p0(), 0.0);
+        backup(&mut s.arena, pending(vec![step(0, 0, 1)], 1), 0.0);
+        assert_eq!(s.arena.edge_q_p0(0, 0), 0.0);
+    }
+
+    /// Finding 6: a search that does not prove (specialist bias) never marks
+    /// a child proven, whatever the global switch says.
+    #[test]
+    fn a_non_proving_search_marks_nothing_proven() {
+        let state = node().state;
+        crate::tactics::set_enabled(true);
+        let child = Node::make_child(state, false);
+        crate::tactics::set_enabled(false);
+        assert!(child.proven.is_none());
     }
 }

@@ -20,7 +20,8 @@ class           selection                                        label
 own_win         some action forces a win this turn               winning actions
 forced_loss     every action hands the opponent a forced win     value -1
 must_block      some actions lose by force, others do not        losing actions
-reveal_trap     a revealing action can lose; a safe one exists   losing mass
+reveal_trap     a revealing action has detected forced-loss      detected loss
+                exposure; another action has none detected      exposure
 solver          the endgame solver recorded a value              that value
 predecessor     the mover's previous decision before walking     realized result
                 into a forced loss on the played line
@@ -35,6 +36,14 @@ Values are actor-relative utilities in [-1, 1] throughout.
 `--split dev` never reads a sealed game, so design work cannot leak into the
 held-out number. Report unique games, not rows -- one endgame yields many
 correlated rows.
+
+What the tactical labels do and do not certify. Every `-1` / `+1` action
+label and every loss mass is a PROOF under the bounded predicates of
+`tactics.py`. The absence of one is not: an unmarked alternative was not shown
+to lose, which is not the same as being shown not to lose (an extra turn, or a
+loss beyond the detector's horizon, is outside it). So `blunder` and
+`trap_pick` mean "chose an action with a proven / detected loss while one
+without a detected loss existed" -- an exposure diagnostic, not action regret.
 
 Selection bias, stated once: positions come from the run's own self-play, so a
 class measures failures CONDITIONAL on reaching such positions, not their
@@ -197,9 +206,11 @@ def classify_record(
         elif losing:
             add("must_block", move, actor, losing=losing)
         else:
-            # A reveal trap: some revealing action can hand the opponent a
-            # forced win in some worlds, and a provably safe action exists.
-            # (Exact: every outcome checked, `tactics.losing_mass`.)
+            # A reveal trap: some revealing action hands the opponent a forced
+            # win in some worlds (exact over every outcome, `tactics.losing_mass`),
+            # and another action has NO detected loss exposure. That second
+            # action is not thereby safe -- the detector is bounded -- so this
+            # class measures exposure, not regret.
             masses = _losing_mass(state) if state.pending_choice is None else []
             traps = {
                 a: m[0] for a, m in zip(legal, masses) if m is not None and m[1] and m[0] > 0.0
@@ -423,9 +434,9 @@ def score(cases: list[Case], readings: list[Reading]) -> dict:
                 )
         if base == "reveal_trap":
             entry["trap_pick"] = _rate(rows, lambda c, r: c.trap_mass.get(r.action, 0.0) > 0.0)
-            # Expected regret of the chosen action, in utility: a losing
-            # outcome costs at least the swing from the safe line, bounded
-            # below by 2 x mass when the safe line is not lost.
+            # Detected forced-loss exposure of the chosen action: the
+            # probability, over its reveals, that the opponent is then left a
+            # forced win. Not regret -- the alternatives are not certified.
             entry["expected_losing_mass"] = _mean(rows, lambda c, r: c.trap_mass.get(r.action, 0.0))
         if base in ("ordinary", "quiet", "predecessor"):
             entry["calibration_ece"] = _ece(rows)
