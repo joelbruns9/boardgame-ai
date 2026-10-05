@@ -106,6 +106,67 @@ default):
    regression; it need not move every class.
 7. Laptop-scale first; one matched online A/B at a time on the box.
 
+## Final run preparation (owner, 2026-10-05) -- supersedes the orders below
+
+Goal: ONE more cloud run (hopefully the last), warm-started, not random.
+
+**Cost split.** Game generation (a full search with network calls for every
+move of every game) is the only step that needs a box. Everything done to the
+existing run07 data is laptop work: correcting all 101 buffers (G1/G2/G2b) is
+~2.5 s per 1,000-game buffer (~4 min total); training on corrected rows ran
+~25 min per 2,000 steps; a full pretrain is a few hours.
+
+**What correction cannot fix** (the gap the cloud run must close):
+
+1. Tactics more than one move deep -- a move that walks into a forced loss two
+   or more moves later (the predecessor class; RICCP's University) keeps
+   run07's possibly wrong target. G2b sees one move ahead only.
+2. Reveal gambles -- G2b corrects a revealing move only when EVERY reveal
+   loses; partial-loss reveals keep run07's fan-out-starved targets (~20 pts
+   optimistic in the reviewed games).
+3. Strategic quality -- drafts, wonders, economy, plans: no exact check
+   exists; labels are as good as run07's search, and a network cannot beat its
+   teacher from the same targets.
+4. Values outside proofs -- most value targets are still the result blended
+   with run07's search value; only proof and certain-win rows are exact.
+5. Coverage -- positions run07 never reached carry no label (G12's job).
+
+**Laptop sequence** (user launches the long steps):
+
+1. Correct the buffers: derivation with G1 + G2 + G2b (all default on).
+2. Targeted reanalysis (G8.2, laptop-sized): re-search a SUBSET of buffer
+   positions with today's search (G4 on, full budget) and replace their
+   targets -- revealing moves, cheap-search moves, and decisions a few moves
+   before decisive positions. Shrinks gaps 1 and 2; doing every position would
+   cost as much as generation.
+3. G14 initialisation check on identical corrected data, equal steps and
+   holdouts: (a) candidate_0060 + fresh optimizer, (b) random init, optional
+   (c) candidate_0060 with value heads reset. Judge on sealed G0 + held-out
+   validation. (a) best -> warm start; (b) catches up -> the old weights hurt
+   and random init earns its compute; (c) best -> partial reset.
+4. Pretrain from the G14 winner over iterations 41-100 in RAM-sized windows
+   (early iterations' weaker targets down-weighted or left out), withholding
+   G0's sealed games.
+5. Score the pretrained checkpoint on sealed G0 (and against candidate_0060)
+   before renting anything.
+
+**Cloud run:** self-play from the pretrained checkpoint with G4 exact tactics
+on (labels tactics-aware natively), every move fully searched (owner decision
+11; budget still open), G2b on until its phase-out criterion is met, plus
+whichever chance-reveal items are ready. G3 off.
+
+**Open decisions:** (a) sims per move -- one compute-neutral budget (~500,
+run07 averaged ~519) vs 1,600 everywhere (~3x compute per game); G0 evidence:
+more sims help must_block tactics (7.7% blunders at 64 -> 5.7% at 800 with
+G2b) but not reveal traps (~30% at both). (b) The chance-reveal programme, in
+the order recommended 2026-10-05: G8.2 targeted reanalysis (attacks the
+unfunded-refutation cause W9 identified; feeds step 2 above) -> partial-proof
+bounds at reveals (G4 layer 2b: k of n worlds proven lost bounds the move's
+value; reuses `losing_mass`) -> the chance-capping A/B (already built, off) ->
+G8.3 afterstate value head (only after G8.2 supplies correct targets). W9-style
+reply sharing across reveal worlds is closed (four nulls). G8.4 root
+verification for the advisor any time.
+
 ## Execution order
 
 Steps 1-4 are laptop work and can overlap; 5+ need a box.
@@ -725,6 +786,13 @@ the test, not a diagnosis.
     certain wins (e.g. an extra-turn wonder uncovering a face-up winning card,
     then not taking it) stay undetected: strong players take them and the
     audit found all 54 taken. Revisit only if G0 shows otherwise.
+11. (2026-10-05) Every move in the next run is fully searched -- no fast/full
+    split. The G11 measurement step is dropped: the G2b / retraining evidence
+    already shows cheap-search targets teach near-end blunders. The budget per
+    move is still open (see Final run preparation).
+12. (2026-10-05) G2b on by default with a measured phase-out; G3 dropped (code
+    kept, off); the next run warm-starts from a laptop-pretrained checkpoint
+    (option 3), subject to the G14 check.
 
 ## Review of WORLD_CLASS_MODEL_EVOLUTION_PLAN workstreams (2026-09-30)
 
