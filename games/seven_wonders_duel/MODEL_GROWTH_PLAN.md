@@ -152,7 +152,7 @@ existing run07 data is laptop work: correcting all 101 buffers (G1/G2/G2b) is
    value |change| 0.16 (pre_decisive) / 0.07 (reveal). Caveat: re-searched with
    iter 60's network, so part of each change is a different network.
 3. G14 initialisation check on identical corrected data, equal steps and
-   holdouts: (a) candidate_0060 + fresh optimizer, (b) random init, optional
+   holdouts: (a) the base (candidate_0100, decision 13) + fresh optimizer, (b) random init, optional
    (c) candidate_0060 with value heads reset. Judge on sealed G0 + held-out
    validation. (a) best -> warm start; (b) catches up -> the old weights hurt
    and random init earns its compute; (c) best -> partial reset.
@@ -799,9 +799,19 @@ the test, not a diagnosis.
     then not taking it) stay undetected: strong players take them and the
     audit found all 54 taken. Revisit only if G0 shows otherwise.
 11. (2026-10-05) Every move in the next run is fully searched -- no fast/full
-    split. The G11 measurement step is dropped: the G2b / retraining evidence
-    already shows cheap-search targets teach near-end blunders. The budget per
-    move is still open (see Final run preparation).
+    split. The G11 measurement step is dropped. **Rationale corrected the same
+    day:** the contaminated targets G2b found, and the near-end blunders plain
+    retraining taught, came from run07's FULL 1,600-sim searches -- cheap moves
+    were never trained on as move targets (derivation drops them). The cause
+    was search without exact tactics, not a low budget. The decision stands on
+    other grounds: cheap moves still shape which positions the games reach
+    while contributing no targets, and searching every move gives ~4x the move
+    targets at a compute-neutral budget. The budget per move is still open.
+13. (2026-10-05) Base checkpoint for the final run's preparation is
+    **candidate_0100**, chosen without the arena. G0 (biased toward 100: it
+    trained on the iter 61-100 games G0's cases come from) showed much lower
+    must_block blunders under search (64 sims 11.7 -> 4.3%, deep 11.0 -> 2.4%)
+    and worse raw value in lost positions (forced_loss error 0.184 -> 0.253).
 12. (2026-10-05) G2b on by default with a measured phase-out; G3 dropped (code
     kept, off); the next run warm-starts from a laptop-pretrained checkpoint
     (option 3), subject to the G14 check.
