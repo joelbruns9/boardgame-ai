@@ -65,7 +65,10 @@ def _reveals(state, action_index: int) -> bool:
 
 def select_record(record, rng: random.Random, *, window: int, per_game_cap: int,
                   cheap_rate: float) -> list[Target]:
-    """The targets one game yields, at most `per_game_cap`, pre_decisive first."""
+    """The targets one game yields, at most `per_game_cap`, pre_decisive first.
+    Within a reason the moves are drawn at random, not earliest-first: in game
+    order a cap took the plies furthest before the FIRST decisive stretch and
+    only Age I reveals."""
 
     if sealed(record.iteration, record.seed):
         return []
@@ -95,7 +98,7 @@ def select_record(record, rng: random.Random, *, window: int, per_game_cap: int,
     chosen: list[Target] = []
     seen: set[int] = set()
     for reason, moves in (("pre_decisive", pre), ("reveal", reveals), ("cheap", cheap)):
-        for i in moves:
+        for i in rng.sample(moves, len(moves)):
             if len(chosen) >= per_game_cap:
                 return chosen
             if i in seen:
@@ -103,6 +106,14 @@ def select_record(record, rng: random.Random, *, window: int, per_game_cap: int,
             seen.add(i)
             chosen.append(Target(record.iteration, record.seed, i, reason))
     return chosen
+
+
+def _record_rng(seed: int, record) -> random.Random:
+    """Selection randomness per GAME, so a resumed run picks the same moves in
+    a half-done game as the first run did (one shared stream drifts with
+    whatever the resumed run skipped)."""
+
+    return random.Random(f"{seed}:{record.iteration}:{record.seed}")
 
 
 def _done_keys(out: Path) -> set[tuple]:
@@ -145,6 +156,7 @@ def run(
         out.write_text(json.dumps({
             "kind": "header", "schema": SCHEMA, "checkpoint": checkpoint, "sims": sims,
             "window": window, "per_game_cap": per_game_cap, "cheap_rate": cheap_rate,
+            "selection": "random-within-reason",
         }) + "\n", encoding="utf-8")
     evaluator = load_evaluator(checkpoint, device, precision)
     rng = random.Random(seed)
@@ -185,7 +197,7 @@ def run(
     for path in buffers:
         for record in read_records(path):
             targets = [
-                t for t in select_record(record, rng, window=window,
+                t for t in select_record(record, _record_rng(seed, record), window=window,
                                          per_game_cap=per_game_cap, cheap_rate=cheap_rate)
                 if (t.iteration, t.seed, t.move) not in done
             ]

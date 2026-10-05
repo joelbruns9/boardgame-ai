@@ -39,6 +39,23 @@ def test_selection_follows_its_classes_caps_and_the_g0_reservation(records):
     assert "pre_decisive" in reasons, reasons
 
 
+def test_selection_is_random_within_reason_and_reproducible_per_game(records):
+    def pick(record, seed):
+        return tr.select_record(record, tr._record_rng(seed, record), window=4,
+                                per_game_cap=2, cheap_rate=1.0)
+
+    differs_from_earliest = False
+    for record in records:
+        assert pick(record, 0) == pick(record, 0)  # resume picks the same moves
+        uncapped = tr.select_record(record, random.Random(0), window=4,
+                                    per_game_cap=999, cheap_rate=1.0)
+        pre = sorted(t.move for t in uncapped if t.reason == "pre_decisive")
+        chosen = [t.move for t in pick(record, 0) if t.reason == "pre_decisive"]
+        if len(pre) > 2 and sorted(chosen) != pre[:2]:
+            differs_from_earliest = True
+    assert differs_from_earliest
+
+
 @pytest.fixture(scope="module")
 def overlay_file(tmp_path_factory, records):
     from .train import build_model, make_checkpoint
