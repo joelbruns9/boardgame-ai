@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 import time
 
@@ -70,6 +71,8 @@ def build_model(base: Path, init: str, seed: int):
 
 
 def run(args) -> dict:
+    if args.presentations_per_row is not None and args.presentations_per_row <= 0:
+        args.presentations_per_row = None
     out_dir = args.out
     out_dir.mkdir(parents=True, exist_ok=True)
     state_path = out_dir / "progress.json"
@@ -100,12 +103,21 @@ def run(args) -> dict:
             examples, RUN07["val_fraction"], RUN07["val_split_salt"]
         )
         del examples
+        # Exposure control: a fixed number of presentations per training row
+        # (default 2) rather than a fixed step count, so a wider window does
+        # not mean more passes over each row.
+        steps = (
+            max(1, math.ceil(args.presentations_per_row * len(train_examples)
+                             / RUN07["batch_size"]))
+            if args.presentations_per_row is not None
+            else args.steps_per_window
+        )
         history, optimizer_state = train_steps(
             model,
             train_examples,
             val_examples,
             device=args.device,
-            steps=args.steps_per_window,
+            steps=steps,
             batch_size=RUN07["batch_size"],
             lr=RUN07["lr"],
             warmup_steps=RUN07["warmup_steps"] if index == 0 and optimizer_state is None else 0,
@@ -131,6 +143,8 @@ def run(args) -> dict:
         progress["history"].append({
             "window": tag,
             "rows": {"train": len(train_examples), "val": len(val_examples)},
+            "steps": steps,
+            "presentations_per_row": steps * RUN07["batch_size"] / max(1, len(train_examples)),
             "g0_sealed_games_withheld": reserved,
             "reanalysed_rows": sum(1 for e in train_examples if getattr(e, "reanalysed", False)),
             "val_total": (final.get("val") or {}).get("total"),
@@ -142,6 +156,7 @@ def run(args) -> dict:
     torch.save(make_checkpoint(model, dict(config)), final_path)
     summary = {"init": args.init, "base": str(args.base), "iterations": args.iterations,
                "window": args.window, "steps_per_window": args.steps_per_window,
+               "presentations_per_row": args.presentations_per_row,
                "tactic_labels": args.tactic_labels,
                "reanalysis_overlay": [str(p) for p in args.reanalysis_overlay or []],
                "windows": progress["history"], "checkpoint": str(final_path)}
@@ -157,7 +172,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--buffers-dir", type=Path, required=True)
     parser.add_argument("--iterations", default="41-100")
     parser.add_argument("--window", type=int, default=10, help="iterations per window")
-    parser.add_argument("--steps-per-window", type=int, default=2000)
+    parser.add_argument("--steps-per-window", type=int, default=2000,
+                        help="fixed steps per window (ignored with --presentations-per-row)")
+    parser.add_argument("--presentations-per-row", type=float, default=2.0,
+                        help="target times each training row is drawn per window; sets "
+                        "the step count from the window's row count (default 2). Pass "
+                        "a negative value to use --steps-per-window instead")
     parser.add_argument("--tactic-labels", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--reanalysis-overlay", type=Path, nargs="*", default=None)
     parser.add_argument("--retain-proofs-per-game", type=int, default=4)

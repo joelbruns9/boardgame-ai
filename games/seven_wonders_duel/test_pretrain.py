@@ -34,6 +34,7 @@ def _args(root, buffers, base, init, out_name, extra=()):
     return pretrain.build_parser().parse_args([
         "--base", str(base), "--init", init, "--buffers-dir", str(buffers),
         "--iterations", "1-2", "--window", "1", "--steps-per-window", "2",
+        "--presentations-per-row", "-1",
         "--validate-every", "1000", "--device", "cpu", "--precision", "fp32",
         "--out", str(root / out_name), *extra,
     ])
@@ -68,3 +69,16 @@ def test_resume_skips_completed_windows(setup):
     assert len(progress["completed_windows"]) == 2
     summary = pretrain.run(_args(root, buffers, base, "checkpoint", "out_resume", ("--resume",)))
     assert len(summary["windows"]) == 2  # nothing re-trained or duplicated
+
+
+def test_presentations_per_row_sets_the_step_count(setup):
+    root, buffers, base = setup
+    args = pretrain.build_parser().parse_args([
+        "--base", str(base), "--buffers-dir", str(buffers), "--iterations", "1-1",
+        "--window", "1", "--presentations-per-row", "2", "--validate-every", "1000",
+        "--device", "cpu", "--precision", "fp32", "--out", str(root / "out_ppr"),
+    ])
+    window = pretrain.run(args)["windows"][0]
+    expected = -(-2 * window["rows"]["train"] // 512)
+    assert window["steps"] == expected
+    assert window["presentations_per_row"] >= 2.0

@@ -164,7 +164,9 @@ existing run07 data is laptop work: correcting all 101 buffers (G1/G2/G2b) is
 
    Steps 3-4 BUILT 2026-10-05: `pretrain.py` (windowed, model + optimizer
    carried across windows, G2b + optional G8.2 overlay, G0-sealed games
-   withheld, resumable per window; `--init checkpoint|random|reset-value` is
+   withheld, resumable per window; steps set by `--presentations-per-row`
+   (default 2, owner 2026-10-05: wider windows, ~2 draws per row, to limit
+   overfitting on games the base already trained on); `--init checkpoint|random|reset-value` is
    the G14 axis -- run the same command three times). ~25 min per 10-iteration
    window at 2,000 steps on the laptop.
 
