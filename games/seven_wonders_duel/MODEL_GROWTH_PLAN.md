@@ -274,6 +274,17 @@ weight -- priority changes frequency only. Priority signals: policy surprise,
 search-vs-network value correction, proof membership. A/B against G1+G2 alone;
 success = G0 decisive classes improve with ordinary-state calibration unchanged.
 
+**BUILT 2026-10-04, UNTESTED** (`priority_sampling.py`, `--priority-sampling`
+off by default, `g3_offline_ab.py`, `test_priority_sampling.py`): priority =
+mean of mean-normalised policy surprise (KL target || model policy) and value
+correction (|root - model value|) from one no-gradient pass of the model about
+to train; solver / certain-win / retained rows pinned at the cap; 30% uniform,
+cap 2x; `train_steps(sample_weights=)` draws by it, loss weights untouched, and
+counts `sampled_proof_rows`. Phase D recomputes per training call and stores
+the report on the training row. Offline A/B: `g3_offline_ab.py --arm
+uniform|priority` warm-starts candidate_0060 on a re-derived window with run07
+loss settings; judge with `tactical_suite.py evaluate`.
+
 ## G4 -- Exact tactics in search (reusable proof service)
 
 Already shown causal (Library 6.94% -> 46.36%). Build natively:

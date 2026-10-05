@@ -693,6 +693,16 @@ class PhaseDConfig:
     whose mover has a guaranteed win this turn as proven -- exact value, no
     network call. Recorded so a run's manifest says which searcher it had."""
 
+    priority_sampling: bool = False
+    """G3 (`priority_sampling.py`): draw training rows 30% uniformly and 70% by
+    priority (policy surprise, search-vs-network value correction, proof
+    membership), capped at 2x the mean. Off = the historical uniform draw, the
+    A/B arm. Costs one no-gradient pass over the training rows per training
+    call."""
+
+    priority_uniform_share: float = 0.3
+    priority_cap: float = 2.0
+
     value_target_contract: str = VALUE_TARGET_CONTRACT_DEFAULT
     """G2: what every value head trains on, per proof type
     (`train.value_targets`). "g2": the flat and W4 heads share proofs, the
@@ -1284,6 +1294,10 @@ class PhaseDConfig:
     def validate(self) -> None:
         if not 0.0 <= self.short_term_value_weight < 1.0:
             raise ValueError("short_term_value_weight must be in [0, 1)")
+        if not 0.0 <= self.priority_uniform_share <= 1.0:
+            raise ValueError("priority_uniform_share must be in [0, 1]")
+        if self.priority_cap < 1.0:
+            raise ValueError("priority_cap must be >= 1")
         if self.value_target_contract not in VALUE_TARGET_CONTRACTS:
             raise ValueError(
                 f"value_target_contract must be one of {VALUE_TARGET_CONTRACTS}"
@@ -4639,6 +4653,27 @@ class PhaseDLoop:
     def optimizer_state_path(self) -> Path:
         return self.checkpoint_dir / "optimizer_state.pt"
 
+    def _priority_weights(self, model, train_examples):
+        """G3: `(sample_weights, report)` for this training call, or
+        `(None, None)` when priority sampling is off."""
+
+        if not self.config.priority_sampling or not train_examples:
+            return None, None
+        from .priority_sampling import sample_weights
+
+        started = time.monotonic()
+        model.to(self.config.device)
+        weights, report = sample_weights(
+            model,
+            train_examples,
+            self.config.device,
+            uniform_share=self.config.priority_uniform_share,
+            cap=self.config.priority_cap,
+        )
+        report["seconds"] = round(time.monotonic() - started, 1)
+        print(f"[g3] priority sampling: {report}", flush=True)
+        return weights, report
+
     def _load_optimizer_state(self) -> dict | None:
         """AdamW moments carried across self-play iterations.
 
@@ -5048,11 +5083,13 @@ class PhaseDLoop:
                 hier_value_weight=self.config.hier_value_weight,
                 hier_value_replaces_joint7=self.config.hier_value_replaces_joint7,
             )
+        weights, priority_report = self._priority_weights(model, train_examples)
         training_started = time.monotonic()
         history, optimizer_state = train_steps(
             model,
             train_examples,
             val_examples,
+            sample_weights=weights,
             device=self.config.device,
             steps=self.config.train_steps,
             batch_size=self.config.train_batch_size,
@@ -5533,10 +5570,14 @@ class PhaseDLoop:
             row["skipped"] = "empty split"
             return row
         model = self.load_model(lineage.latest_path)
+        weights, priority_report = self._priority_weights(model, train_examples)
+        if priority_report is not None:
+            row["priority_sampling"] = priority_report
         history, optimizer_state = train_steps(
             model,
             train_examples,
             val_examples,
+            sample_weights=weights,
             device=self.config.device,
             steps=steps,
             batch_size=self.config.train_batch_size,
@@ -7726,6 +7767,19 @@ def build_parser() -> argparse.ArgumentParser:
         "so --train-steps must rise with it",
     )
     parser.add_argument(
+        "--priority-sampling",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="G3: draw training rows 30%% uniformly and 70%% by priority (policy "
+        "surprise, search-vs-network value correction, proof membership), "
+        "capped at 2x the mean; loss weights unchanged. Off = uniform (the A/B "
+        "arm). One no-gradient pass over the training rows per training call",
+    )
+    parser.add_argument("--priority-uniform-share", type=float, default=0.3,
+                        help="G3: share of draws that stay uniform")
+    parser.add_argument("--priority-cap", type=float, default=2.0,
+                        help="G3: cap on a row's priority, as a multiple of the mean")
+    parser.add_argument(
         "--value-target-contract",
         choices=VALUE_TARGET_CONTRACTS,
         default=VALUE_TARGET_CONTRACT_DEFAULT,
@@ -8089,6 +8143,9 @@ def main(argv=None) -> int:
         record_fast_moves=args.record_fast_moves,
         retain_proofs_per_game=args.retain_proofs_per_game,
         value_target_contract=args.value_target_contract,
+        priority_sampling=args.priority_sampling,
+        priority_uniform_share=args.priority_uniform_share,
+        priority_cap=args.priority_cap,
         derive_backend=args.derive_backend,
         eval_search_mode=args.eval_search_mode,
         generation_backend=args.generation_backend,

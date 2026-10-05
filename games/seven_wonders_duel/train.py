@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import itertools
 import json
 import math
 import random
@@ -1442,6 +1443,7 @@ def train_steps(
     hier_value_replaces_joint7: bool = False,
     outlook_bootstrap: float = 0.0,
     value_target_contract: str = VALUE_TARGET_CONTRACT_DEFAULT,
+    sample_weights=None,
     log=print,
 ) -> tuple[list[dict], dict]:
     """Fixed-budget training on uniform random minibatches from the replay.
@@ -1487,6 +1489,14 @@ def train_steps(
     )
     rng = random.Random(seed)
     population = range(len(train_examples))
+    # G3: per-row draw probabilities (`priority_sampling`), or None for the
+    # historical uniform draw. Frequency only -- every drawn row keeps unit
+    # loss weight. Cumulative once, so a draw stays O(log n).
+    cum_weights = None
+    if sample_weights is not None:
+        if len(sample_weights) != len(train_examples):
+            raise ValueError("sample_weights must give one weight per training row")
+        cum_weights = list(itertools.accumulate(float(w) for w in sample_weights))
     best = {"val_total": float("inf"), "step": -1, "state": None}
     history: list[dict] = []
     running: dict[str, float] = {}
@@ -1509,6 +1519,14 @@ def train_steps(
     certain_rows = [bool(getattr(e, "certain_win", False)) for e in train_examples]
     any_certain = any(certain_rows)
     sampled_certain = 0
+    # G3: every proof row (solver value, certain win, retained proof).
+    proof_rows = [
+        e.solver_value is not None
+        or bool(getattr(e, "certain_win", False))
+        or bool(getattr(e, "retained_proof", False))
+        for e in train_examples
+    ]
+    sampled_proof = 0
 
     def learning_rate(step: int) -> float:
         if not warm and warmup_steps > 0 and step < warmup_steps:
@@ -1524,8 +1542,13 @@ def train_steps(
         current_lr = learning_rate(step)
         for group in optimizer.param_groups:
             group["lr"] = current_lr
-        sampled = rng.choices(population, k=batch_size)
+        sampled = (
+            rng.choices(population, k=batch_size)
+            if cum_weights is None
+            else rng.choices(population, cum_weights=cum_weights, k=batch_size)
+        )
         sampled_rows += len(sampled)
+        sampled_proof += sum(proof_rows[i] for i in sampled)
         if any_retained:
             sampled_retained += sum(retained_rows[i] for i in sampled)
         if any_certain:
@@ -1597,6 +1620,7 @@ def train_steps(
             "sampled_rows": sampled_rows,
             "sampled_retained_proof_rows": sampled_retained,
             "sampled_certain_win_rows": sampled_certain,
+            "sampled_proof_rows": sampled_proof,
         }
         running = {}
         running_grad_norm = 0.0

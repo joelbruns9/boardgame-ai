@@ -1096,6 +1096,23 @@ certain-win rows. It is the A/B arm (G5). Training logs
 `sampled_certain_win_rows` per window. Validation is unchanged by the contract
 (proofs are off there and a certain row's exact target equals its realised one).
 
+### `--priority-sampling`, `--priority-uniform-share`, `--priority-cap`
+
+**Default:** off; share `0.3`, cap `2.0`.
+
+G3 (`MODEL_GROWTH_PLAN.md`, `priority_sampling.py`). Draws training rows
+`share` uniformly and the rest by priority, each row's priority capped at
+`cap` x the mean. Priority = the mean of two mean-normalised signals from one
+no-gradient pass of the model about to train -- policy surprise (KL of the
+search target against the model's policy) and value correction (|search root
+value - model value|) -- with solver-proven, certain-win and G1-retained rows
+pinned at the cap. Loss weights are unchanged: priority changes how often a
+row is seen, never how much one presentation counts. The pass costs one
+forward over the training rows per training call; its report (effective
+sample share, proof rows' relative presentations, signal means, seconds) is
+printed and stored on the training row. Off is the A/B arm; judge it with the
+G0 suite (`tactical_suite.py`), not validation loss.
+
 ### `--value-weight`
 
 **Default:** `1.0` (historical). **Value:** positive float
