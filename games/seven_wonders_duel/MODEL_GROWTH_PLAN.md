@@ -162,6 +162,12 @@ existing run07 data is laptop work: correcting all 101 buffers (G1/G2/G2b) is
 5. Score the pretrained checkpoint on sealed G0 (and against candidate_0060)
    before renting anything.
 
+   Steps 3-4 BUILT 2026-10-05: `pretrain.py` (windowed, model + optimizer
+   carried across windows, G2b + optional G8.2 overlay, G0-sealed games
+   withheld, resumable per window; `--init checkpoint|random|reset-value` is
+   the G14 axis -- run the same command three times). ~25 min per 10-iteration
+   window at 2,000 steps on the laptop.
+
 **Cloud run:** self-play from the pretrained checkpoint with G4 exact tactics
 on (labels tactics-aware natively), every move fully searched (owner decision
 11; budget still open), G2b on until its phase-out criterion is met, plus
