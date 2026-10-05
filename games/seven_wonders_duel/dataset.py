@@ -209,6 +209,9 @@ class Example:
     #: proven, 1 a forced win, -1 every move loses, 2 some moves lose by force
     #: (must_block). Provenance for counting; the targets already carry it.
     tactic: int = 0
+    #: G8.2: this row's move target and search value come from a targeted
+    #: re-search (`targeted_reanalysis`), not from the search run07 recorded.
+    reanalysed: bool = False
 
     def __post_init__(self) -> None:
         """Make the arrays read-only as well as the fields.
@@ -790,6 +793,30 @@ def apply_tactic_labels(example: Example, labels) -> Example:
     return dataclasses.replace(example, **fields)
 
 
+def apply_reanalysis(example: Example, entry: dict) -> Example:
+    """G8.2: replace one row's move target and search value with a targeted
+    re-search's (`targeted_reanalysis`). The row becomes a policy row even if
+    run07 searched it cheaply -- the re-search ran at the full budget. Applied
+    before `apply_tactic_labels`, so G2b still has the last word on proven
+    moves."""
+
+    policy = np.array(
+        [float(entry["policy"].get(int(a), 0.0)) for a in example.legal], dtype=np.float32
+    )
+    total = float(policy.sum())
+    if total <= 0.0:
+        return example
+    return dataclasses.replace(
+        example,
+        policy_target=policy / total,
+        has_policy=True,
+        root_value=float(entry["root_value"]),
+        root_value_shaped=False,
+        root_outlook=None,
+        reanalysed=True,
+    )
+
+
 def emits_example(move, *, record_fast_moves: bool, retained: set[int]) -> bool:
     """Whether a recorded move becomes a training row (both derive backends)."""
 
@@ -1010,6 +1037,7 @@ def examples_from_record(
     derived_for: str = GENERAL_ROUTE,
     retain_proofs_per_game: int = 0,
     tactic_labels: bool = False,
+    reanalysis_overlay: dict | None = None,
 ) -> list[Example]:
     """Replay one game (through the VERIFIED buffer.replay path — mask hashes,
     actors, chance log, trajectory and final digests all checked) and emit an
@@ -1048,6 +1076,9 @@ def examples_from_record(
         set() if record_fast_moves
         else retained_proof_moves(record, retain_proofs_per_game)
     )
+    # G8.2: re-searched moves are emitted even when run07 searched them cheaply.
+    reanalysed = (reanalysis_overlay or {}).get((record.iteration, record.seed), {})
+    emitted = retained | set(reanalysed)
 
     def featurize(game, move):
         nonlocal maximum_track
@@ -1059,7 +1090,7 @@ def examples_from_record(
             legal_action_indices(game), dtype=np.int16
         )
         # Replay still steps through this move -- only the example is dropped.
-        if not emits_example(move, record_fast_moves=record_fast_moves, retained=retained):
+        if not emits_example(move, record_fast_moves=record_fast_moves, retained=emitted):
             return
         kept_proof = move.i in retained
         if tactic_labels:
@@ -1218,6 +1249,11 @@ def examples_from_record(
                 certain_win=move_index in certain,
             )
         )
+    if reanalysed:
+        examples = [
+            apply_reanalysis(e, reanalysed[e.move_index]) if e.move_index in reanalysed else e
+            for e in examples
+        ]
     if tactic_labels:
         examples = [
             apply_tactic_labels(e, tactics_by_move[e.move_index]) for e in examples
@@ -1268,6 +1304,7 @@ def _examples_from_rust_payload(
     derived_for: str = GENERAL_ROUTE,
     retained: set[int] | frozenset[int] = frozenset(),
     tactic_labels: bool = False,
+    reanalysed: dict | None = None,
 ) -> tuple[list[Example], GameDerivationStats]:
     """Turn one packed Rust replay into the exact public ``Example`` objects."""
 
@@ -1412,6 +1449,11 @@ def _examples_from_rust_payload(
             )
         )
 
+    if reanalysed:
+        examples = [
+            apply_reanalysis(e, reanalysed[e.move_index]) if e.move_index in reanalysed else e
+            for e in examples
+        ]
     if tactic_labels:
         packed = np.frombuffer(payload.get("tactic_labels", b""), dtype=np.int8)
         cursor = 0
@@ -1480,6 +1522,7 @@ def derive_records_rust(
     derived_for: str = GENERAL_ROUTE,
     retain_proofs_per_game: int = 0,
     tactic_labels: bool = False,
+    reanalysis_overlay: dict | None = None,
 ) -> list[tuple[list[Example], GameDerivationStats]]:
     """Rust-default replay/encode path, aligned one result per input game.
 
@@ -1524,12 +1567,18 @@ def derive_records_rust(
             else retained_proof_moves(record, retain_proofs_per_game)
             for record in batch
         ]
+        reanalysed_by_game = [
+            (reanalysis_overlay or {}).get((record.iteration, record.seed), {})
+            for record in batch
+        ]
         include = [
             [
-                emits_example(move, record_fast_moves=record_fast_moves, retained=kept)
+                emits_example(
+                    move, record_fast_moves=record_fast_moves, retained=kept | set(extra)
+                )
                 for move in record.moves
             ]
-            for record, kept in zip(batch, retained_by_game)
+            for record, kept, extra in zip(batch, retained_by_game, reanalysed_by_game)
         ]
         chance_logs = [_rust_chance_log(record) for record in batch]
         expected_results = [
@@ -1574,8 +1623,12 @@ def derive_records_rust(
         if len(payloads) != len(batch):
             raise ReplayMismatchError("Rust derivation returned the wrong game count")
         output.extend(
-            _examples_from_rust_payload(record, payload, derived_for, kept, tactic_labels)
-            for record, payload, kept in zip(batch, payloads, retained_by_game)
+            _examples_from_rust_payload(
+                record, payload, derived_for, kept, tactic_labels, extra
+            )
+            for record, payload, kept, extra in zip(
+                batch, payloads, retained_by_game, reanalysed_by_game
+            )
         )
     return output
 

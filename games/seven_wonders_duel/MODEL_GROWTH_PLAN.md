@@ -139,6 +139,18 @@ existing run07 data is laptop work: correcting all 101 buffers (G1/G2/G2b) is
    targets -- revealing moves, cheap-search moves, and decisions a few moves
    before decisive positions. Shrinks gaps 1 and 2; doing every position would
    cost as much as generation.
+   **BUILT 2026-10-05** (`targeted_reanalysis.py`; `--reanalysis-overlay` in
+   `g3_offline_ab.py`; `dataset.apply_reanalysis`, both backends; resumable
+   JSONL overlay; G0-sealed games never selected). Classes: pre_decisive
+   (within 4 plies before a forced-win/loss/must_block position), reveal (the
+   played move uncovered a card), cheap (sampled). Measured on run07 iter 100:
+   ~4,800 targets per 1,000 games at a cap of 6 per game; 0.42 s per position
+   at 1,600 sims (coalesced, laptop) -> the full 41-100 selection is ~34 h, so
+   cap 2 over 81-100 (~32k, ~4 h) or cap 3 over 61-100 (~96k, ~11 h). On a
+   204-position probe (78-85% were cheap searches in run07) the re-search
+   moved a third of the move target (TV 0.30) and changed the top move in 28-29%;
+   value |change| 0.16 (pre_decisive) / 0.07 (reveal). Caveat: re-searched with
+   iter 60's network, so part of each change is a different network.
 3. G14 initialisation check on identical corrected data, equal steps and
    holdouts: (a) candidate_0060 + fresh optimizer, (b) random init, optional
    (c) candidate_0060 with value heads reset. Judge on sealed G0 + held-out

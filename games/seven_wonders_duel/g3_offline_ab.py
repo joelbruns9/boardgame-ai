@@ -37,6 +37,7 @@ import torch
 from .buffer import read_records
 from .dataset import RETAIN_PROOFS_PER_GAME_DEFAULT, derive_records_rust
 from .tactical_suite import SEALED_FRACTION, sealed
+from .targeted_reanalysis import load_overlay
 from .train import (
     VALUE_TARGET_CONTRACT_DEFAULT,
     VALUE_TARGET_CONTRACTS,
@@ -75,7 +76,7 @@ def _iterations(text: str) -> list[int]:
 
 def derive_window(
     buffers_dir: Path, iterations: list[int], retain: int, log=print,
-    *, tactic_labels: bool = False,
+    *, tactic_labels: bool = False, reanalysis_overlay: dict | None = None,
 ) -> tuple[list, int]:
     """`(examples, reserved_games)`: the window's rows with every G0-sealed
     game left out before it is derived."""
@@ -87,7 +88,8 @@ def derive_window(
         kept = [r for r in records if not sealed(r.iteration, r.seed)]
         reserved += len(records) - len(kept)
         for rows, _stats in derive_records_rust(
-            kept, retain_proofs_per_game=retain, tactic_labels=tactic_labels
+            kept, retain_proofs_per_game=retain, tactic_labels=tactic_labels,
+            reanalysis_overlay=reanalysis_overlay,
         ):
             examples.extend(rows)
         log(f"derived iteration {iteration}: {len(examples)} rows so far, "
@@ -108,6 +110,9 @@ def run(args) -> dict:
     examples, reserved = derive_window(
         args.buffers_dir, _iterations(args.iterations), args.retain_proofs_per_game,
         tactic_labels=args.tactic_labels,
+        reanalysis_overlay=(
+            load_overlay(args.reanalysis_overlay) if args.reanalysis_overlay else None
+        ),
     )
     train_examples, val_examples = stable_game_split(
         examples, RUN07["val_fraction"], RUN07["val_split_salt"]
@@ -157,6 +162,8 @@ def run(args) -> dict:
         "g0_sealed_games_withheld": reserved,
         "g0_sealed_fraction": SEALED_FRACTION,
         "tactic_labels": args.tactic_labels,
+        "reanalysis_overlay": [str(p) for p in args.reanalysis_overlay or []],
+        "reanalysed_rows": sum(1 for e in train_examples if getattr(e, "reanalysed", False)),
         # G2b rows by kind, over the training rows.
         "tactic_rows": {
             name: sum(1 for e in train_examples if getattr(e, "tactic", 0) == code)
@@ -190,6 +197,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tactic-labels", action=argparse.BooleanOptionalAction,
                         default=False,
                         help="G2b: fold exact one-move tactics into the targets")
+    parser.add_argument("--reanalysis-overlay", type=Path, nargs="*", default=None,
+                        help="G8.2 overlay file(s) from targeted_reanalysis.py")
     parser.add_argument("--uniform-share", type=float, default=0.3)
     parser.add_argument("--cap", type=float, default=2.0)
     parser.add_argument("--out", type=Path, required=True)
