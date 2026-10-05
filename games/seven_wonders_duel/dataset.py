@@ -1640,6 +1640,7 @@ def examples_from_records(
     record_fast_moves: bool = False,
     derived_for: str = GENERAL_ROUTE,
     retain_proofs_per_game: int = 0,
+    tactic_labels: bool = False,
 ) -> list[Example]:
     out: list[Example] = []
     for record in records:
@@ -1649,6 +1650,7 @@ def examples_from_records(
                 record_fast_moves=record_fast_moves,
                 derived_for=derived_for,
                 retain_proofs_per_game=retain_proofs_per_game,
+                tactic_labels=tactic_labels,
             )
         )
     return out

@@ -319,7 +319,36 @@ runs with G4 on, new labels are tactics-aware anyway: G2b matters most for the
 run07 buffers and for cheap moves whose searches are too short for the check
 to fire everywhere it should.
 
-**BUILT 2026-10-05** (`--tactic-labels`, off until the A/B; `dataset.apply_tactic_labels`,
+**Three-arm offline A/B (2026-10-05), sealed G0, paired, 300 cases/class.**
+uniform -> G2b-uniform: must_block blunders 19.0 -> 13.3% raw, 14.0 -> 7.7% at
+64 sims, 12.0 -> 5.7% at 800 (19 fixed / 0 broken at both search budgets);
+near-end 31.5 -> 7-9%; deep 10.2 -> 7.3% (64) and 7.7 -> 5.3% (800), p 0.016 /
+0.031; immediate wins taken 89-92 -> 92-95% (0 broken); reveal traps,
+predecessor, solver, quiet, ordinary unchanged. G2b-uniform -> G2b-priority:
+nothing significant under search (raw deep must_block 14.2 -> 11.0%, raw
+forced-loss value error +0.02). candidate_0060 -> uniform (plain retraining on
+run07 iters 91-100): values better almost everywhere, but near-end must_block
+blunders DOUBLED, 16.7 -> 31.5% (2 / 10, p 0.012-0.039) -- training imitated
+run07's contaminated move targets (F4 directly observed); G2b more than undoes
+it (7-9%, below the starting checkpoint). Hypothesis, untested: the same
+contamination is part of why run07 stopped promoting after iteration 60.
+
+**Owner decisions 2026-10-05:** G2b ON by default. It is a bridge: G4 in
+self-play (plus the proven-loss guard below) should produce clean labels
+natively. **Phase-out criterion:** on the first new run's buffers, measure how
+often G2b changes a target; near zero -> remove it, otherwise the cheap moves
+still need it. G3 DROPPED from the plan (code kept, off by default): it adds
+frequency, not information, and showed no gain under search.
+
+**Proven-loss guard (built 2026-10-05, `tree_resumable.rs`):** with tactics on,
+a root move PROVEN lost (one-move `classify_actions` on the root, or a proof
+search found) gets zero target mass and is never
+played while a move without a proven loss exists. Needed because the Gumbel
+improved policy blends Q with the prior, so a strong prior could keep target
+mass -- and the move -- on a proven -1. Applies to self-play targets/moves,
+arena and G0; the advisor's live panel reads visits and is not changed.
+
+**BUILT 2026-10-05** (`--tactic-labels`, ON by default after the A/B; `dataset.apply_tactic_labels`,
 Rust `derive_records(tactic_labels=True)`, `test_tactic_labels.py`; part of the
 example-cache key). Measured on run07 iter 100 (1,000 games, G1 cap 4): 6.4% of
 18,491 rows labelled -- 396 forced wins, 345 forced losses, 438 must_block.

@@ -1098,7 +1098,10 @@ certain-win rows. It is the A/B arm (G5). Training logs
 
 ### `--tactic-labels`, `--no-tactic-labels`
 
-**Default:** off (until the offline A/B decides).
+**Default:** on (offline A/B 2026-10-05: search blunders in must_block halved
+-- 14.0 -> 7.7% at 64 sims, 12.0 -> 5.7% at 800, 19 fixed / 0 broken; immediate
+wins taken 92 -> 95%; no calibration cost). Phase out once new self-play
+buffers show it rarely changes a target.
 
 G2b (`MODEL_GROWTH_PLAN.md`, `dataset.apply_tactic_labels`). At derivation,
 every row's legal actions are labelled with the exact one-move tactics

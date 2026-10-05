@@ -2612,6 +2612,72 @@ impl SearchSession {
     /// Result for a PUCT root: play argmax visits, target is the visit
     /// distribution. Mirrors `tree::puct_root` exactly -- the two are compared
     /// against the same Python reference.
+    /// G4 guard: root moves PROVEN to lose for the mover -- by the exact
+    /// one-move check on the root position (`tactics::classify_actions`,
+    /// which covers moves the search never visited) or by a proof the search
+    /// found (`edge_exact` = -1 in the mover's frame) -- or all false when the
+    /// guard does not apply: tactics off for this search, or every move
+    /// proven lost (then there is nothing better to prefer).
+    fn proven_losing_root_edges(&self) -> Vec<bool> {
+        let n = self.legal.len();
+        if !self.arena.tactics {
+            return vec![false; n];
+        }
+        let root = self.arena.root_id;
+        let labels = crate::tactics::classify_actions(&self.arena.nodes[root].state);
+        let losing: Vec<bool> = (0..n)
+            .map(|j| {
+                labels.get(j).is_some_and(|&label| label == -1)
+                    || edge_exact(&self.arena, root, j)
+                        .is_some_and(|(value, _)| self.sign * value <= -1.0 + 1e-9)
+            })
+            .collect();
+        if losing.iter().all(|&l| l) {
+            return vec![false; n];
+        }
+        losing
+    }
+
+    /// G4 guard on a root distribution: no mass on proven-losing moves while a
+    /// move without a proven loss exists (a 100-sim search can still put
+    /// target mass, or the move choice, on a move it has proven lost, because
+    /// the improved policy blends Q with the network's prior). Renormalised;
+    /// uniform over the remaining moves if they held no mass.
+    fn guard_distribution(policy: &mut [f64], losing: &[bool]) {
+        if !losing.iter().any(|&l| l) {
+            return;
+        }
+        for (p, &l) in policy.iter_mut().zip(losing) {
+            if l {
+                *p = 0.0;
+            }
+        }
+        let total: f64 = policy.iter().sum();
+        if total > 0.0 {
+            policy.iter_mut().for_each(|p| *p /= total);
+        } else {
+            let keep = losing.iter().filter(|&&l| !l).count() as f64;
+            for (p, &l) in policy.iter_mut().zip(losing) {
+                *p = if l { 0.0 } else { 1.0 / keep };
+            }
+        }
+    }
+
+    /// The move to play under the guard: `best` unless it is proven lost,
+    /// else the remaining move with the most guarded target mass.
+    fn guard_action(best: usize, policy: &[f64], losing: &[bool]) -> usize {
+        if !losing[best] {
+            return best;
+        }
+        (0..policy.len())
+            .filter(|&j| !losing[j])
+            .fold(None, |acc: Option<usize>, j| match acc {
+                Some(b) if policy[b] >= policy[j] => Some(b),
+                _ => Some(j),
+            })
+            .unwrap_or(best)
+    }
+
     fn into_puct_result(mut self) -> PyResult<(SearchResult, Arena, SearchMetrics)> {
         let n = self.legal.len();
         let completed: Vec<f64> = (0..n).map(|j| self.completed_q(j)).collect();
@@ -2635,6 +2701,10 @@ impl SearchSession {
                 best = j;
             }
         }
+        let losing = self.proven_losing_root_edges();
+        let mut policy_target = policy_target;
+        Self::guard_distribution(&mut policy_target, &losing);
+        let best = Self::guard_action(best, &policy_target, &losing);
         let root_value = self.sign * self.arena.nodes[self.arena.root_id].value_p0();
         self.metrics.root_completed_q = completed.clone();
         // The arena edges still carry the NOISED priors the search descended
@@ -2646,14 +2716,16 @@ impl SearchSession {
                 .iter()
                 .map(|e| e.prior)
                 .collect();
-            Some(crate::tree::prune_policy_target(
+            let mut pruned = crate::tree::prune_policy_target(
                 &self.visits,
                 &noised,
                 &completed,
                 self.cfg.c_puct,
                 self.cfg.forced_playout_k,
                 self.arena.nodes[self.arena.root_id].visits,
-            ))
+            );
+            Self::guard_distribution(&mut pruned, &losing);
+            Some(pruned)
         } else {
             None
         };
@@ -2711,7 +2783,10 @@ impl SearchSession {
         let peak = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         let weights: Vec<f64> = logits.iter().map(|&value| (value - peak).exp()).collect();
         let total = weights.iter().fold(0.0_f64, |sum, &value| sum + value);
-        let policy_target = weights.iter().map(|&weight| weight / total).collect();
+        let mut policy_target: Vec<f64> = weights.iter().map(|&weight| weight / total).collect();
+        let losing = self.proven_losing_root_edges();
+        Self::guard_distribution(&mut policy_target, &losing);
+        let best = Self::guard_action(best, &policy_target, &losing);
         let root_value = self.sign * self.arena.nodes[self.arena.root_id].value_p0();
         let root_completed_q = (0..self.legal.len()).map(|j| self.completed_q(j)).collect();
         self.metrics.root_completed_q = root_completed_q;
@@ -3370,5 +3445,29 @@ mod review_6ab4342_tests {
         let child = Node::make_child(state, false);
         crate::tactics::set_enabled(false);
         assert!(child.proven.is_none());
+    }
+}
+
+#[cfg(test)]
+mod proven_loss_guard_tests {
+    use super::SearchSession;
+
+    #[test]
+    fn proven_losing_moves_lose_their_mass_and_are_never_played() {
+        let losing = [true, false, false, true];
+        let mut policy = vec![0.6, 0.1, 0.3, 0.0];
+        SearchSession::guard_distribution(&mut policy, &losing);
+        assert_eq!(policy[0], 0.0);
+        assert!((policy[1] - 0.25).abs() < 1e-12 && (policy[2] - 0.75).abs() < 1e-12);
+        assert_eq!(SearchSession::guard_action(0, &policy, &losing), 2);
+        assert_eq!(SearchSession::guard_action(1, &policy, &losing), 1);
+        // All mass on proven losses: uniform over the rest.
+        let mut all_bad = vec![0.5, 0.0, 0.0, 0.5];
+        SearchSession::guard_distribution(&mut all_bad, &losing);
+        assert_eq!(all_bad, vec![0.0, 0.5, 0.5, 0.0]);
+        // Nothing proven lost: untouched.
+        let mut free = vec![0.2, 0.8];
+        SearchSession::guard_distribution(&mut free, &[false, false]);
+        assert_eq!(free, vec![0.2, 0.8]);
     }
 }

@@ -825,8 +825,13 @@ def test_streaming_search_deepens_a_cumulative_tree():
     from .train import build_model
 
     payload = _load_great_library()
+    # Exact tactics OFF: this tests streaming mechanics, and with tactics on
+    # the Great Library position is almost wholly proven -- simulations end
+    # at proven nodes without a network call and 100k of them finish before
+    # three snapshots can be polled.
     advisor = SevenWondersAdvisor(
-        evaluator=Evaluator(build_model("transformer", 32, 1), "cpu")
+        evaluator=Evaluator(build_model("transformer", 32, 1), "cpu"),
+        exact_tactics=False,
     )
     state = advisor.state_from_wire(
         {k: payload[k] for k in ("bga", "args", "dom", "log")}

@@ -685,12 +685,14 @@ class PhaseDConfig:
     endgame; the default 4 adds ~+21% rows (`dataset.retained_proof_moves`).
     """
 
-    tactic_labels: bool = False
+    tactic_labels: bool = True
     """G2b: at derivation, label every row's legal actions with the exact
     one-move tactics (`tactics.classify_actions`) and fold them into its
     targets (`dataset.apply_tactic_labels`): exact value on a forced win/loss,
-    move target restricted to winning moves / stripped of losing ones. Off is
-    the A/B arm until the offline A/B decides."""
+    move target restricted to winning moves / stripped of losing ones. ON by
+    default since the 2026-10-05 offline A/B (search blunders in must_block
+    halved, no calibration cost); to be phased out once new self-play buffers
+    show it rarely changes a target (G2b phase-out criterion)."""
 
     derive_backend: str = "rust"
     """Replay/encoding implementation: production Rust or Python reference."""
@@ -7804,11 +7806,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--tactic-labels",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="G2b: fold exact one-move tactics into every row's targets at "
         "derivation -- exact value on a forced win/loss, move target limited "
-        "to winning moves or stripped of moves that lose by force. Off until "
-        "the offline A/B decides",
+        "to winning moves or stripped of moves that lose by force. On by "
+        "default (offline A/B 2026-10-05)",
     )
     parser.add_argument(
         "--retain-proofs-per-game",

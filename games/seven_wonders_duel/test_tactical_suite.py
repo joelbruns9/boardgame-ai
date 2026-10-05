@@ -208,3 +208,29 @@ def test_paired_compare_counts_discordant_pairs_and_clusters_by_game(tmp_path):
     assert low < -0.225 < high < 0  # mean diff -9/40, and clearly below zero
     assert "must_block/near_end" in report["modes"]["network"]
     assert ts._mcnemar(0, 0) == 1.0 and ts._mcnemar(5, 5) == 1.0
+
+
+def test_search_never_targets_a_proven_losing_move(cases, records):
+    """G4 guard: at a must_block position a low-budget search's target and move
+    carry no mass on a move PROVEN to lose while another exists."""
+
+    from .inference import Evaluator
+    from .train import build_model
+
+    picked = [c for c in cases if c.cls == "must_block"][:8]
+    assert picked
+    by_game = {(r.iteration, r.seed): r for r in records}
+    states = []
+    for case in picked:
+        grabbed = {}
+        replay(
+            by_game[(case.iteration, case.seed)],
+            on_state=lambda game, move, grabbed=grabbed, case=case: grabbed.setdefault(
+                "s", game.clone()) if move.i == case.move else None,
+        )
+        states.append(grabbed["s"])
+    evaluator = Evaluator(build_model("transformer", 32, 1), "cpu")
+    readings = ts.read_search(evaluator, states, 16, exact_tactics=True)
+    for case, reading in zip(picked, readings):
+        assert reading.action not in case.losing
+        assert sum(reading.mass.get(a, 0.0) for a in case.losing) == pytest.approx(0.0, abs=1e-12)

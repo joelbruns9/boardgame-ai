@@ -123,7 +123,9 @@ def test_cache_returns_exactly_what_the_uncached_path_returns(tmp_path, records)
     """The equivalence gate: same examples, same order, cold and warm."""
 
     loop = _loop(tmp_path)
-    expected = examples_from_records(records, record_fast_moves=False)
+    expected = examples_from_records(
+        records, record_fast_moves=False, tactic_labels=loop.config.tactic_labels
+    )
 
     cold = loop._cached_examples(records)
     assert len(cold) == len(expected)
@@ -411,7 +413,7 @@ def test_tactic_labels_are_part_of_the_key(tmp_path, records):
 
     loop = _loop(tmp_path)
     loop._cached_examples(records)
-    loop.config.tactic_labels = True
+    loop.config.tactic_labels = not loop.config.tactic_labels
     loop._cached_examples(records)
     assert loop.last_example_cache_stats["replayed_games"] == len(records)
 
@@ -562,7 +564,9 @@ def test_a_cap_below_one_window_still_returns_every_example(tmp_path, records):
 
     loop = _loop(tmp_path, example_cache_examples=1)
     examples = loop._cached_examples(records)
-    expected = examples_from_records(records, record_fast_moves=False)
+    expected = examples_from_records(
+        records, record_fast_moves=False, tactic_labels=loop.config.tactic_labels
+    )
     assert len(examples) == len(expected)
     assert all(_same(a, b) for a, b in zip(examples, expected))
 
