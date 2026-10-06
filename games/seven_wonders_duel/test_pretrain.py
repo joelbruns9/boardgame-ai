@@ -120,3 +120,50 @@ def test_every_arm_refits_w5_alpha_after_each_window(setup, monkeypatch):
             model = model_from_config(saved["config"])
             model.load_state_dict(saved["model_state"])
             assert model.action_scorer.alpha_value() == pytest.approx(0.7, abs=1e-5)
+
+
+def test_grown_layers_start_as_an_exact_no_op_and_still_learn(setup):
+    """Capacity probe: the grown net computes what the base did, and the new
+    layers receive gradient (a fully zeroed block would not)."""
+
+    from .dataset import collate, examples_from_record
+    from .train import compute_losses, load_checkpoint, model_from_config
+
+    _root, _buffers, base = setup
+    stored = torch.load(base, map_location="cpu", weights_only=False)
+    original = model_from_config(stored["config"])
+    load_checkpoint(base, original, checkpoint=stored)
+    grown, config = pretrain.build_model(base, "checkpoint", 7, grow_to=3)
+    assert config["layers"] == 3 and len(grown.encoder.layers) == 3
+    rows = examples_from_record(fresh_bot_records(1, seed=99)[0])[:16]
+    batch = collate(rows)
+    original.eval()
+    grown.eval()
+    with torch.no_grad():
+        before, after = original(batch), grown(batch)
+    for key, tensor in before.items():
+        assert torch.allclose(tensor, after[key], atol=1e-5), key
+    grown.train()
+    loss, _ = compute_losses(grown(batch), batch)
+    loss.backward()
+    for name in ("encoder.layers.2.linear2.weight", "encoder.layers.2.self_attn.out_proj.weight"):
+        grad = dict(grown.named_parameters())[name].grad
+        assert grad is not None and grad.abs().sum() > 0, name
+    with pytest.raises(ValueError):
+        pretrain.build_model(base, "random", 0, grow_to=3)
+
+
+def test_a_grown_pretrain_saves_a_checkpoint_that_rebuilds(setup):
+    from .train import model_from_config
+
+    root, buffers, base = setup
+    summary = pretrain.run(_args(root, buffers, base, "checkpoint", "out_grow",
+                                 ("--grow-layers", "2")))
+    assert summary["grow_layers"] == 2
+    saved = torch.load(root / "out_grow" / "pretrained.pt", map_location="cpu",
+                       weights_only=False)
+    assert saved["config"]["layers"] == 2
+    model_from_config(saved["config"]).load_state_dict(saved["model_state"])
+    # And a resume rebuilds the same grown architecture.
+    pretrain.run(_args(root, buffers, base, "checkpoint", "out_grow",
+                       ("--grow-layers", "2", "--resume")))

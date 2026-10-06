@@ -25,6 +25,14 @@ W5-off (review of 8014a6c, #1). ``--alpha-step`` defaults to a jump straight
 to the fitted value: windows are few, and a capped step would leave the random
 arm short of where its heads put the optimum.
 
+``--grow-layers N`` is the capacity probe (plan W8): the base's transformer
+gets ``N - layers`` new layers appended on top, each an exact no-op at the
+start -- pre-norm residual blocks whose two output projections (attention
+``out_proj`` and feed-forward ``linear2``, weights and biases) are zero -- so
+the grown net computes exactly what the base did, and training decides what
+the new layers add. Only the output projections are zeroed: a block zeroed
+throughout gets no gradient and would stay a no-op forever.
+
 Each window's checkpoint is saved, so a stopped run restarts from the last
 completed window with ``--resume``.
 """
@@ -43,6 +51,8 @@ from .action_alpha import format_alpha_fit, refit_alpha
 from .g3_offline_ab import RUN07, derive_window
 from .targeted_reanalysis import load_overlay
 from .train import (
+    ENCODER_SIGNATURE,
+    _check_control_table,
     load_checkpoint,
     make_checkpoint,
     model_from_config,
@@ -60,9 +70,47 @@ def _windows(first: int, last: int, size: int) -> list[list[int]]:
     return [list(range(lo, min(lo + size, last + 1))) for lo in range(first, last + 1, size)]
 
 
-def build_model(base: Path, init: str, seed: int):
+#: The parameters of a new layer that are zeroed so the layer starts as a no-op.
+GROWN_ZERO_SUFFIXES = (
+    "self_attn.out_proj.weight", "self_attn.out_proj.bias", "linear2.weight", "linear2.bias",
+)
+
+
+def grow_layers(model_config: dict, state: dict, layers: int, seed: int):
+    """A model with `layers` transformer layers whose first ones carry `state`
+    and whose new top layers are exact no-ops (see the module docstring)."""
+
+    old = int(model_config["layers"])
+    if layers <= old:
+        raise ValueError(f"--grow-layers {layers} must exceed the base's {old} layers")
+    config = dict(model_config, layers=layers)
+    torch.manual_seed(seed)
+    model = model_from_config(config)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    new_prefixes = tuple(f"encoder.layers.{i}." for i in range(old, layers))
+    if unexpected or any(not key.startswith(new_prefixes) for key in missing):
+        raise RuntimeError(
+            f"growing {old} -> {layers} layers: unexpected {unexpected[:3]}, "
+            f"missing outside the new layers {[k for k in missing if not k.startswith(new_prefixes)][:3]}"
+        )
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if name.startswith(new_prefixes) and name.endswith(GROWN_ZERO_SUFFIXES):
+                parameter.zero_()
+    return model, config
+
+
+def build_model(base: Path, init: str, seed: int, grow_to: int | None = None):
     checkpoint = torch.load(base, map_location="cpu", weights_only=False)
     torch.manual_seed(seed)
+    if grow_to is not None:
+        if init != "checkpoint":
+            raise ValueError("--grow-layers grows a trained base; use --init checkpoint")
+        # The checks an ordinary load makes, before the partial state load below.
+        if checkpoint["encoder_signature"] != ENCODER_SIGNATURE:
+            raise ValueError(f"{base}: encoder signature changed; migrate it first")
+        _check_control_table(checkpoint, migrating=False)
+        return grow_layers(checkpoint["config"], checkpoint["model_state"], grow_to, seed)
     model = model_from_config(checkpoint["config"])
     if init == "random":
         return model, checkpoint["config"]
@@ -88,7 +136,7 @@ def run(args) -> dict:
     progress = json.loads(state_path.read_text()) if args.resume and state_path.exists() else {
         "completed_windows": [], "history": [],
     }
-    model, config = build_model(args.base, args.init, args.seed)
+    model, config = build_model(args.base, args.init, args.seed, args.grow_layers)
     optimizer_state = None
     if progress["completed_windows"]:
         last = out_dir / f"window_{progress['completed_windows'][-1]}.pt"
@@ -180,6 +228,7 @@ def run(args) -> dict:
     final_path = out_dir / "pretrained.pt"
     torch.save(make_checkpoint(model, dict(config)), final_path)
     summary = {"init": args.init, "base": str(args.base), "iterations": args.iterations,
+               "grow_layers": args.grow_layers,
                "window": args.window, "steps_per_window": args.steps_per_window,
                "presentations_per_row": args.presentations_per_row,
                "tactic_labels": args.tactic_labels,
@@ -205,6 +254,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "a negative value to use --steps-per-window instead")
     parser.add_argument("--tactic-labels", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--reanalysis-overlay", type=Path, nargs="*", default=None)
+    parser.add_argument("--grow-layers", type=int, default=None,
+                        help="capacity probe: append no-op transformer layers to the base "
+                        "up to this many (e.g. 12), then train as usual")
     parser.add_argument("--alpha-step", type=float, default=None,
                         help="largest W5 alpha change per window (default: jump to the "
                         "held-out fit)")
