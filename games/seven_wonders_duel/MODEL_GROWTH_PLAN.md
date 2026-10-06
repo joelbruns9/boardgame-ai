@@ -173,6 +173,21 @@ existing run07 data is laptop work: correcting all 101 buffers (G1/G2/G2b) is
    must_block 17.7 -> 14.0%, near-end under search 13.0 -> 5.6%; solver-class
    value error under search slightly worse (0.162 -> 0.176 at 64 sims).
    G6 on (a), W5 alone vs combined: no difference on any class or budget.
+
+   **Final pretrain 2026-10-06** (`prep/final_41_100`: candidate_0100, iters
+   41-100, G2b + overlay on 81-100, ~2 presentations/row, alpha refit per
+   window, held-out 2.326 at the last window). vs candidate_0100 on sealed G0:
+   raw must_block 17.7 -> 12.7% (19 fixed / 4 broken), near-end must_block
+   under search 13% -> 0-1.9%, predecessor value error 0.33 -> 0.24, forced-loss
+   0.25 -> 0.15; raw reveal-trap 30.3 -> 32.0% (n.s., vs 29.7% for the 81-100-
+   only arm: re-searching 41-80 judged not worth two overnights); everything
+   else unchanged. **Capacity probe (W8):** the same pretrain grown to 12
+   layers (`--grow-layers 12`, 25.2M params) ties: held-out 2.3261 vs 2.3258,
+   G0 equal on every decisive class; ordinary/quiet value error 0.004 better
+   under search (significant, tiny). Inference 1.26-1.39x slower (bf16, batch
+   16-256), training 2-3x slower on the laptop. Caveat: new layers start as
+   no-ops and got ~3,800 steps. Capacity is not binding at a level worth ~1.4x
+   generation cost.
 4. Pretrain from the G14 winner over iterations 41-100 in RAM-sized windows
    (early iterations' weaker targets down-weighted or left out), withholding
    G0's sealed games.
