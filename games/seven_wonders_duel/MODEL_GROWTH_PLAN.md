@@ -163,6 +163,16 @@ existing run07 data is laptop work: correcting all 101 buffers (G1/G2/G2b) is
    (c), both from candidate_0100, on iters 81-100 with the G8.2 overlay
    (`overlay_81_100_cap5.jsonl`: 80,275 positions, 86% pre_decisive, 75% run07
    cheap searches; re-search moved the top move in 19-35% by class).
+   **Result 2026-10-06 (sealed G0, paired, game-level p):** (a) vs (c) tie on
+   every class and budget (held-out loss 2.335 vs 2.338) -> warm start from
+   the checkpoint, no value reset. (a) vs base+ (G2b only, iters 61-100):
+   equal under search; raw reveal-trap picks 34.7 -> 29.7% (20 fixed / 5
+   broken, p 0.004) -- the overlay undoes the raw reveal regression plain
+   retraining introduced, but does not go below candidate_0100 (30.3%).
+   Must_block: no overlay effect beyond G2b. (a) vs candidate_0100: raw
+   must_block 17.7 -> 14.0%, near-end under search 13.0 -> 5.6%; solver-class
+   value error under search slightly worse (0.162 -> 0.176 at 64 sims).
+   G6 on (a), W5 alone vs combined: no difference on any class or budget.
 4. Pretrain from the G14 winner over iterations 41-100 in RAM-sized windows
    (early iterations' weaker targets down-weighted or left out), withholding
    G0's sealed games.
