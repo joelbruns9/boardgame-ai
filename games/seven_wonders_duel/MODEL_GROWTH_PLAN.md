@@ -156,6 +156,13 @@ existing run07 data is laptop work: correcting all 101 buffers (G1/G2/G2b) is
    (c) candidate_0060 with value heads reset. Judge on sealed G0 + held-out
    validation. (a) best -> warm start; (b) catches up -> the old weights hurt
    and random init earns its compute; (c) best -> partial reset.
+   **Owner 2026-10-06: arm (b) DROPPED, laptop and cloud.** At laptop scale
+   (~1,240 steps on iters 81-100) a random net can only lose to 100
+   iterations of training, so the arm cannot answer the plasticity question;
+   answering it needs cloud-scale compute, not worth the rental. Run (a) vs
+   (c), both from candidate_0100, on iters 81-100 with the G8.2 overlay
+   (`overlay_81_100_cap5.jsonl`: 80,275 positions, 86% pre_decisive, 75% run07
+   cheap searches; re-search moved the top move in 19-35% by class).
 4. Pretrain from the G14 winner over iterations 41-100 in RAM-sized windows
    (early iterations' weaker targets down-weighted or left out), withholding
    G0's sealed games.
