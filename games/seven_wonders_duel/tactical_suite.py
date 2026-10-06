@@ -478,6 +478,7 @@ def evaluate(
     max_per_class: int | None = None,
     seed: int = 0,
     readings_out: Path | None = None,
+    policy_source: str = "combined",
 ) -> dict:
     cases = read_cases(cases_path, split)
     if max_per_class is not None:
@@ -493,9 +494,19 @@ def evaluate(
     states_by_id = load_states(cases)
     states = [states_by_id[case.id] for case in cases]
     evaluator = pe.load_evaluator(checkpoint, device, precision)
+    if policy_source != "combined":
+        # G6: W5 alone serves the priors, the flat head ignored -- the same
+        # view as `arena --policy-source-a action`.
+        if getattr(evaluator.model, "action_scorer", None) is None:
+            raise ValueError(
+                f"{checkpoint} has no W5 action scorer; policy_source={policy_source!r} "
+                "needs one"
+            )
+    evaluator.model.policy_source = policy_source
     report = {
         "schema": SCHEMA,
         "checkpoint": checkpoint,
+        "policy_source": policy_source,
         "split": split,
         "exact_tactics": exact_tactics,
         "modes": {},
@@ -668,6 +679,8 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--exact-tactics", action=argparse.BooleanOptionalAction, default=True)
     e.add_argument("--max-per-class", type=int, default=None)
     e.add_argument("--seed", type=int, default=0)
+    e.add_argument("--policy-source", choices=("combined", "action"), default="combined",
+                   help="which policy serves the priors: the served mix, or W5 alone (G6)")
     e.add_argument("--save-readings", action="store_true",
                    help="also write per-case readings next to --out "
                    "(<out>.readings.jsonl) for a paired `compare`")
@@ -706,6 +719,7 @@ def main(argv=None) -> int:
         exact_tactics=args.exact_tactics, max_per_class=args.max_per_class,
         seed=args.seed,
         readings_out=args.out.with_suffix(".readings.jsonl") if args.save_readings else None,
+        policy_source=args.policy_source,
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(report, indent=2))

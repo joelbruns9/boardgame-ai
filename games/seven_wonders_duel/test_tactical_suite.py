@@ -257,3 +257,28 @@ def test_search_never_targets_a_proven_losing_move(cases, records):
     for case, reading in zip(picked, readings):
         assert reading.action not in case.losing
         assert sum(reading.mass.get(a, 0.0) for a in case.losing) == pytest.approx(0.0, abs=1e-12)
+
+
+def test_evaluate_can_serve_w5_alone(tmp_path, records):
+    """G6 check: `--policy-source action` scores W5 alone, and is refused for a
+    net without the W5 scorer."""
+
+    import torch
+
+    from .train import make_checkpoint, model_from_config
+
+    buffer = tmp_path / "iter_0001.jsonl"
+    append_records(buffer, records[:4])
+    cases = tmp_path / "cases.jsonl"
+    ts.harvest([buffer], cases, ordinary_rate=0.05, log=lambda *_: None)
+    base = {"model": "transformer", "d_model": 32, "layers": 1, "heads": 2}
+    paths = {}
+    for name, extra in (("plain", {}), ("w5", {"action_residual": True})):
+        config = {**base, **extra}
+        paths[name] = tmp_path / f"{name}.pt"
+        torch.save(make_checkpoint(model_from_config(config), config), paths[name])
+    kwargs = dict(sims=[0], split=None, device="cpu", precision="fp32", max_per_class=2)
+    report = ts.evaluate(cases, str(paths["w5"]), policy_source="action", **kwargs)
+    assert report["policy_source"] == "action"
+    with pytest.raises(ValueError, match="no W5 action scorer"):
+        ts.evaluate(cases, str(paths["plain"]), policy_source="action", **kwargs)
