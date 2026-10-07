@@ -42,6 +42,118 @@ pub struct Edge {
     /// growth — see `tree::fixed_support_index`. The paired AgeDeal sampler is
     /// the first member of this class; capped chance supports join it.
     pub fixed_support: bool,
+    /// G4 layer 2b: the exact worlds of a SAMPLED reveal edge, set on its first
+    /// visit. See `reveal_strata`.
+    pub strata: Option<Box<Strata>>,
+}
+
+/// G4 layer 2b: a sampled reveal edge split into the worlds whose value is
+/// PROVEN (`tactics::proven_value` on the world's state -- the check every
+/// child gets) and the rest. The proven part is counted analytically and only
+/// the open worlds are sampled, so the edge's Q is
+///
+///     Q = sum_{proven k} p_k v_k + (1 - mass) * E[v | open]
+///
+/// with every backed-up value mapped through `v -> value_p0 + (1 - mass) v`
+/// (`backup`): unbiased, and a world where the mover loses on the spot counts
+/// from the first visit instead of when a sample first happens to draw it.
+/// Root edges never carry one: forced expansion already enumerates them.
+pub struct Strata {
+    /// Probability of the proven worlds.
+    pub mass: f64,
+    /// `sum p_k v_k` over the proven worlds, player-0 frame.
+    pub value_p0: f64,
+    /// `sum p_k o_k` over the proven worlds, player-0 frame.
+    pub outlook: Outlook,
+    /// The open worlds: `(outcomes, probability, key)`.
+    open: Vec<(Vec<Vec<usize>>, f64, Vec<Vec<i32>>)>,
+    /// One proven world, materialized when every world is proven.
+    any_proven: Option<(Vec<Vec<usize>>, f64, Vec<Vec<i32>>)>,
+}
+
+/// Largest outcome count an interior reveal is enumerated over (a single
+/// reveal is at most 23; two-card reveals mostly exceed this and stay sampled).
+const STRATA_MAX_WORLDS: usize = 64;
+
+/// The exact worlds of `action_index`'s reveal at `state`, or None when the
+/// edge has none (or is not worth enumerating). Only card reveals: a Library
+/// draw has its own offer node, an Age deal is sample-only.
+pub(crate) fn reveal_strata(state: &GameState, action_index: usize, specs: &[ChanceSpec]) -> Option<Strata> {
+    if specs.is_empty() || specs.iter().any(|s| s.kind != ChanceKind::CardReveal) {
+        return None;
+    }
+    // Necessary for the common case, a world where the opponent wins on the
+    // spot. Worlds the mover wins outright (an extra turn into a win) are only
+    // seen past this screen; missing them costs recall, not soundness.
+    if !crate::tactics::opponent_may_win_next(state) {
+        return None;
+    }
+    let worlds = chance::enumerate_chains(state, specs);
+    if worlds.is_empty() || worlds.len() > STRATA_MAX_WORLDS {
+        return None;
+    }
+    let action = decode_action(state, action_index);
+    let mut strata = Strata {
+        mass: 0.0,
+        value_p0: 0.0,
+        outlook: [0.0; 7],
+        open: Vec::new(),
+        any_proven: None,
+    };
+    for (outcomes, probability, key) in worlds {
+        let mut child = state.clone();
+        if child.apply_with_chance(&action, &outcomes).is_err() {
+            return None;
+        }
+        let proven = if child.phase == Phase::Complete {
+            Some((
+                terminal_value_p0(&child),
+                crate::eval::terminal_outlook_p0(&child),
+            ))
+        } else {
+            crate::tactics::proven_value(&child)
+        };
+        match proven {
+            Some((value, outlook)) => {
+                strata.mass += probability;
+                strata.value_p0 += probability * value;
+                for k in 0..7 {
+                    strata.outlook[k] += probability * outlook[k];
+                }
+                strata.any_proven.get_or_insert((outcomes, probability, key));
+            }
+            None => strata.open.push((outcomes, probability, key)),
+        }
+    }
+    (strata.mass > 0.0).then_some(strata)
+}
+
+impl Strata {
+    pub fn open_worlds(&self) -> usize {
+        self.open.len()
+    }
+
+    /// Every world proven: the edge's value is exact.
+    fn closed(&self) -> bool {
+        self.open.is_empty()
+    }
+
+    /// The world a visit descends into: an open world drawn by probability,
+    /// or -- when none is open -- a proven one, whose value `backup` replaces.
+    fn draw(&self, rng: &mut Rng) -> (Vec<Vec<usize>>, f64, Vec<Vec<i32>>) {
+        if self.open.is_empty() {
+            return self.any_proven.clone().expect("strata hold a proven world");
+        }
+        let total: f64 = self.open.iter().map(|(_, p, _)| p).sum();
+        let mut target = rng.next_float() * total;
+        for world in &self.open {
+            if target < world.1 {
+                return world.clone();
+            }
+            target -= world.1;
+        }
+        self.open.last().expect("open worlds").clone()
+    }
 }
 
 impl Edge {
@@ -182,6 +294,8 @@ pub struct Arena {
     tactics: bool,
     /// G4b: Library offer nodes built in this search.
     library_offer_nodes: usize,
+    /// G4 layer 2b: interior reveal edges given exact strata.
+    strata_edges: usize,
 }
 
 impl Arena {
@@ -197,6 +311,7 @@ impl Arena {
             library_offers: false,
             tactics: false,
             library_offer_nodes: 0,
+            strata_edges: 0,
         }
     }
 
@@ -380,6 +495,7 @@ fn expand(arena: &mut Arena, node_id: NodeId, priors: Vec<f64>) -> PyResult<()> 
                 incomplete: 0,
                 probability_weighted: false,
                 fixed_support: false,
+                strata: None,
             }
         })
         .collect();
@@ -459,11 +575,37 @@ fn closed_child(arena: &mut Arena, node_id: NodeId, edge_idx: usize, rng: &mut R
         &arena.nodes[node_id].state,
         &arena.nodes[node_id].edges[edge_idx].specs,
     );
+    // G4 layer 2b: an interior reveal's exact worlds, found on its first
+    // visit (a sampled edge's first visit materializes its first child).
+    if library.is_none()
+        && arena.tactics
+        && crate::tactics::reveal_strata_enabled()
+        && node_id != arena.root_id
+    {
+        let first_visit = {
+            let edge = &arena.nodes[node_id].edges[edge_idx];
+            edge.children.is_empty() && edge.strata.is_none() && !edge.probability_weighted
+        };
+        if first_visit {
+            let strata = {
+                let node = &arena.nodes[node_id];
+                let edge = &node.edges[edge_idx];
+                reveal_strata(&node.state, edge.action_index, &edge.specs)
+            };
+            if let Some(strata) = strata {
+                arena.strata_edges += 1;
+                arena.nodes[node_id].edges[edge_idx].strata = Some(Box::new(strata));
+            }
+        }
+    }
     let (mut outcomes, mut probability, mut key) = {
         let node = &arena.nodes[node_id];
         let edge = &node.edges[edge_idx];
         let specs = library.as_deref().unwrap_or(&edge.specs);
-        if specs.is_empty() {
+        if let Some(strata) = edge.strata.as_deref() {
+            let (outcomes, probability, key) = strata.draw(rng);
+            (outcomes, Some(probability), key)
+        } else if specs.is_empty() {
             (Vec::new(), Some(1.0), Vec::new())
         } else {
             chance::sample_outcomes(&node.state, specs, rng)
@@ -653,6 +795,33 @@ enum OutlookFate {
     /// over options whose outlooks are not kept: no outlook describes the
     /// value any more, so this simulation contributes none (review finding 1).
     Dropped,
+    /// G4 layer 2b: one or more stratified reveal edges mapped the scalar
+    /// `v -> a + s v`; the leaf's outlook takes the same map, `offset + scale o`.
+    Affine { offset: Outlook, scale: f64 },
+}
+
+impl OutlookFate {
+    /// Compose a stratified edge's map `o -> offset + scale o` on top.
+    fn through_strata(self, offset: &Outlook, scale: f64) -> Self {
+        match self {
+            OutlookFate::Leaf => OutlookFate::Affine { offset: *offset, scale },
+            OutlookFate::Exact(witness) => {
+                let mut mixed = *offset;
+                for k in 0..7 {
+                    mixed[k] += scale * witness[k];
+                }
+                OutlookFate::Exact(mixed)
+            }
+            OutlookFate::Affine { offset: inner, scale: inner_scale } => {
+                let mut mixed = *offset;
+                for k in 0..7 {
+                    mixed[k] += scale * inner[k];
+                }
+                OutlookFate::Affine { offset: mixed, scale: scale * inner_scale }
+            }
+            OutlookFate::Dropped => OutlookFate::Dropped,
+        }
+    }
 }
 
 /// The value that reached the root, and whether something replaced it.
@@ -677,6 +846,14 @@ fn backup(arena: &mut Arena, pending: PendingSimulation, value_p0: f64) -> Backu
             .any(|(_, child)| child.node_id == step.chance_child_id));
         {
             let edge = &mut arena.nodes[step.node_id].edges[step.edge_id];
+            // G4 layer 2b: a sampled world stands for the OPEN worlds only;
+            // the proven ones enter exactly.
+            if let Some(strata) = edge.strata.as_deref() {
+                let scale = 1.0 - strata.mass;
+                value_p0 = strata.value_p0 + scale * value_p0;
+                replaced = true;
+                outlook = outlook.through_strata(&strata.outlook, scale);
+            }
             edge.visits += 1;
             edge.value_sum_p0 += value_p0;
         }
@@ -831,6 +1008,10 @@ fn edge_exact(arena: &Arena, node_id: NodeId, edge_idx: usize) -> Option<(f64, O
     let edge = &arena.nodes[node_id].edges[edge_idx];
     if edge.children.is_empty() {
         return None;
+    }
+    if let Some(strata) = edge.strata.as_deref() {
+        // G4 layer 2b: exact once every world is proven.
+        return strata.closed().then_some((strata.value_p0, strata.outlook));
     }
     if edge.specs.is_empty() {
         let (_, child) = edge.children.first()?;
@@ -1818,6 +1999,13 @@ impl SearchSession {
             OutlookFate::Leaf => outlook,
             OutlookFate::Exact(witness) => Some(witness),
             OutlookFate::Dropped => None,
+            OutlookFate::Affine { offset, scale } => outlook.map(|o| {
+                let mut mixed = offset;
+                for k in 0..7 {
+                    mixed[k] += scale * o[k];
+                }
+                mixed
+            }),
         };
         if let Some(o) = outlook {
             for k in 0..7 {
@@ -2320,6 +2508,11 @@ impl SearchSession {
     /// owns their construction).
     pub fn library_offer_nodes(&self) -> usize {
         self.arena.library_offer_nodes
+    }
+
+    /// G4 layer 2b: interior reveal edges with exact strata so far.
+    pub fn strata_edges(&self) -> usize {
+        self.arena.strata_edges
     }
 
     pub fn sims_done(&self) -> usize {
@@ -3278,6 +3471,7 @@ mod review_6ab4342_tests {
             incomplete: 0,
             probability_weighted: false,
             fixed_support: false,
+            strata: None,
         }
     }
 
@@ -3323,6 +3517,75 @@ mod review_6ab4342_tests {
 
     fn utility(o: Outlook) -> f64 {
         o[..3].iter().sum::<f64>() - o[3..6].iter().sum::<f64>()
+    }
+
+    fn strata(mass: f64, value_p0: f64, open: usize) -> Box<Strata> {
+        let world = (vec![], 0.0, vec![]);
+        let mut o = outlook(-1.0);
+        for k in 0..7 {
+            o[k] *= mass;
+        }
+        Box::new(Strata {
+            mass,
+            value_p0,
+            outlook: o,
+            open: vec![world.clone(); open],
+            any_proven: Some(world),
+        })
+    }
+
+    /// G4 layer 2b: a sample through a stratified reveal edge stands for the
+    /// open worlds only; the proven quarter enters exactly, for the edge and
+    /// everything above it, scalar and outlook alike.
+    #[test]
+    fn a_stratified_reveal_counts_its_proven_worlds_exactly() {
+        let mut a = Arena::new(node());
+        for _ in 0..2 {
+            a.push(node());
+        }
+        a.nodes[0].legal = vec![0];
+        a.nodes[0].edges = vec![edge(0, Some(1), 0.0)];
+        a.nodes[0].edges[0].visits = 0;
+        a.nodes[1].legal = vec![0];
+        let mut reveal = edge(0, Some(2), 0.0);
+        reveal.visits = 0;
+        reveal.strata = Some(strata(0.25, -0.25, 3));
+        a.nodes[1].edges = vec![reveal];
+        let path = vec![step(0, 0, 1), step(1, 0, 2)];
+        let fate = backup(&mut a, pending(path, 2), 0.6);
+        let expected = -0.25 + 0.75 * 0.6;
+        assert!((a.edge_q_p0(1, 0) - expected).abs() < 1e-12);
+        assert!((a.edge_q_p0(0, 0) - expected).abs() < 1e-12);
+        assert!((fate.value_p0 - expected).abs() < 1e-12 && fate.replaced);
+        // The leaf's outlook takes the same map, so the panel's split agrees
+        // with Q: utility(0.25 * loss + 0.75 * outlook(0.6)) == expected.
+        let OutlookFate::Affine { offset, scale } = fate.outlook else {
+            panic!("expected an affine outlook, got {:?}", fate.outlook);
+        };
+        let leaf = outlook(0.6);
+        let mut mixed = offset;
+        for k in 0..7 {
+            mixed[k] += scale * leaf[k];
+        }
+        assert!((utility(mixed) - expected).abs() < 1e-12);
+        assert!(edge_exact(&a, 1, 0).is_none(), "open worlds remain");
+    }
+
+    #[test]
+    fn a_reveal_with_every_world_proven_is_exact() {
+        let mut a = Arena::new(node());
+        a.push(node());
+        let mut reveal = edge(0, Some(1), 0.0);
+        reveal.strata = Some(strata(1.0, -1.0, 0));
+        a.nodes[0].edges = vec![reveal];
+        assert_eq!(edge_exact(&a, 0, 0).map(|(v, _)| v), Some(-1.0));
+        // Whatever the materialized world returned, the edge reports the exact
+        // value: the open share it stands for is zero.
+        a.nodes[0].edges[0].visits = 0;
+        a.nodes[0].edges[0].value_sum_p0 = 0.0;
+        a.push(node());
+        let fate = backup(&mut a, pending(vec![step(0, 0, 1)], 1), 0.9);
+        assert_eq!(fate.value_p0, -1.0);
     }
 
     /// Finding 2: a leaf selected before its ancestor was proven must not

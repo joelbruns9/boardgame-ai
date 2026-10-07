@@ -219,6 +219,42 @@ G8.3 afterstate value head (only after G8.2 supplies correct targets). W9-style
 reply sharing across reveal worlds is closed (four nulls). G8.4 root
 verification for the advisor any time.
 
+**Owner decisions 2026-10-06 (cloud run):**
+- Sims: 1,000-1,200 per move, every move full (staged ramp optional).
+- Empty replay buffer at launch (the pretrain already absorbed run07); train
+  steps tied to inflow for the first iterations.
+- **Promotion gate DROPPED.** Generation always uses the latest learner
+  (`latest` mode). Progress is read from anchors: the W7a self-anchor (vs the
+  learner 20k games back, 400 games every 10k -- the stopping rule) plus a
+  FIXED anchor vs the starting checkpoint (cumulative; to add). Correction to
+  an earlier claim: soft_gate never froze the generator -- it generates with
+  the learner and only falls back to current_best after a REJECT.
+- G2b phase-out measured on the first new buffers.
+- Builds before launch: G4 layer 2b, G10a (with denial / consequence
+  features: denies science/military incl. the Mausoleum distinction, opens a
+  next-turn threat incl. extra turns, control flip), G12 restart archive
+  (doubles as a backward curriculum). G9 parked until G10a priors exist.
+- Capacity: stay at 8 layers (W8 probe above).
+
+**G4 layer 2b -- BUILT 2026-10-06 (interior reveals only).** Correction: at
+the ROOT this already existed -- forced root expansion enumerates every reveal
+world and G4 settles proven ones exactly, so G0's reveal_trap rate (~29%) is
+NOT a bound failure: search sees the exact losing share (median 20% for the
+picked move, 3 of 300 picks >= 50%) and judges the rest worth it; the class
+measures exposure, not regret. Interior (sampled) reveal edges now get
+`Strata` on their first visit (`tree_resumable.rs`): every world is checked
+with `tactics::proven_value`; proven worlds are counted analytically and only
+open worlds are sampled, each backed-up value mapped `v -> sum p_k v_k +
+(1 - mass) v` (outlook alike), so the edge Q is unbiased and a world where the
+mover loses on the spot counts from the first visit. Card reveals only, <= 64
+worlds, behind the `losing_mass` reach screen; switch
+`swr.set_exact_reveal_strata` (on; only consulted with exact tactics on).
+Strata are a superset of `losing_mass`'s worlds (they also prove the mover's
+own extra-turn losses). Tests: Rust backup/exactness units, Python agreement
+with `losing_mass` on bot games, on/off switch.
+Self-play cost (laptop, final_41_100 net, 32 games x 200 sims, tactics on,
+3 alternating pairs): -4.6 / -3.5 / -5.3% moves/s with strata on.
+
 ## Execution order
 
 Steps 1-4 are laptop work and can overlap; 5+ need a box.

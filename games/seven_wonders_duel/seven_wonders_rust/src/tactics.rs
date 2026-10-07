@@ -54,6 +54,30 @@ pub fn losses_enabled() -> bool {
     EXACT_LOSSES.load(Ordering::Relaxed)
 }
 
+/// G4 layer 2b: exact worlds of an interior reveal edge (`tree_resumable`
+/// `reveal_strata`). Its own switch, ON by default, consulted only while
+/// `enabled()` and the search proves.
+static REVEAL_STRATA: AtomicBool = AtomicBool::new(true);
+
+pub fn set_reveal_strata_enabled(enabled: bool) {
+    REVEAL_STRATA.store(enabled, Ordering::Relaxed);
+}
+
+pub fn reveal_strata_enabled() -> bool {
+    REVEAL_STRATA.load(Ordering::Relaxed)
+}
+
+/// Necessary condition for the mover's opponent to be left a forced win by
+/// one of the mover's actions (the screen `losing_mass` applies).
+pub fn opponent_may_win_next(state: &GameState) -> bool {
+    let mover = actor(state);
+    let present = present_cards(state);
+    within_reach(state, 1 - mover, 1)
+        || replay_reach(state, 1 - mover, EXTRA_TURNS)
+        || (state.age == 3 && present <= 2)
+        || (state.age == 3 && present <= 2 + EXTRA_TURNS && can_replay(state, 1 - mover))
+}
+
 fn actor(state: &GameState) -> usize {
     crate::tree::state_actor(state)
 }
@@ -349,11 +373,7 @@ pub fn losing_mass(state: &GameState) -> Vec<Option<(f64, bool)>> {
         return Vec::new();
     }
     let mover = actor(state);
-    let present = present_cards(state);
-    let can_lose = within_reach(state, 1 - mover, 1)
-        || replay_reach(state, 1 - mover, EXTRA_TURNS)
-        || (state.age == 3 && present <= 2)
-        || (state.age == 3 && present <= 2 + EXTRA_TURNS && can_replay(state, 1 - mover));
+    let can_lose = opponent_may_win_next(state);
     legal_action_indices(state)
         .into_iter()
         .map(|index| {

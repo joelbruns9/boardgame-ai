@@ -551,6 +551,7 @@ impl RustPuctSearch {
             ("option_rows", m.option_rows),
             ("shared_afterstates", m.shared_afterstates),
             ("library_offer_nodes", self.session.library_offer_nodes()),
+            ("strata_edges", self.session.strata_edges()),
             ("requested", m.requested_nn_leaves),
             ("terminal", m.terminal_leaves),
         ])
@@ -839,6 +840,17 @@ impl RustGame {
     /// (`tactics::losing_mass`).
     fn losing_mass(&self) -> Vec<Option<(f64, bool)>> {
         tactics::losing_mass(&self.state)
+    }
+
+    /// G4 layer 2b: `(proven mass, proven sum p*v player-0, open worlds)` of
+    /// the legal action at `position`'s reveal, or None (no proven world, not a
+    /// card reveal, or the screen rules it out). Needs `set_exact_tactics(True)`.
+    fn reveal_strata(&self, position: usize) -> Option<(f64, f64, usize)> {
+        let index = *crate::codec::legal_action_indices(&self.state).get(position)?;
+        let action = crate::codec::decode_action(&self.state, index);
+        let specs = crate::chance::chance_signature(&self.state, &action);
+        crate::tree_resumable::reveal_strata(&self.state, index, &specs)
+            .map(|s| (s.mass, s.value_p0, s.open_worlds()))
     }
 
     /// G0: `+1` / `-1` / `0` per legal action (`tactics::classify_actions`).
@@ -3240,6 +3252,18 @@ fn exact_tactics_losses() -> bool {
 }
 
 #[pyfunction]
+/// G4 layer 2b: count an interior reveal's proven worlds exactly. Consulted
+/// only while `set_exact_tactics(True)`; on by default.
+fn set_exact_reveal_strata(enabled: bool) {
+    tactics::set_reveal_strata_enabled(enabled);
+}
+
+#[pyfunction]
+fn exact_reveal_strata() -> bool {
+    tactics::reveal_strata_enabled()
+}
+
+#[pyfunction]
 /// Set the cheap-move root width. See `self_play::set_cheap_top_k`.
 fn set_cheap_top_k(width: usize) {
     self_play::set_cheap_top_k(width);
@@ -3669,6 +3693,12 @@ mod seven_wonders_rust {
 
     #[pymodule_export]
     use super::exact_tactics_losses;
+
+    #[pymodule_export]
+    use super::set_exact_reveal_strata;
+
+    #[pymodule_export]
+    use super::exact_reveal_strata;
 
     #[pymodule_export]
     use super::set_endgame_cost_model;

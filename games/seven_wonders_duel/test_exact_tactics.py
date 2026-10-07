@@ -376,3 +376,76 @@ def test_a_library_build_is_one_offer_node_over_the_whole_pool():
     # where the Library is built later add their own, hence >=.)
     assert on["library_offer_nodes"] >= 1
     assert on["option_expansions"] >= 1
+
+
+def _reveal_positions(records):
+    """`(state, previous_state)` for every position with a revealing action that
+    leaves the opponent a forced win in some world (`losing_mass` > 0)."""
+
+    found = []
+    for record in records:
+        previous = {}
+
+        def visit(state, move, previous=previous):
+            if state.phase is Phase.PLAY_AGE and state.pending_choice is None:
+                masses = rust_game_from_state(state).losing_mass()
+                if any(m is not None and m[1] and m[0] > 0.0 for m in masses):
+                    found.append((state.clone(), previous.get("s")))
+            previous["s"] = state.clone()
+
+        replay(record, on_state=visit)
+    return found
+
+
+def test_reveal_strata_agree_with_the_losing_mass_reference():
+    """G4 layer 2b: an interior reveal's proven worlds include exactly the
+    worlds `losing_mass` (the G0 reference) finds, and their summed value is
+    what those worlds plus any proven wins are worth."""
+
+    positions = _reveal_positions(pe.fresh_bot_records(60, seed=8080))
+    assert positions, "fixture has no reveal with forced-loss exposure"
+    swr.set_exact_tactics(True)
+    checked = 0
+    for state, _previous in positions:
+        game = rust_game_from_state(state)
+        sign = 1.0 if state_actor(state) == 0 else -1.0
+        for position, entry in enumerate(game.losing_mass()):
+            if entry is None or not entry[1]:
+                continue
+            losing = entry[0]
+            strata = game.reveal_strata(position)
+            if strata is None:
+                continue  # an over-cap (two-card) reveal stays sampled
+            mass, value_p0, open_worlds = strata
+            assert mass >= losing - 1e-9
+            assert 0.0 < mass <= 1.0 + 1e-9
+            # Every `losing_mass` world is in, at -1 for the mover. The other
+            # proven worlds are worth +-1: the mover's wins, and its losses the
+            # reference does not look for (an extra turn whose every follow-up
+            # loses) -- a superset, never fewer.
+            mover_value = sign * value_p0
+            assert -mass - 1e-9 <= mover_value <= mass - 2.0 * losing + 1e-9
+            assert (open_worlds == 0) == (mass >= 1.0 - 1e-9)
+            checked += 1
+    assert checked, "no reveal was stratified"
+
+
+def test_interior_reveals_are_stratified_only_when_switched_on():
+    positions = [p for _s, p in _reveal_positions(pe.fresh_bot_records(60, seed=8080)) if p]
+    assert positions
+
+    def run(strata: bool) -> int:
+        swr.set_exact_tactics(True)
+        swr.set_exact_reveal_strata(strata)
+        try:
+            total = 0
+            for root in positions[:12]:
+                handle = swr.RustPuctSearch.open_mock(rust_game_from_state(root), 400, 11)
+                handle.advance(400)
+                total += handle.tactics_metrics()["strata_edges"]
+            return total
+        finally:
+            swr.set_exact_reveal_strata(True)
+
+    assert run(True) > 0
+    assert run(False) == 0
