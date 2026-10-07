@@ -214,3 +214,50 @@ def test_the_phase_out_census_counts_the_changes_g2b_makes(records):
             moves.append(replace(move, policy_target=target))
         cleaned.append(replace(record, moves=moves))
     assert census(cleaned, retain=0)["policy_changed"] == 0
+
+
+def test_the_census_counts_specialist_owned_policy_corrections(records):
+    """Review of ebc70c0, #2: a specialist-owned row has no policy in the
+    general projection, yet G2b rewrites the target that specialist trains on."""
+
+    from .g2b_census import census
+
+    owned = [_as_searched(record, route="specialist:1") for record in records]
+    result = census(owned, retain=0)
+    assert result["routes"]["general"]["policy_rows"] == 0
+    assert result["routes"]["specialist:1"]["policy_rows"] > 0
+    assert result["routes"]["specialist:1"]["policy_changed"] > 0
+    assert result["policy_changed_any_route"] == result["routes"]["specialist:1"]["policy_changed"]
+
+
+def test_the_census_counts_an_exactness_change_at_an_unchanged_value(records, monkeypatch):
+    """Review of ebc70c0, #3: +1 expectimax -> +1 exact switches the row from
+    utility to proof supervision, so it is a value change."""
+
+    from . import g2b_census
+
+    record = _as_searched(records[0])
+    base = [
+        replace(row, tactic=TACTIC_NONE, solver_value=None, solver_exact=False,
+                certain_win=False)
+        for row in examples_from_record(record)
+    ]
+    expectimax = list(base)
+    expectimax[3] = replace(base[3], solver_value=1.0, solver_exact=False)
+    proven = list(base)
+    proven[3] = replace(base[3], solver_value=1.0, solver_exact=True, tactic=TACTIC_WIN)
+    monkeypatch.setattr(
+        g2b_census, "_derive",
+        lambda records, *, tactic_labels, retain: [proven if tactic_labels else expectimax],
+    )
+    result = g2b_census.census([record], retain=0)
+    assert result["value_changed"] == 1
+    assert result["value_exactness_only"] == 1
+    assert result["value_changed_effective"] == 1
+
+    # Under the certain-win rule the exact win is the target either way.
+    proven[3] = replace(proven[3], certain_win=True)
+    expectimax[3] = replace(expectimax[3], certain_win=True)
+    result = g2b_census.census([record], retain=0)
+    assert result["value_changed"] == 1
+    assert result["value_changed_effective"] == 0

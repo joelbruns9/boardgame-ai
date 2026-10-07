@@ -55,6 +55,9 @@
 #   LEAGUE_SCHEDULE=random  `cycle` fixes each iteration's specialist class
 #                   (S M S M S for science 0.15 / military 0.10) instead of a draw
 #   RESTART_FRACTION=0  G12: share of games restarted from archived search states
+#   EXACT_TACTICS=1 TACTIC_LABELS=1  G4 exact tactics in every Rust search and
+#                   G2b tactic relabelling at derivation. Both default on in
+#                   phase_d; passed explicitly so the launch line records them.
 #   PROBATION_RESET_AFTER=4 REVERT_RESET_AFTER=3
 #   LAUNCH_FLAGS_JSON=<f4_cloud_finalize output>  measured --rust-* flags (W6.3)
 #   PRECISION_ARENA_CHECKPOINT=<path>             runs W6.2b before launching
@@ -330,6 +333,11 @@ PROMOTION_EVERY="${PROMOTION_EVERY:-10}"
 GENERATOR_MODE="${GENERATOR_MODE:-soft_gate}"
 LEAGUE_SCHEDULE="${LEAGUE_SCHEDULE:-random}"
 RESTART_FRACTION="${RESTART_FRACTION:-0}"
+EXACT_TACTICS="${EXACT_TACTICS:-1}"
+TACTIC_LABELS="${TACTIC_LABELS:-1}"
+TACTIC_FLAGS=()
+[ "$EXACT_TACTICS" = "1" ] && TACTIC_FLAGS+=(--exact-tactics) || TACTIC_FLAGS+=(--no-exact-tactics)
+[ "$TACTIC_LABELS" = "1" ] && TACTIC_FLAGS+=(--tactic-labels) || TACTIC_FLAGS+=(--no-tactic-labels)
 # `latest` with a gate still scheduled is not "no gate": the controller gates
 # every PROMOTION_EVERY iterations and a REJECT resets the learner to
 # current_best -- which, with nothing ever promoted, is the starting network.
@@ -1207,6 +1215,7 @@ TRAIN_CMD=(
   --hof-opponent-fraction "$HOF_FRACTION" --hof-start-games "$HOF_START_GAMES"
   --selfplay-generator-mode "$GENERATOR_MODE"
   --restart-fraction "$RESTART_FRACTION"
+  "${TACTIC_FLAGS[@]}"
   --bootstrap-policy "$BOOTSTRAP_POLICY"
   --promotion-every "$PROMOTION_EVERY"
   --revert-reset-after "$REVERT_RESET_AFTER"

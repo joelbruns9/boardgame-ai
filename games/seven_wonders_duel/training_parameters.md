@@ -110,6 +110,7 @@ two is visible.
   --solver-fallback-research `
   --selfplay-generator-mode soft_gate `
   --restart-fraction 0 `
+  --exact-tactics --tactic-labels `
   --bootstrap-policy auto_first_trained `
   --promotion-every 10 --promotion-min-lcb 0.50 --revert-max-ucb 0.48 `
   --revert-reset-after 3 --probation-reset-after 4 `

@@ -2352,3 +2352,41 @@ def test_a_second_hof_change_starts_from_the_effective_regime(tmp_path):
         "from": 0.15,
         "to": 0.30,
     }
+
+
+# -- league schedule on resume (review of ebc70c0, #1) ---------------------
+
+
+def test_a_cycle_run_cannot_resume_as_random(tmp_path):
+    started = _resumable(tmp_path, league_schedule="cycle")
+    payload = json.loads(started.manifest.path.read_text(encoding="utf-8"))
+    resumed = PhaseDLoop(_soft_gate_config(tmp_path))
+    with pytest.raises(ValueError, match="league_schedule"):
+        resumed._refuse_changed_schedules(payload)
+
+
+def test_a_random_run_cannot_resume_as_cycle(tmp_path):
+    started = _resumable(tmp_path)
+    payload = json.loads(started.manifest.path.read_text(encoding="utf-8"))
+    resumed = PhaseDLoop(_soft_gate_config(tmp_path, league_schedule="cycle"))
+    with pytest.raises(ValueError, match="league_schedule"):
+        resumed._refuse_changed_schedules(payload)
+
+
+def test_a_pre_switch_manifest_ran_random(tmp_path):
+    """No stored value means the run drew at random: random resumes, cycle is
+    refused."""
+
+    started = _resumable(tmp_path)
+    payload = json.loads(started.manifest.path.read_text(encoding="utf-8"))
+    payload["config"].pop("league_schedule", None)
+    PhaseDLoop(_soft_gate_config(tmp_path))._refuse_changed_schedules(payload)
+    resumed = PhaseDLoop(_soft_gate_config(tmp_path, league_schedule="cycle"))
+    with pytest.raises(ValueError, match="league_schedule"):
+        resumed._refuse_changed_schedules(payload)
+
+
+def test_an_unchanged_cycle_run_resumes(tmp_path):
+    started = _resumable(tmp_path, league_schedule="cycle")
+    payload = json.loads(started.manifest.path.read_text(encoding="utf-8"))
+    PhaseDLoop(_soft_gate_config(tmp_path, league_schedule="cycle"))._refuse_changed_schedules(payload)

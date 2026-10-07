@@ -13,8 +13,15 @@ and on, pairs the rows by `(game, move)` and counts:
   labelled row whose search already put no mass on the losing moves is
   unchanged.
 * `policy_changed` -- policy rows whose move target moved by total variation
-  >= `--tv` (default 0.01): search put real mass where G2b removes it.
-* `value_changed` -- rows whose exact value (`solver_value`) G2b set or changed.
+  >= `--tv` (default 0.01): search put real mass where G2b removes it. Counted
+  PER TRAINED ROUTE (`general`, `specialist:N`): a specialist-owned row has no
+  policy in the general's projection but G2b still rewrites the target its
+  own model trains on (review of ebc70c0, #2).
+* `value_changed` -- rows whose exact-value supervision G2b changed: the
+  scalar (`solver_value`) OR its exactness (`solver_exact`). An unchanged +-1
+  that turns exact switches the row from expectimax utility to categorical
+  proof supervision (review of ebc70c0, #3). `value_changed_effective` drops
+  the exactness-only rows already overridden by the certain-win rule.
 
 Laptop, seconds per buffer::
 
@@ -31,77 +38,137 @@ from pathlib import Path
 import numpy as np
 
 from .buffer import read_records
-from .dataset import TACTIC_BLOCK, TACTIC_LOSS, TACTIC_NONE, TACTIC_WIN, derive_records_rust
+from .dataset import (
+    TACTIC_BLOCK,
+    TACTIC_LOSS,
+    TACTIC_NONE,
+    TACTIC_WIN,
+    derive_records_rust,
+    project_examples,
+)
+from .specialist import GENERAL_ROUTE
 
 _CLASS = {TACTIC_WIN: "win", TACTIC_LOSS: "all_lose", TACTIC_BLOCK: "block"}
 
 
-def _rows(records, *, tactic_labels: bool, retain: int) -> dict:
-    out = {}
-    for rows, _stats in derive_records_rust(
-        records, retain_proofs_per_game=retain, tactic_labels=tactic_labels
-    ):
-        for row in rows:
-            if row.move_index is None:
-                continue
-            out[(row.iteration, row.game_key, row.move_index)] = row
-    return out
+def _derive(records, *, tactic_labels: bool, retain: int) -> list:
+    """Per-record example lists, general derivation (the cached one)."""
+
+    return [
+        rows
+        for rows, _stats in derive_records_rust(
+            records, retain_proofs_per_game=retain, tactic_labels=tactic_labels
+        )
+    ]
+
+
+def _routes(records) -> list[str]:
+    routes = {GENERAL_ROUTE}
+    for record in records:
+        for move in record.moves:
+            route = getattr(move, "target_route", None)
+            if route:
+                routes.add(route)
+    return sorted(routes)
+
+
+def _keyed(rows) -> dict:
+    return {
+        (row.iteration, row.game_key, row.move_index): row
+        for row in rows
+        if row.move_index is not None
+    }
+
+
+def _tv(a, b) -> float:
+    return 0.5 * float(
+        np.abs(a.astype(np.float64) - b.astype(np.float64)).sum()
+    )
 
 
 def census(records, *, retain: int = 4, tv: float = 0.01) -> dict:
     """The change counts for one set of records (see the module docstring)."""
 
-    plain = _rows(records, tactic_labels=False, retain=retain)
-    labelled = _rows(records, tactic_labels=True, retain=retain)
-    if plain.keys() != labelled.keys():
-        raise AssertionError("tactic labels changed WHICH rows exist, not just their targets")
+    plain = _derive(records, tactic_labels=False, retain=retain)
+    labelled = _derive(records, tactic_labels=True, retain=retain)
     counts = {
         "games": len(records),
-        "rows": len(labelled),
-        "policy_rows": 0,
+        "rows": 0,
         "labelled": 0,
-        "policy_changed": 0,
         "value_changed": 0,
+        "value_exactness_only": 0,
+        "value_changed_effective": 0,
         "by_class": {},
+        "routes": {
+            route: {"policy_rows": 0, "policy_changed": 0, "tv_sum": 0.0}
+            for route in _routes(records)
+        },
     }
-    moved = []
-    for key, after in labelled.items():
-        before = plain[key]
-        if after.has_policy:
-            counts["policy_rows"] += 1
-        tactic = int(getattr(after, "tactic", TACTIC_NONE))
-        if tactic == TACTIC_NONE:
-            continue
-        counts["labelled"] += 1
-        bucket = counts["by_class"].setdefault(
-            _CLASS.get(tactic, str(tactic)),
-            {"labelled": 0, "policy_changed": 0, "value_changed": 0},
-        )
-        bucket["labelled"] += 1
-        if (
-            after.has_policy
-            and after.policy_target is not None
-            and before.policy_target is not None
-        ):
-            distance = 0.5 * float(
-                np.abs(
-                    after.policy_target.astype(np.float64)
-                    - before.policy_target.astype(np.float64)
-                ).sum()
+    for record, before_rows, after_rows in zip(records, plain, labelled):
+        before_by, after_by = _keyed(before_rows), _keyed(after_rows)
+        if before_by.keys() != after_by.keys():
+            raise AssertionError(
+                "tactic labels changed WHICH rows exist, not just their targets"
             )
-            if distance >= tv:
-                counts["policy_changed"] += 1
-                bucket["policy_changed"] += 1
-                moved.append(distance)
-        if after.solver_value != before.solver_value:
-            counts["value_changed"] += 1
-            bucket["value_changed"] += 1
+        counts["rows"] += len(after_by)
+        changed_keys = set()
+        for key, after in after_by.items():
+            before = before_by[key]
+            tactic = int(getattr(after, "tactic", TACTIC_NONE))
+            if tactic == TACTIC_NONE:
+                continue
+            changed_keys.add(key)
+            counts["labelled"] += 1
+            bucket = counts["by_class"].setdefault(
+                _CLASS.get(tactic, str(tactic)),
+                {"labelled": 0, "value_changed": 0},
+            )
+            bucket["labelled"] += 1
+            scalar = after.solver_value != before.solver_value
+            exactness = bool(after.solver_exact) != bool(before.solver_exact)
+            if scalar or exactness:
+                counts["value_changed"] += 1
+                bucket["value_changed"] += 1
+                if not scalar:
+                    counts["value_exactness_only"] += 1
+                # A certain-win row's value target is the exact win whatever
+                # the solver fields say, so exactness alone changes nothing.
+                if scalar or not getattr(after, "certain_win", False):
+                    counts["value_changed_effective"] += 1
+        for route, tally in counts["routes"].items():
+            before_view = _keyed(project_examples(before_rows, record, route))
+            after_view = _keyed(project_examples(after_rows, record, route))
+            for key, after in after_view.items():
+                if not after.has_policy or after.policy_target is None:
+                    continue
+                tally["policy_rows"] += 1
+                if key not in changed_keys:
+                    continue
+                before = before_view[key]
+                if before.policy_target is None:
+                    continue
+                distance = _tv(after.policy_target, before.policy_target)
+                if distance >= tv:
+                    tally["policy_changed"] += 1
+                    tally["tv_sum"] += distance
     rows = max(counts["rows"], 1)
-    policy_rows = max(counts["policy_rows"], 1)
     counts["labelled_share"] = counts["labelled"] / rows
-    counts["policy_changed_share_of_policy_rows"] = counts["policy_changed"] / policy_rows
     counts["value_changed_share"] = counts["value_changed"] / rows
-    counts["policy_tv_mean_when_changed"] = float(np.mean(moved)) if moved else 0.0
+    counts["value_changed_effective_share"] = counts["value_changed_effective"] / rows
+    for tally in counts["routes"].values():
+        tally["policy_changed_share"] = tally["policy_changed"] / max(tally["policy_rows"], 1)
+        tally["policy_tv_mean_when_changed"] = (
+            tally.pop("tv_sum") / tally["policy_changed"] if tally["policy_changed"] else 0.0
+        )
+    general = counts["routes"][GENERAL_ROUTE]
+    # Kept for continuity with the run07 baseline (general route only).
+    counts["policy_rows"] = general["policy_rows"]
+    counts["policy_changed"] = general["policy_changed"]
+    counts["policy_changed_share_of_policy_rows"] = general["policy_changed_share"]
+    counts["policy_tv_mean_when_changed"] = general["policy_tv_mean_when_changed"]
+    counts["policy_changed_any_route"] = sum(
+        tally["policy_changed"] for tally in counts["routes"].values()
+    )
     return counts
 
 
@@ -127,9 +194,18 @@ def main(argv=None) -> int:
             f"labelled {result['labelled_share']:.2%} | policy target changed "
             f"{result['policy_changed_share_of_policy_rows']:.2%} of policy rows "
             f"(mean TV {result['policy_tv_mean_when_changed']:.3f}) | value changed "
-            f"{result['value_changed_share']:.2%}",
+            f"{result['value_changed_share']:.2%} "
+            f"(effective {result['value_changed_effective_share']:.2%})",
             flush=True,
         )
+        for route, tally in result["routes"].items():
+            if route == GENERAL_ROUTE:
+                continue
+            print(
+                f"    {route}: policy target changed in {tally['policy_changed']} of "
+                f"{tally['policy_rows']} policy rows ({tally['policy_changed_share']:.2%})",
+                flush=True,
+            )
     if args.out:
         args.out.write_text(json.dumps(report, indent=2))
     return 0

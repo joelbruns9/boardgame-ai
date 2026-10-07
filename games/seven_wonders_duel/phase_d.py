@@ -1274,10 +1274,11 @@ class PhaseDConfig:
             # changes which opponent every later iteration draws.
             specialists=self.specialists,
         )
-        # Only when set, so every run that predates the switch keeps the
-        # identity it was started with and still resumes.
-        if self.league_schedule != "random":
-            identity["league_schedule"] = self.league_schedule
+        # Always compared, in both directions (review of ebc70c0, #1): omitting
+        # it for `random` let a cycle run resume as random unnoticed. A manifest
+        # from before the switch has no value and ran `random` -- see
+        # `_refuse_changed_schedules`.
+        identity["league_schedule"] = self.league_schedule
         return identity
 
     def evaluation_leaf_batch(self) -> int:
@@ -4237,6 +4238,9 @@ class PhaseDLoop:
         for key in stored:
             stored[key] = stored_config.get(key, None)
         stored["schedule_basis"] = stored_basis
+        # Known default for a pre-switch manifest: every run before
+        # --league-schedule drew its league class at random.
+        stored["league_schedule"] = stored_config.get("league_schedule", "random")
         # The manifest config is immutable launch provenance. Recorded changes
         # form the effective regime on later resumes, so compare with the last
         # accepted value rather than repeatedly comparing with the launch value.

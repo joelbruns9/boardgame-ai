@@ -262,11 +262,19 @@ export RESTART_FRACTION="${RESTART_FRACTION:-0.25}"
 # 25% restarts and 25% league games, against run07's ~15.5 -- so setup's
 # 0.19 x games would be ~1.9 samples per new row instead of run07's ~6. 550
 # steps x 512 over ~51k rows per 1,000 games is ~5.5, back on target. Warmup a
-# third, as setup derives it.
-export TRAIN_STEPS="${TRAIN_STEPS:-550}"
-export TRAIN_WARMUP_STEPS="${TRAIN_WARMUP_STEPS:-183}"
-# Exact tactics (G4, incl. 2b reveal strata) and G2b tactic relabelling are
-# phase_d defaults (on); not repeated here.
+# third, derived by setup from whatever TRAIN_STEPS ends up being.
+#
+# DERIVED from GAMES_PER_ITERATION (0.55 per game), not fixed: a fixed 550
+# survived an override of GAMES_PER_ITERATION for a smoke run (review of
+# ebc70c0). 550 at the planned 1,000.
+export TRAIN_STEPS="${TRAIN_STEPS:-$(( (GAMES_PER_ITERATION * 55 + 99) / 100 ))}"
+
+# Exact tactics (G4, incl. 2b reveal strata) and G2b tactic relabelling: both
+# phase_d defaults, PINNED here so a default flipped before launch cannot
+# silently change the run (review of ebc70c0). G2b comes off only on the
+# phase-out census (`g2b_census.py`) over the first buffers.
+export EXACT_TACTICS="${EXACT_TACTICS:-1}"
+export TACTIC_LABELS="${TACTIC_LABELS:-1}"
 
 # ── Scheduler geometry ──────────────────────────────────────────────────────
 #

@@ -151,3 +151,39 @@ minutes on a laptop 3070, and it needs `prep/final_41_100_g10a/pretrained.pt`.
 2. The cycle's shares and resume behaviour.
 3. `TRAIN_STEPS=550` for the measured inflow.
 4. Whether to pin the default-on features (focus 6) before launch.
+
+## Response to the review of ebc70c0 (2026-10-07)
+
+Review: `reviews/sevenwd-run08-ebc70c0-review.md`. All three findings are
+valid and fixed.
+
+| # | finding | verdict | fix |
+|---|---|---|---|
+| 1 | `league_schedule` omitted from the identity for `random`, so cycle -> random resumed silently, and a legacy manifest accepted cycle | **Valid** | Always in `schedule_identity()`. A missing historical value is read as `random` in `_refuse_changed_schedules`. Tests for cycle -> random (refused), random -> cycle (refused), legacy -> random (accepted), legacy -> cycle (refused), cycle -> cycle (accepted). |
+| 2 | Census counts the general route only; specialist-owned corrections were invisible | **Valid** | Each record is projected onto every trained route (`project_examples`), with per-route denominators and changes plus `policy_changed_any_route`. On the dry-run buffers it now reports the reviewer's specialist corrections exactly: 1 / 4 / 8 / 0. Regression: bot games owned by `specialist:1` give 0 general policy rows and >0 specialist changes. |
+| 3 | An expectimax +-1 turning exact is a supervision change the census missed | **Valid** | `value_changed` counts a scalar OR exactness change. `value_exactness_only` and `value_changed_effective` (which drops exactness-only rows already overridden by the certain-win rule) are reported separately. Dry run: 26 exactness-only rows, 13 effective, matching the review. Regression covers both cases. |
+
+**Sign-off items acted on**
+
+- **Pinned.** `EXACT_TACTICS=1` and `TACTIC_LABELS=1` are in the settings file.
+  The launcher passes `--exact-tactics/--no-exact-tactics` and
+  `--tactic-labels/--no-tactic-labels` explicitly, so emitted config and sweep
+  validation see them. The documented cloud command is updated.
+- **Train steps are derived, not fixed.** `TRAIN_STEPS = 0.55 x
+  GAMES_PER_ITERATION` (550 at 1,000). Warmup is no longer set in the settings
+  file, so setup derives it from whatever `TRAIN_STEPS` is.
+- **Startup exposure** (~12 presentations for the first cohort vs ~5 at steady
+  state): taken to the owner as a decision. It is not a defect.
+
+**Corrections to the brief** (the reviewer is right on all three):
+
+- League and restart games are **not** disjoint: 0 / 0 / 2 / 2 league games
+  were restarts. A `kind` partition cannot show disjointness. Nothing requires
+  it.
+- W5 alpha was **not** refitted at iteration 0. There were 220 held-out policy
+  positions, below the minimum of 256. It refitted from iteration 1.
+- `current_best` does **not** stay the pretrain all run. `auto_first_trained`
+  copies the first trained learner to it once (iteration 1 at run08 scale),
+  then it is fixed. Specialist seeding and the frozen general anchor run before
+  generation at iteration 0, so they use the pretrain as intended. Offline
+  start comparisons should use the uploaded pretrain, not `current_best.pt`.
