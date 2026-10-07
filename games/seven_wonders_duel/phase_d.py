@@ -7145,7 +7145,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="random",
         help="how each iteration's league opponent class is chosen: random "
         "draw (historical) or a fixed cycle that holds the shares over every "
-        "short window (e.g. S M S M S for science 0.15 / military 0.10)",
+        "short window, within two iterations of each share (e.g. S M S M S for "
+        "science 0.15 / military 0.10)",
     )
     parser.add_argument(
         "--hof-sampling-mode",

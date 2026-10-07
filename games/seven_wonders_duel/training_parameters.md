@@ -650,8 +650,8 @@ How an archived opponent is drawn. `recency` weights newer archives linearly.
 How each iteration's league opponent CLASS is chosen. `random` draws it with
 the renormalised shares (every run through run07). `cycle` fixes it: the class
 furthest behind its share goes next, so science 0.15 / military 0.10 plays
-`S M S M S` repeating and every window holds its shares to within one
-iteration. run07's random draw gave its first twenty league iterations 8
+`S M S M S` repeating; every prefix is within one iteration of its share, so
+every window is within two. run07's random draw gave its first twenty league iterations 8
 military and 1 science. Under `cycle`, a scheduled specialist with no checkpoint
 yet is announced, and with `--hof-opponent-fraction 0` never replaced by an old
 HOF archive. run08 uses `cycle`.

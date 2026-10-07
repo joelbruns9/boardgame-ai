@@ -223,8 +223,9 @@ def cycle_opponent_class(
     iterations went 8 military, 1 science: fine over a hundred iterations, a
     different curriculum over the ten that matter early. Here class ``c`` is
     the one furthest behind its quota ``(index + 1) * p_c`` after the first
-    ``index`` assignments (ties to the listed order), so every window of
-    iterations is within one assignment of its share. Science 0.15 / military
+    ``index`` assignments (ties to the listed order). Every PREFIX of the
+    schedule is then within one assignment of its quota, so every window (a
+    difference of two prefixes) is within two. Science 0.15 / military
     0.10 gives ``S M S M S`` repeating.
 
     A pure function of ``index``: a resume reproduces it, and it consumes no
