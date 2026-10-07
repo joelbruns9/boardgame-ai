@@ -89,7 +89,8 @@ def test_the_equivalence_suite_runs_before_training(setup_text):
 def test_the_launch_configuration_matches_the_locked_decisions(setup_text):
     command = _block(setup_text, "TRAIN_CMD=(")
     # The decisions table in CLOUD_TRAINING_PLAN.md, as flags.
-    assert "--selfplay-generator-mode soft_gate" in command
+    assert '--selfplay-generator-mode "$GENERATOR_MODE"' in command
+    assert 'GENERATOR_MODE="${GENERATOR_MODE:-soft_gate}"' in setup_text
     assert '--bootstrap-policy "$BOOTSTRAP_POLICY"' in command
     assert '--promotion-every "$PROMOTION_EVERY"' in command
     assert '--revert-reset-after "$REVERT_RESET_AFTER"' in command
@@ -1607,7 +1608,8 @@ def test_w4_attaches_replaces_joint7_and_bootstraps_its_target(setup_text):
         'export HIER_VALUE_DETACH="${HIER_VALUE_DETACH:-0}"',
         'export HIER_VALUE_REPLACES_JOINT7="${HIER_VALUE_REPLACES_JOINT7:-1}"',
         'export OUTLOOK_BOOTSTRAP="${OUTLOOK_BOOTSTRAP:-0.5}"',
-        'export OUTLOOK_BOOTSTRAP_GAMES="${OUTLOOK_BOOTSTRAP_GAMES:-10000}"',
+        # run08: no ramp -- the pretrain already trained W4.
+        'export OUTLOOK_BOOTSTRAP_GAMES="${OUTLOOK_BOOTSTRAP_GAMES:-0}"',
     ):
         assert line in decision, line
 

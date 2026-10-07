@@ -183,3 +183,34 @@ def test_a_cached_general_row_projects_to_the_directly_derived_specialist_row(re
             if d.tactic == TACTIC_BLOCK and d.has_policy:
                 checked += 1
     assert checked, "no specialist must_block row exercised"
+
+
+def test_the_phase_out_census_counts_the_changes_g2b_makes(records):
+    """G2b phase-out measure: searched bot games put uniform mass on proven
+    losing moves, so the census must count real target changes; a game whose
+    targets already avoid them must count none."""
+
+    from .g2b_census import census
+
+    searched = [_as_searched(record) for record in records]
+    result = census(searched, retain=0)
+    assert result["labelled"] > 0
+    assert 0 < result["policy_changed"] <= result["labelled"]
+    assert result["value_changed"] > 0
+    assert set(result["by_class"]) <= {"win", "all_lose", "block"}
+
+    # Clean those same targets the way G2b would; the census then sees nothing
+    # left to change in the policy.
+    cleaned = []
+    for record in searched:
+        rows = {e.move_index: e for e in examples_from_record(record, tactic_labels=True)}
+        moves = []
+        for move in record.moves:
+            row = rows.get(move.i)
+            if row is None or not row.has_policy:
+                moves.append(move)
+                continue
+            target = {int(a): float(p) for a, p in zip(row.legal, row.policy_target) if p > 0}
+            moves.append(replace(move, policy_target=target))
+        cleaned.append(replace(record, moves=moves))
+    assert census(cleaned, retain=0)["policy_changed"] == 0

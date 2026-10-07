@@ -115,6 +115,7 @@ from .specialist import (
     league_game_count,
     league_share,
     cap_reanalysis,
+    cycle_opponent_class,
     parse_specialists,
     reanalysis_candidates,
     reanalysis_examples,
@@ -318,6 +319,12 @@ class PhaseDConfig:
     search compute is the one question the seat arrangement cannot answer by
     itself.
     """
+
+    league_schedule: str = "random"
+    """How each iteration's league opponent CLASS is chosen: ``random`` draws it
+    (`specialist.draw_opponent_class`, every run through run07); ``cycle`` fixes
+    it (`specialist.cycle_opponent_class`), so the shares hold over every short
+    window and a class that is due but not ready is reported, not hidden."""
 
     hof_sampling_mode: str = "recency"
     """How a HOF opponent is drawn: ``recency``, ``uniform``, or ``latest``.
@@ -1267,6 +1274,10 @@ class PhaseDConfig:
             # changes which opponent every later iteration draws.
             specialists=self.specialists,
         )
+        # Only when set, so every run that predates the switch keeps the
+        # identity it was started with and still resumes.
+        if self.league_schedule != "random":
+            identity["league_schedule"] = self.league_schedule
         return identity
 
     def evaluation_leaf_batch(self) -> int:
@@ -1390,6 +1401,8 @@ class PhaseDConfig:
             raise ValueError(
                 "hof_sampling_mode must be recency, uniform, or latest"
             )
+        if self.league_schedule not in {"random", "cycle"}:
+            raise ValueError("league_schedule must be random or cycle")
         if self.schedule_basis == "games":
             # Constructing it here turns an incoherent window into a config-time
             # error rather than an iteration-30 surprise.
@@ -3511,7 +3524,17 @@ class PhaseDLoop:
         # nothing here may depend on wall clock, directory order, or how far the
         # run got before it was interrupted.
         rng = random.Random(config.seed + iteration * 100_003)
-        drawn = draw_opponent_class(rng, config.hof_opponent_fraction, specialists)
+        cycle = config.league_schedule == "cycle"
+        if cycle:
+            # Indexed by iteration, so the phase is fixed from iteration 0 and
+            # the shares hold over any window whenever the league starts.
+            drawn = cycle_opponent_class(
+                iteration, config.hof_opponent_fraction, specialists
+            )
+        else:
+            drawn = draw_opponent_class(
+                rng, config.hof_opponent_fraction, specialists
+            )
         if drawn is None:
             return None
         specialist = next(
@@ -3519,6 +3542,24 @@ class PhaseDLoop:
         )
         if specialist is not None:
             entry = self._specialist_opponent(specialist, iteration, rng)
+            if entry is None and cycle:
+                # run07 fell through here to an empty HOF and played plain
+                # self-play for seven iterations with nothing saying so.
+                fallback = (
+                    "fall back to the HOF"
+                    if config.hof_opponent_fraction > 0.0
+                    else "are plain self-play (the HOF share is 0)"
+                )
+                print(
+                    f"WARNING: iteration {iteration}: the league cycle scheduled "
+                    f"the {specialist.name} specialist but it has no checkpoint "
+                    f"yet; this iteration's league games {fallback}",
+                    flush=True,
+                )
+                if config.hof_opponent_fraction <= 0.0:
+                    # A HOF the run turned off is not a fallback: its archive
+                    # may still hold entries from before the share was zeroed.
+                    return None
             if entry is None:
                 # The specialist has not been seeded yet (or its bootstrap games
                 # have not elapsed). Fall back to HOF rather than skipping the
@@ -7099,6 +7140,14 @@ def build_parser() -> argparse.ArgumentParser:
         "cloud launch value: 0.15)",
     )
     parser.add_argument(
+        "--league-schedule",
+        choices=("random", "cycle"),
+        default="random",
+        help="how each iteration's league opponent class is chosen: random "
+        "draw (historical) or a fixed cycle that holds the shares over every "
+        "short window (e.g. S M S M S for science 0.15 / military 0.10)",
+    )
+    parser.add_argument(
         "--hof-sampling-mode",
         choices=("recency", "uniform", "latest"),
         default="recency",
@@ -8263,6 +8312,7 @@ def main(argv=None) -> int:
         specialist_floor_every=args.specialist_floor_every,
         specialist_reanalysis=args.specialist_reanalysis,
         hof_sampling_mode=args.hof_sampling_mode,
+        league_schedule=args.league_schedule,
         hof_start_games=args.hof_start_games,
         cheap_sims_min=args.cheap_sims_min,
         cheap_sims_max=args.cheap_sims_max,

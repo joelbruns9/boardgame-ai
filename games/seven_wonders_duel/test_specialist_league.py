@@ -111,6 +111,39 @@ def test_the_draw_delivers_the_INTENDED_shares_not_shares_times_L():
     assert league_share(hof_share, specialists) == pytest.approx(0.40)
 
 
+def test_the_fixed_cycle_interleaves_science_and_military_three_to_two():
+    from .specialist import cycle_opponent_class
+
+    order = [cycle_opponent_class(i, 0.0, (SCIENCE, MILITARY)) for i in range(10)]
+    assert order == ["science", "military"] * 2 + ["science"] + (
+        ["science", "military"] * 2 + ["science"]
+    )
+
+
+def test_the_fixed_cycle_holds_every_share_over_every_window():
+    from .specialist import cycle_opponent_class
+
+    specialists = (SCIENCE, MILITARY)
+    hof_share = 0.15
+    total = league_share(hof_share, specialists)
+    shares = {"hof": 0.15, "science": SCIENCE.share, "military": MILITARY.share}
+    order = [cycle_opponent_class(i, hof_share, specialists) for i in range(200)]
+    for start in range(0, 150):
+        window = order[start:start + 40]
+        for name, share in shares.items():
+            assert abs(window.count(name) - 40 * share / total) <= 2, (start, name)
+
+
+def test_the_fixed_cycle_never_schedules_a_zero_share_and_is_off_without_shares():
+    from .specialist import cycle_opponent_class
+
+    zero = SpecialistConfig(name="military", lambda_=0.4, share=0.0)
+    assert {cycle_opponent_class(i, 0.0, (SCIENCE, zero)) for i in range(20)} == {
+        "science"
+    }
+    assert cycle_opponent_class(3, 0.0, ()) is None
+
+
 def test_no_shares_means_no_league_at_all():
     rng = random.Random(0)
     assert draw_opponent_class(rng, 0.0, ()) is None
@@ -813,13 +846,16 @@ def _loop(tmp_path: Path, **overrides):
         layers=1,
         device="cpu",
         games_per_iteration=500,
-        hof_opponent_fraction=0.15,
-        hof_start_games=10_000,
         # A biased search reads W4's outlook head, so a league run must carry
         # one; the config refuses to launch without it.
         hierarchical_value=True,
         hier_value_weight=0.5,
-        **{"specialists": "science:0.15:0.5,military:0.10:0.4", **overrides},
+        **{
+            "specialists": "science:0.15:0.5,military:0.10:0.4",
+            "hof_opponent_fraction": 0.15,
+            "hof_start_games": 10_000,
+            **overrides,
+        },
     )
     loop = PhaseDLoop(config)
     write_iterations(loop, 20, 500)  # 10,000 games: past the threshold
@@ -918,6 +954,35 @@ def test_once_seeded_the_draw_reaches_the_specialists_with_their_bias(
     assert hof.specialist_lambda == 0.0 and hof.opponent_route == "none"
     # 40% of 500 games go to whichever class was drawn.
     assert all(assignment.games == 200 for assignment in drew)
+
+
+def test_the_league_cycle_plays_s_m_s_m_s_from_iteration_zero(tmp_path: Path):
+    loop = _loop(
+        tmp_path, league_schedule="cycle", hof_opponent_fraction=0.0,
+        hof_start_games=0,
+    )
+    _promoted_general(loop)
+    loop.bootstrap_specialists(0)
+    drew = [loop.league_assignment(iteration, 500) for iteration in range(10)]
+    assert [a.opponent_class for a in drew] == ["science", "military"] * 2 + [
+        "science"
+    ] + ["science", "military"] * 2 + ["science"]
+    # 25% of 500: the whole league share goes to the scheduled class.
+    assert all(a.games == 125 for a in drew)
+
+
+def test_an_unready_cycled_specialist_is_reported_and_never_borrows_the_hof(
+    tmp_path: Path, capsys
+):
+    """HOF off, archive non-empty (`_loop` adds one): the old fallback would
+    have quietly played the archived net instead of the scheduled specialist."""
+
+    loop = _loop(
+        tmp_path, league_schedule="cycle", hof_opponent_fraction=0.0,
+        hof_start_games=0,
+    )
+    assert loop.league_assignment(0, 500) is None
+    assert "scheduled the science specialist" in capsys.readouterr().out
 
 
 def test_the_draw_stays_resume_stable_with_specialists_configured(tmp_path: Path):

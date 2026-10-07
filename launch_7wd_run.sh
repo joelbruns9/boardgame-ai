@@ -14,7 +14,7 @@
 #   SWEEP_CHECKPOINT=/path/to/L_checkpoint.pt bash launch_7wd_run.sh
 #
 #   # PASS 2 — launch on this box's numbers.
-#   source ~/boardgame-ai/runs/seven_wonders_duel/run07_bundle/sweeps/measured_env.sh
+#   source ~/boardgame-ai/runs/seven_wonders_duel/run08/sweeps/measured_env.sh
 #   bash launch_7wd_run.sh
 #
 # Pass 2 REFUSES to launch if this box has a sweep that was not sourced. Before
@@ -26,6 +26,12 @@
 # Everything below is an override of a `setup_cloud_7wd.sh` default. That script
 # is the authority on what each knob means and why it is set where it is; this
 # one records the choices for THIS run and nothing else.
+#
+# THIS RUN: run08, the final run of MODEL_GROWTH_PLAN.md ("Final run
+# preparation", owner decisions 2026-10-06/07). run07's decisions are in git
+# history. In one line: warm start from the encoder-8 laptop pretrain, empty
+# buffer, every move searched at 1,200 sims, no promotion gate, no HOF, the
+# specialists on a fixed cycle from iteration 0, G12 restarts at 25%.
 # =============================================================================
 set -euo pipefail
 
@@ -35,7 +41,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # The launcher keys everything -- buffers, checkpoints, sweeps, the manifest --
 # off RUN_DIR_REL, so naming the run here is what keeps two runs on one box from
 # resuming into each other.
-export RUN_DIR_REL="${RUN_DIR_REL:-runs/seven_wonders_duel/run07_bundle}"
+export RUN_DIR_REL="${RUN_DIR_REL:-runs/seven_wonders_duel/run08}"
 
 # The branch the box builds. Everything this run carries -- W1-W7, S2b, the
 # warm-start knob, this file itself -- lives on this branch and is NOT on main,
@@ -56,7 +62,15 @@ export GAMES_PER_ITERATION="${GAMES_PER_ITERATION:-1000}"
 export SEED_GAMES="${SEED_GAMES:-0}"                          # no bot seed corpus
 export DRAFT_PRIOR_GAMES="${DRAFT_PRIOR_GAMES:-0}"            # no tier-list draft prior
 export CURRICULUM_ANNEAL_GAMES="${CURRICULUM_ANNEAL_GAMES:-0}"  # no bot games in the mix
-# ── Warm buffer: cloud2's last 20 iterations ────────────────────────────────
+# ── Empty replay buffer (owner 2026-10-06) ──────────────────────────────────
+#
+# The pretrain already absorbed run07 (iterations 41-100, G2b relabelled, G8.2
+# overlay), so the run starts from an EMPTY buffer and learns only from games
+# its own search produced. The cloud2 import below is run07's, kept for the
+# record; leaving WARM_BUFFER unset is now the decision, not an omission.
+ALLOW_COLD_BUFFER="${ALLOW_COLD_BUFFER:-1}"   # read below, not by the launcher
+
+# ── (run07) Warm buffer: cloud2's last 20 iterations ────────────────────────
 #
 # A fixed 190x512 step budget over a replay buffer that starts empty
 # over-presents early positions: at a 50k warm-up the first iteration's
@@ -81,9 +95,10 @@ if [ -z "$WARM_BUFFER" ] && [ "${ALLOW_COLD_BUFFER:-0}" != "1" ]; then
   echo "        (ALLOW_COLD_BUFFER=1 starts from an empty buffer deliberately.)" >&2
   exit 1
 fi
-# The fallback if the buffer is not imported: 100k starts training at iteration
-# 5 and accepts ~7-8x on the earliest positions. With the warm buffer it is
-# already met at iteration 0 and changes nothing.
+# With an empty buffer this is the training warmup. Every move is now a full
+# search and every full move is a training row, so a game records several
+# times run07's ~15 rows and 100k is reached within the first iteration or two.
+# The laptop dry run measures rows per game; TRAIN_STEPS below follows it.
 export MIN_BUFFER_POSITIONS="${MIN_BUFFER_POSITIONS:-100000}"
 
 # ── Warm start ──────────────────────────────────────────────────────────────
@@ -95,11 +110,16 @@ export MIN_BUFFER_POSITIONS="${MIN_BUFFER_POSITIONS:-100000}"
 # within 0.05%, value within 0.0002). Without this the run starts from random
 # weights, so it is REQUIRED rather than defaulted. Upload the checkpoint and
 # give its absolute path on the box.
+#
+# run08: `runs/seven_wonders_duel/prep/final_41_100_g10a/pretrained.pt` (laptop,
+# 7f90cbbc...): candidate_0100 migrated to encoder-8 (G10a consequence
+# features) and pretrained on run07 iterations 41-100. Ties the encoder-7
+# pretrain on sealed G0 and keeps every gain over candidate_0100.
 export INIT_CHECKPOINT="${INIT_CHECKPOINT:-}"
 if [ -z "$INIT_CHECKPOINT" ] && [ "${ALLOW_COLD_START:-0}" != "1" ]; then
   echo "[FATAL] INIT_CHECKPOINT is unset. This run warm-starts; set it to the" >&2
   echo "        uploaded checkpoint's absolute path, e.g." >&2
-  echo "        INIT_CHECKPOINT=\$HOME/candidate_0085.pt bash launch_7wd_run.sh" >&2
+  echo "        INIT_CHECKPOINT=\$HOME/final_41_100_g10a.pt bash launch_7wd_run.sh" >&2
   echo "        (ALLOW_COLD_START=1 launches from random weights deliberately.)" >&2
   exit 1
 fi
@@ -155,7 +175,9 @@ export HIER_VALUE_REPLACES_JOINT7="${HIER_VALUE_REPLACES_JOINT7:-1}"
 # the head starts untrained on a warm start. cloud2's imported rows carry no
 # outlook and keep the hard label.
 export OUTLOOK_BOOTSTRAP="${OUTLOOK_BOOTSTRAP:-0.5}"
-export OUTLOOK_BOOTSTRAP_GAMES="${OUTLOOK_BOOTSTRAP_GAMES:-10000}"
+# run08: no ramp. It existed because W4 started untrained on run07's warm
+# start; the pretrain trained it on 60 iterations of run07 targets.
+export OUTLOOK_BOOTSTRAP_GAMES="${OUTLOOK_BOOTSTRAP_GAMES:-0}"
 
 # ── W7: the specialist league ───────────────────────────────────────────────
 #
@@ -187,14 +209,25 @@ export OUTLOOK_BOOTSTRAP_GAMES="${OUTLOOK_BOOTSTRAP_GAMES:-10000}"
 # how sharply the outlook head separates sibling moves, and this was measured
 # on a 5.2M-param net at joint7_acc 0.512.
 export SPECIALISTS="${SPECIALISTS:-science:0.15:3,military:0.10:3}"
-export HOF_FRACTION="${HOF_FRACTION:-0.15}"
+# run08: a FIXED cycle, S M S M S, every iteration a specialist iteration.
+# run07 drew at random: its first twenty league iterations went 8 military,
+# 1 science, and 7 iterations fell through to plain self-play unannounced.
+export LEAGUE_SCHEDULE="${LEAGUE_SCHEDULE:-cycle}"
+# run08: HOF OFF. Without a gate nothing is promoted, and promotions are the
+# only thing that fills the HOF, so its share would silently become self-play.
+# Forgetting is watched by the self-anchor instead (vs the learner 20k games
+# back); the specialists carry the strategic diversity.
+export HOF_FRACTION="${HOF_FRACTION:-0}"
 # 10k, not setup's 50k. The 50k was a COLD-start decision: run 04 opened the
 # league against its own near-random bootstrap checkpoint, so league games were
 # lopsided wins pinning value targets near +1. A warm start's iteration-0 best is
 # candidate_0085, so the archive starts strong. 10k gives the new modules about
 # ten iterations to train before specialists (which follow this clock, since
 # SPECIALIST_BOOTSTRAP_GAMES=0) and S2b reanalysis start shaping the general.
-export HOF_START_GAMES="${HOF_START_GAMES:-10000}"
+#
+# run08: 0. The league opens at iteration 0 -- the specialists seed from the
+# pretrained start, which already carries every module.
+export HOF_START_GAMES="${HOF_START_GAMES:-0}"
 export SPECIALIST_BOOTSTRAP_GAMES="${SPECIALIST_BOOTSTRAP_GAMES:-0}"   # 0 = follow HOF_START_GAMES
 export SPECIALIST_FLOOR_EVERY="${SPECIALIST_FLOOR_EVERY:-5}"
 # S2b: on, the general also learns to EXECUTE the attacks the specialists find;
@@ -203,6 +236,37 @@ export SPECIALIST_FLOOR_EVERY="${SPECIALIST_FLOOR_EVERY:-5}"
 # reanalysis from 2539 to 45 ms/position. The cost is that this run cannot also
 # be S5's defence-only vs defence+transfer comparison.
 export SPECIALIST_REANALYSIS="${SPECIALIST_REANALYSIS:-1}"
+
+# ── run08: lifecycle and search ─────────────────────────────────────────────
+#
+# No promotion gate (owner 2026-10-06): the learner always generates and
+# progress is read from the self-anchor (the stopping rule). PROMOTION_EVERY=0
+# is what actually removes the gate -- `latest` alone still schedules one, and
+# a REJECT would reset the learner to the starting checkpoint.
+export GENERATOR_MODE="${GENERATOR_MODE:-latest}"
+export PROMOTION_EVERY="${PROMOTION_EVERY:-0}"
+# Both reset the learner to current_best; the controller refuses them outside
+# soft_gate (caught by the laptop dry run, 2026-10-07).
+export REVERT_RESET_AFTER="${REVERT_RESET_AFTER:-0}"
+export PROBATION_RESET_AFTER="${PROBATION_RESET_AFTER:-0}"
+# Every move a full search at 1,200 sims (decision 11; budget 2026-10-07).
+export CHEAP_SIMS="${CHEAP_SIMS:-1200}"
+export FULL_SIMS="${FULL_SIMS:-1200}"
+export FULL_SEARCH_FRACTION="${FULL_SEARCH_FRACTION:-1.0}"
+# G12 restart archive: a quarter of games replay a decisive position from an
+# earlier game's deal with an untried first move.
+export RESTART_FRACTION="${RESTART_FRACTION:-0.25}"
+
+# Train steps, RE-DERIVED for every-move-full search (laptop dry run
+# 2026-10-07, run08 settings, 64 sims): ~51 general policy rows per game with
+# 25% restarts and 25% league games, against run07's ~15.5 -- so setup's
+# 0.19 x games would be ~1.9 samples per new row instead of run07's ~6. 550
+# steps x 512 over ~51k rows per 1,000 games is ~5.5, back on target. Warmup a
+# third, as setup derives it.
+export TRAIN_STEPS="${TRAIN_STEPS:-550}"
+export TRAIN_WARMUP_STEPS="${TRAIN_WARMUP_STEPS:-183}"
+# Exact tactics (G4, incl. 2b reveal strata) and G2b tactic relabelling are
+# phase_d defaults (on); not repeated here.
 
 # ── Scheduler geometry ──────────────────────────────────────────────────────
 #

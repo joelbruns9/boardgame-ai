@@ -211,6 +211,48 @@ def draw_opponent_class(
     return weights[-1][0]
 
 
+def cycle_opponent_class(
+    index: int,
+    hof_share: float,
+    specialists: tuple[SpecialistConfig, ...],
+) -> str | None:
+    """The opponent class for league iteration ``index`` under a FIXED cycle.
+
+    The deterministic counterpart of :func:`draw_opponent_class`, with the same
+    renormalised shares. run07 drew at random and its first twenty league
+    iterations went 8 military, 1 science: fine over a hundred iterations, a
+    different curriculum over the ten that matter early. Here class ``c`` is
+    the one furthest behind its quota ``(index + 1) * p_c`` after the first
+    ``index`` assignments (ties to the listed order), so every window of
+    iterations is within one assignment of its share. Science 0.15 / military
+    0.10 gives ``S M S M S`` repeating.
+
+    A pure function of ``index``: a resume reproduces it, and it consumes no
+    random draw, so the checkpoint sample after it is unaffected.
+    """
+
+    if index < 0:
+        raise ValueError("index must be non-negative")
+    weights = [("hof", hof_share)] + [
+        (config.name, config.share) for config in specialists
+    ]
+    weights = [(name, share) for name, share in weights if share > 0.0]
+    total = sum(share for _, share in weights)
+    if total <= 0.0:
+        return None
+    if total > 1.0 + 1e-9:
+        raise ValueError(f"opponent shares sum to {total:.3f} > 1")
+    delivered = {name: 0 for name, _ in weights}
+    chosen = weights[0][0]
+    for step in range(index + 1):
+        chosen = max(
+            weights,
+            key=lambda item: (step + 1) * item[1] / total - delivered[item[0]],
+        )[0]
+        delivered[chosen] += 1
+    return chosen
+
+
 def league_share(hof_share: float, specialists: tuple[SpecialistConfig, ...]) -> float:
     """``L``: the fraction of every iteration's games that are league games."""
 

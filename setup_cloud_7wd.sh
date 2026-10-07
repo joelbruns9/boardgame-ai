@@ -49,6 +49,12 @@
 #   TRAIN_BATCH_SIZE=512
 #   HOF_FRACTION=0.15 GATE_LADDER="200 600 1000 1500"
 #   PROMOTION_EVERY=10 BOOTSTRAP_POLICY=auto_first_trained
+#   GENERATOR_MODE=soft_gate  `latest` drops the promotion gate entirely: the
+#                   learner always generates and anchors read progress. Needs
+#                   PROMOTION_EVERY=0, or a scheduled gate can still REVERT it.
+#   LEAGUE_SCHEDULE=random  `cycle` fixes each iteration's specialist class
+#                   (S M S M S for science 0.15 / military 0.10) instead of a draw
+#   RESTART_FRACTION=0  G12: share of games restarted from archived search states
 #   PROBATION_RESET_AFTER=4 REVERT_RESET_AFTER=3
 #   LAUNCH_FLAGS_JSON=<f4_cloud_finalize output>  measured --rust-* flags (W6.3)
 #   PRECISION_ARENA_CHECKPOINT=<path>             runs W6.2b before launching
@@ -321,6 +327,25 @@ HOF_START_GAMES="${HOF_START_GAMES:-50000}"
 GATE_LADDER="${GATE_LADDER:-200 600 1000 1500}"
 GATE_LADDER_FLOOR_GAMES="${GATE_LADDER_FLOOR_GAMES:-10000}"
 PROMOTION_EVERY="${PROMOTION_EVERY:-10}"
+GENERATOR_MODE="${GENERATOR_MODE:-soft_gate}"
+LEAGUE_SCHEDULE="${LEAGUE_SCHEDULE:-random}"
+RESTART_FRACTION="${RESTART_FRACTION:-0}"
+# `latest` with a gate still scheduled is not "no gate": the controller gates
+# every PROMOTION_EVERY iterations and a REJECT resets the learner to
+# current_best -- which, with nothing ever promoted, is the starting network.
+if [ "$GENERATOR_MODE" = "latest" ] && [ "$PROMOTION_EVERY" != "0" ]; then
+  echo "[FATAL] GENERATOR_MODE=latest needs PROMOTION_EVERY=0 (got $PROMOTION_EVERY):" >&2
+  echo "        a scheduled gate would still revert the learner." >&2
+  exit 1
+fi
+# The controller refuses these two outside soft_gate (each copies current_best
+# over the learner). Checked here so the refusal costs seconds, not a box setup.
+if [ "$GENERATOR_MODE" != "soft_gate" ] &&
+   { [ "${REVERT_RESET_AFTER:-3}" != "0" ] || [ "${PROBATION_RESET_AFTER:-4}" != "0" ]; }; then
+  echo "[FATAL] GENERATOR_MODE=$GENERATOR_MODE needs REVERT_RESET_AFTER=0 and" >&2
+  echo "        PROBATION_RESET_AFTER=0 (soft_gate-only learner resets)." >&2
+  exit 1
+fi
 BOOTSTRAP_POLICY="${BOOTSTRAP_POLICY:-auto_first_trained}"
 PROBATION_RESET_AFTER="${PROBATION_RESET_AFTER:-4}"
 REVERT_RESET_AFTER="${REVERT_RESET_AFTER:-3}"
@@ -1071,6 +1096,7 @@ HIERARCHICAL_VALUE=1 and a positive HIER_VALUE_WEIGHT."
     --specialists "$SPECIALISTS"
     --specialist-bootstrap-games "$SPECIALIST_BOOTSTRAP_GAMES"
     --specialist-floor-every "$SPECIALIST_FLOOR_EVERY"
+    --league-schedule "$LEAGUE_SCHEDULE"
   )
   if [ "$SPECIALIST_REANALYSIS" = "1" ]; then
     SPECIALIST_FLAGS+=(
@@ -1179,7 +1205,8 @@ TRAIN_CMD=(
   "${SOLVER_FLAGS[@]}"
   "${GRAPH_REPLAY_FLAGS[@]}"
   --hof-opponent-fraction "$HOF_FRACTION" --hof-start-games "$HOF_START_GAMES"
-  --selfplay-generator-mode soft_gate
+  --selfplay-generator-mode "$GENERATOR_MODE"
+  --restart-fraction "$RESTART_FRACTION"
   --bootstrap-policy "$BOOTSTRAP_POLICY"
   --promotion-every "$PROMOTION_EVERY"
   --revert-reset-after "$REVERT_RESET_AFTER"
