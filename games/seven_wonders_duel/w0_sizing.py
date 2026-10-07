@@ -200,6 +200,12 @@ def prepare_cache(args) -> None:
 def _pack_examples(examples, val_fraction: float, split_salt: str) -> dict:
     """Pack ragged examples once so every optimizer step avoids Python collation."""
 
+    if any(getattr(example, "outcome_free", False) for example in examples):
+        # G12 restart rows need `outcome_free` / `split_family`, which this
+        # packed schema does not carry (review of 50e02c7): refuse rather than
+        # train them on the realised result.
+        raise ValueError("w0_sizing cannot pack G12 restart rows; use collate")
+
     rows = len(examples)
     max_tokens = max(len(example.type_ids) for example in examples)
     storage = {

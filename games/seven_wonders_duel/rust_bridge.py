@@ -127,7 +127,7 @@ def rust_game_for_record(record: GameRecord):
             "seven_wonders_rust is not installed; run maturin develop in seven_wonders_rust/"
         ) from exc
 
-    game = new_game(record.seed, first_player=record.first_player)
+    game = new_game(record.replay_seed, first_player=record.first_player)
     draws = [
         list(outcome) if isinstance(outcome, tuple) else [outcome]
         for kind, outcome in record.chance_log

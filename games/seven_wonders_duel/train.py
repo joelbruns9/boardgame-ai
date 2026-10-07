@@ -154,16 +154,25 @@ def value_targets(
     value_class = batch["value_class"].long()
     hard = F.one_hot(value_class, num_classes=3).float()
     size = hard.shape[0]
-    # G12: a restarted game's realised result is not an independent sample
-    # (it reuses its ancestor's hidden deal), so its rows take the search's own
-    # value in place of the outcome wherever the search has one.
+    # G12 (review of 50e02c7, findings 1-4). A restarted game reuses its
+    # ancestor's hidden deal, so its realised result is not an independent
+    # sample. Its rows get ONE explicit contract, applied after the ordinary
+    # targets are built so `hard` / `joint_hard` stay the realised labels the
+    # certain-win exception legitimately needs:
+    #   * no outcome, no outcome bootstrap, no short-term return (that return
+    #     is anchored on the terminal result);
+    #   * the base is the search value (flat) / outlook (W4); proofs and certain
+    #     wins still override it;
+    #   * a row with neither a search value nor a proof gets no value
+    #     supervision (`value_rows` / `hier_rows`), rather than an invented one.
     outcome_free = batch.get("outcome_free")
-    if outcome_free is not None and "value_soft" in batch:
-        hard = torch.where(
-            (outcome_free & batch["value_soft_valid"]).unsqueeze(1),
-            batch["value_soft"],
-            hard,
-        )
+    free = (
+        outcome_free
+        if outcome_free is not None and bool(outcome_free.any())
+        else None
+    )
+    if free is not None and legacy:
+        raise ValueError("restart rows (outcome_free) need the g2 value contract")
     solver_rows = batch.get("value_solver_valid") if solver_value_target else None
     if solver_rows is None:
         solver_rows = torch.zeros(size, dtype=torch.bool, device=hard.device)
@@ -229,15 +238,22 @@ def value_targets(
         "utility_rows": utility_rows & ~certain,
         "utility": utility,
     }
+    if free is not None:
+        if "value_soft" in batch:
+            soft_ok = batch["value_soft_valid"]
+            soft = batch["value_soft"]
+        else:
+            soft_ok = torch.zeros_like(free)
+            soft = hard
+        # `hard` only stands in where nothing else applies; such rows are then
+        # dropped by `value_rows` unless a proof or certain win overrides them.
+        free_flat = prove(torch.where(soft_ok.unsqueeze(1), soft, hard))
+        ordinary = flat if flat is not None else hard
+        out["flat"] = torch.where(free.unsqueeze(1), free_flat, ordinary)
+        out["value_rows"] = ~free | soft_ok | solver_rows | certain
     if not hierarchical:
         return out
     joint_hard = F.one_hot(batch["joint7"].long(), num_classes=7).float()
-    if outcome_free is not None and "outlook_soft" in batch:
-        joint_hard = torch.where(
-            (outcome_free & batch["outlook_soft_valid"]).unsqueeze(1),
-            batch["outlook_soft"],
-            joint_hard,
-        )
     if outlook_bootstrap > 0.0 and "outlook_soft" in batch:
         # The value head's bootstrap, applied to the victory type: blend the
         # realised class with search's own seven-way outlook at this root. The
@@ -272,6 +288,37 @@ def value_targets(
     certain_type = joint_hard.clone()
     certain_type[:, 6] = 0.0
     type_mass = torch.where(certain.unsqueeze(1), certain_type, type_mass)
+    if free is not None:
+        if "outlook_soft" in batch:
+            look_ok = batch["outlook_soft_valid"]
+            look = batch["outlook_soft"]
+        else:
+            look_ok = torch.zeros_like(free)
+            look = joint_hard
+        look_outcome = torch.stack(
+            [look[:, 0:3].sum(dim=1), look[:, 6], look[:, 3:6].sum(dim=1)], dim=1
+        )
+        if "value_soft" in batch:
+            soft_ok = batch["value_soft_valid"]
+            soft = batch["value_soft"]
+        else:
+            soft_ok = torch.zeros_like(free)
+            soft = hard
+        base = torch.where(
+            look_ok.unsqueeze(1),
+            look_outcome,
+            torch.where(soft_ok.unsqueeze(1), soft, hard),
+        )
+        free_outcome = prove(base)
+        # The type is supervised only from the search outlook or a certain
+        # win -- never from the realised type of a same-deal game.
+        free_type = torch.where(look_ok.unsqueeze(1), look, torch.zeros_like(look))
+        free_type = free_type.clone()
+        free_type[:, 6] = 0.0
+        free_type = torch.where(certain.unsqueeze(1), certain_type, free_type)
+        outcome = torch.where(free.unsqueeze(1), free_outcome, outcome)
+        type_mass = torch.where(free.unsqueeze(1), free_type, type_mass)
+        out["hier_rows"] = ~free | look_ok | soft_ok | solver_rows | certain
     out.update(
         hier_outcome=outcome,
         hier_utility_rows=utility_rows & ~certain,
@@ -377,7 +424,10 @@ def compute_losses(
             ),
             per_value,
         )
-    value_loss = (per_value * value_w).sum() / value_w.sum().clamp(min=1e-9)
+    rows_w = value_w
+    if targets.get("value_rows") is not None:
+        rows_w = value_w * targets["value_rows"].to(value_w.dtype)
+    value_loss = (per_value * rows_w).sum() / rows_w.sum().clamp(min=1e-9)
     # G12: the end-of-game heads read the realised game, which a restart row
     # does not supply as an independent sample -- they skip those rows.
     outcome_rows = batch.get("outcome_free")
@@ -442,7 +492,10 @@ def compute_losses(
         if value_target_contract == "legacy":
             outcome_term = per_outcome.mean()
         else:
-            outcome_term = (per_outcome * value_w).sum() / value_w.sum().clamp(min=1e-9)
+            hier_w = value_w
+            if targets.get("hier_rows") is not None:
+                hier_w = value_w * targets["hier_rows"].to(value_w.dtype)
+            outcome_term = (per_outcome * hier_w).sum() / hier_w.sum().clamp(min=1e-9)
         type_log = torch.cat(
             [outputs["hier_type_win"], outputs["hier_type_loss"]], dim=-1
         )
@@ -712,12 +765,13 @@ def stable_game_split(
     train: list[Example] = []
     val: list[Example] = []
     for example in examples:
-        key = (example.iteration, example.game_key)
+        # G12: a restart is split with its FAMILY (root ancestor), so the
+        # restart position never trains while its ancestor validates.
+        family = getattr(example, "split_family", None)
+        key = tuple(family) if family is not None else (example.iteration, example.game_key)
         held = decisions.get(key)
         if held is None:
-            held = stable_is_validation(
-                example.iteration, example.game_key, val_frac, salt
-            )
+            held = stable_is_validation(key[0], key[1], val_frac, salt)
             decisions[key] = held
         (val if held else train).append(example)
     return train, val

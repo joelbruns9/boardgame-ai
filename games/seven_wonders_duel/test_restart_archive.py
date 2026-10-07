@@ -203,3 +203,150 @@ def test_phase_d_restarts_games_from_its_archive(tmp_path):
         replay(record)
     for record in restarted:
         assert record.iteration == 1 and "restart_of" in record.agents
+
+
+# --- review of 50e02c7: one regression per finding ---------------------------
+
+
+def _merged(restarted):
+    chosen, continuations = restarted
+    return [ra.merge_record(e, c, iteration=2) for e, c in zip(chosen, continuations)]
+
+
+def _restart_batch(restarted, rust: bool):
+    merged = _merged(restarted)
+    if rust:
+        rows = [row for rows, _ in derive_records_rust(merged, batch_games=4) for row in rows]
+    else:
+        rows = [row for record in merged for row in examples_from_record(record)]
+    assert rows and all(row.outcome_free for row in rows)
+    return collate(rows)
+
+
+RECIPE = dict(value_bootstrap=0.5, short_term_value_weight=0.25, outlook_bootstrap=0.5,
+              hierarchical=True)
+
+
+@pytest.mark.parametrize("rust", [False, True])
+def test_finding_1_the_terminal_result_cannot_reach_restart_targets(restarted, rust):
+    """Changing only the realised result -- and the short-term return anchored
+    on it -- leaves every restart target unchanged, flat and W4."""
+
+    batch = _restart_batch(restarted, rust)
+    before = value_targets(batch, **RECIPE)
+    flipped = dict(batch)
+    flipped["value_class"] = 2 - batch["value_class"]
+    flipped["joint7"] = (batch["joint7"] + 3) % 6
+    flipped["value_short"] = batch["value_short"].flip(dims=[1])
+    after = value_targets(flipped, **RECIPE)
+    for key in ("flat", "hier_outcome", "hier_type"):
+        assert torch.allclose(before[key], after[key]), key
+
+
+def _one_row(restarted, **overrides):
+    batch = _restart_batch(restarted, rust=False)
+    one = {k: (v[:1].clone() if torch.is_tensor(v) else v) for k, v in batch.items()}
+    one.update(overrides)
+    return one
+
+
+def test_finding_2_a_certain_win_keeps_its_exact_labels(restarted):
+    soft = torch.tensor([[0.6, 0.0, 0.4]])
+    one = _one_row(
+        restarted,
+        value_class=torch.tensor([0]),
+        joint7=torch.tensor([1]),  # my_military
+        value_soft=soft, value_soft_valid=torch.tensor([True]),
+        value_certain=torch.tensor([True]),
+        value_solver=torch.tensor([[1.0, 0.0, 0.0]]),
+        value_solver_valid=torch.tensor([True]),
+        value_solver_exact=torch.tensor([True]),
+    )
+    targets = value_targets(one, **RECIPE)
+    assert torch.allclose(targets["flat"], torch.tensor([[1.0, 0.0, 0.0]]))
+    assert torch.allclose(targets["hier_outcome"], torch.tensor([[1.0, 0.0, 0.0]]))
+    expected_type = torch.zeros(1, 7)
+    expected_type[0, 1] = 1.0
+    assert torch.allclose(targets["hier_type"], expected_type)
+
+
+def test_finding_3_no_outlook_means_no_realised_type_and_soft_outcome(restarted):
+    soft = torch.tensor([[0.6, 0.0, 0.4]])
+    base = dict(
+        value_soft=soft, value_soft_valid=torch.tensor([True]),
+        outlook_soft_valid=torch.tensor([False]),
+        value_certain=torch.tensor([False]),
+        value_solver_valid=torch.tensor([False]),
+    )
+    targets = value_targets(_one_row(restarted, **base), **RECIPE)
+    assert torch.allclose(targets["hier_outcome"], soft)
+    assert float(targets["hier_type"].abs().sum()) == 0.0
+    assert bool(targets["hier_rows"][0]) and bool(targets["value_rows"][0])
+    # Nothing permitted at all: the row is not supervised, rather than invented.
+    bare = dict(base, value_soft_valid=torch.tensor([False]))
+    targets = value_targets(_one_row(restarted, **bare), **RECIPE)
+    assert not bool(targets["value_rows"][0]) and not bool(targets["hier_rows"][0])
+
+
+def test_finding_4_zero_bootstrap_still_builds_the_restart_target(restarted, ancestors):
+    batch = _restart_batch(restarted, rust=False)
+    targets = value_targets(batch, value_bootstrap=0.0, short_term_value_weight=0.0)
+    assert targets["flat"] is not None
+    free = batch["value_soft_valid"] & ~batch["value_solver_valid"] & ~batch["value_certain"]
+    assert torch.allclose(targets["flat"][free], batch["value_soft"][free])
+    # The loss reads that target, so changing only the realised label changes nothing.
+    torch.manual_seed(0)
+    model = build_model("transformer", 32, 1)
+    outputs = model(batch)
+    flipped = dict(batch, value_class=2 - batch["value_class"])
+    _, a = compute_losses(outputs, batch)
+    _, b = compute_losses(outputs, flipped)
+    assert a["value"] == pytest.approx(b["value"])
+    # Mixed with ordinary rows, the restart rows keep the same targets.
+    mixed_rows = examples_from_record(ancestors[0])[:8] + [
+        row for record in _merged(restarted) for row in examples_from_record(record)
+    ]
+    mixed = collate(mixed_rows)
+    mixed_targets = value_targets(mixed, value_bootstrap=0.0, short_term_value_weight=0.0)
+    rows = mixed["outcome_free"] & mixed["value_soft_valid"] & ~mixed["value_solver_valid"] & ~mixed["value_certain"]
+    assert torch.allclose(mixed_targets["flat"][rows], mixed["value_soft"][rows])
+
+
+def test_finding_5_restarts_of_one_ancestor_have_distinct_identities(evaluator, entries):
+    by_seed: dict = {}
+    for entry in entries:
+        by_seed.setdefault(entry.seed, []).append(entry)
+    pair = next((group[:2] for group in by_seed.values() if len(group) >= 2), None)
+    if pair is None:
+        pair = [entries[0], entries[0]]
+    games = [ra.restart_game(entry) for entry in pair]
+    seeds = [80_001, 80_002]
+    continuations = _play(evaluator, games, seeds,
+                          first_move_excludes=[list(e.tried) for e in pair])
+    merged = [ra.merge_record(e, c, iteration=2) for e, c in zip(pair, continuations)]
+    assert len({(r.iteration, r.seed) for r in merged}) == 2
+    for record, entry in zip(merged, pair):
+        assert record.deal_seed == entry.seed and record.replay_seed == entry.seed
+        replay(record)
+        again = from_json_line(to_json_line(record))
+        assert (again.seed, again.deal_seed, again.family) == (
+            record.seed, record.deal_seed, record.family
+        )
+
+
+def test_finding_6_a_family_shares_one_holdout_side(restarted, ancestors):
+    from .train import stable_game_split
+
+    merged = _merged(restarted)
+    by_seed = {r.seed: r for r in ancestors}
+    for salt in ("a", "b", "c", "swd-v1"):
+        for record in merged:
+            ancestor = by_seed[record.deal_seed]
+            assert record.family == (ancestor.iteration, ancestor.seed)
+            rows = examples_from_record(ancestor) + examples_from_record(record)
+            train, val = stable_game_split(rows, 0.5, salt)
+            assert not train or not val, "family split across the holdout"
+    # A restart of a restart stays in the ROOT family.
+    second = ra.harvest(merged, iteration=2, seed=5)
+    for entry in second:
+        assert tuple(entry.family) in {r.family for r in merged}

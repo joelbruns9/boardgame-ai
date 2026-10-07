@@ -57,6 +57,9 @@ class Entry:
     source: list
     restarts: int = 0
     legal_count: int = 0
+    #: `(iteration, seed)` of the root ancestor, carried by every restart so the
+    #: whole family shares one holdout side.
+    family: list | None = None
     #: The ancestor game's winner, so a restart can report whether its forced
     #: branch ended differently.
     ancestor_winner: int | None = None
@@ -134,10 +137,15 @@ def harvest(
                 for kind, outcome in record.chance_log[:events]
             ]
             out.append(Entry(
-                seed=record.seed, first_player=record.first_player, prefix=prefix,
+                # The DEAL's seed: a restart of a restart replays the original deal.
+                seed=record.replay_seed, first_player=record.first_player, prefix=prefix,
                 chance_prefix=chance, tried=[move.action], born=iteration,
                 source=[record.iteration, d, d - ply], legal_count=legal,
                 ancestor_winner=record.winner,
+                family=(
+                    list(record.family) if record.family is not None
+                    else [record.iteration, record.seed]
+                ),
             ))
             taken += 1
     return out
@@ -276,7 +284,10 @@ def merge_record(entry: Entry, continuation: GameRecord, iteration: int | None) 
     agents = dict(continuation.agents)
     agents["restart_of"] = f"{entry.source[0]}:{entry.seed}:{ply}"
     return GameRecord(
-        seed=entry.seed,
+        # Its own identity (the job seed), replaying its ancestor's deal.
+        seed=continuation.seed,
+        deal_seed=entry.seed,
+        family=tuple(entry.family) if entry.family is not None else None,
         first_player=entry.first_player,
         agents=agents,
         iteration=iteration,

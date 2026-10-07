@@ -187,3 +187,31 @@ python -m pytest -n 4 games/seven_wonders_duel/test_exact_tactics.py \
 3. The encoder-8 migration is additive and safe for the warm start.
 4. G12 restarts produce replayable records and the right targets, with no
    result leakage via the deal.
+
+
+## Response to the review of 50e02c7 (2026-10-06)
+
+Review: `reviews/sevenwd-growth-50e02c7-review.md`. All six findings checked
+against the code; all hold and are fixed. 2b, G10a and the encoder-8 migration
+were signed off. Every regression test below FAILS against the pre-fix
+`train.py` / `restart_archive.py` and passes after.
+
+| # | finding | verdict | fix | regression test |
+|---|---|---|---|---|
+| 1 | short-term return carries the terminal result into restart targets | valid | restart rows get ONE contract in `value_targets`, built after the ordinary targets: no outcome, no outcome bootstrap, no short-term term | `test_finding_1_...` (both derivation backends; flipping the result and the short-term return leaves flat, W4 outcome and W4 type unchanged) |
+| 2 | substitution overwrote the labels certain-win overrides use | valid | `hard` / `joint_hard` stay the realised labels; the restart base is a separate tensor, then `prove()` (solver, then certain) | `test_finding_2_...` (certain + agreeing solver +1 + search 0.2 -> (1,0,0); type = the known route) |
+| 3 | no outlook -> W4 fell back to realised outcome/type | valid | W4 outcome from the outlook, else the scalar search value, else a proof; type only from the outlook or a certain win, else unsupervised; rows with nothing permitted are dropped (`value_rows` / `hier_rows` weights) | `test_finding_3_...` |
+| 4 | zero bootstrap weights bypassed the restart target | valid | a flat target is always built when a batch has restart rows | `test_finding_4_...` (alone and mixed with ordinary rows; value loss invariant to the realised label) |
+| 5 | restarts shared `(iteration, seed)` | valid | `seed` is the restart's own job seed (identity for G0, overlays, splits); the ancestor's deal replays from `deal_seed` (`GameRecord.replay_seed`, used by `replay` and `rust_game_for_record`); written to `setup.deal_seed` only when set | `test_finding_5_...` |
+| 6 | restarts could cross the holdout from their ancestor | valid | `GameRecord.family` = root ancestor `(iteration, seed)`, carried through restarts of restarts; `Example.split_family`; `stable_game_split` keys on it | `test_finding_6_...` |
+
+Also from the review: `w0_sizing._pack_examples` now REFUSES restart rows (its
+packed schema has no `outcome_free` / `split_family`). Design answers accepted:
+2b expectation/order, G10a loose-bound semantics, `initialized` not being an
+output-equivalence guarantee in general, the forced proven-loss move as
+exploration, temperature restarting at the restart ply, non-atomic archive
+charging.
+
+After the fixes: restart archive, G2 contract, buffer, w0 sizing, Rust
+derivation, Phase D, tactical suite, targeted reanalysis, pretrain, tactic
+labels, Rust engine equivalence -- 234 passed.

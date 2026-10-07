@@ -217,6 +217,9 @@ class Example:
     #: and W4 train on the search's own value/outlook instead, and the
     #: end-of-game heads (joint7, margin, military, science) skip the row.
     outcome_free: bool = False
+    #: G12: the holdout identity of a restart's FAMILY, `(iteration, seed)` of
+    #: its root ancestor; None means the row's own `(iteration, game_key)`.
+    split_family: tuple | None = None
 
     def __post_init__(self) -> None:
         """Make the arrays read-only as well as the fields.
@@ -1321,7 +1324,10 @@ def examples_from_record(
     if reanalysed or tactic_labels:
         examples = sync_reply_targets(examples, before)
     if record.restart_from is not None:
-        examples = [dataclasses.replace(e, outcome_free=True) for e in examples]
+        examples = [
+            dataclasses.replace(e, outcome_free=True, split_family=record.family)
+            for e in examples
+        ]
     return _with_short_term(examples, record)
 
 
@@ -1548,7 +1554,10 @@ def _examples_from_rust_payload(
         wonders_discarded=int(stats_payload["wonders_discarded"]),
     )
     if record.restart_from is not None:
-        examples = [dataclasses.replace(e, outcome_free=True) for e in examples]
+        examples = [
+            dataclasses.replace(e, outcome_free=True, split_family=record.family)
+            for e in examples
+        ]
     return _with_short_term(examples, record), stats
 
 

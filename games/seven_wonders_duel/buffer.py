@@ -251,6 +251,18 @@ class GameRecord:
     spec_version: str = SPEC_VERSION
     target_version: int = TARGET_VERSION
     digest_version: str = LOGIC_DIGEST_VERSION
+    deal_seed: int | None = None
+    """G12: the seed whose deal this game REPLAYS, when it is not ``seed``.
+
+    A restart reuses its ancestor's deal but is its own trajectory, so it keeps
+    a unique ``seed`` -- the identity every lookup keys on (`(iteration, seed)`
+    in G0, reanalysis overlays, the holdout split) -- and replays from this one
+    (`replay_seed`). Review of 50e02c7, finding 5."""
+    family: tuple[int | None, int] | None = None
+    """G12: ``(iteration, seed)`` of the ROOT ancestor of a restart chain. The
+    train/validation split keys on it, so an ancestor and every restart of it
+    sit on one side (review of 50e02c7, finding 6). None for an ordinary game,
+    which is its own family."""
     restart_from: int | None = None
     """G12: the game was RESTARTED from an archived position at this move index.
 
@@ -276,6 +288,12 @@ class GameRecord:
     @property
     def source_digest(self) -> str | None:
         return self._source_digest
+
+    @property
+    def replay_seed(self) -> int:
+        """The seed whose deal reproduces this game (G12: `deal_seed`)."""
+
+        return self.deal_seed if self.deal_seed is not None else self.seed
 
 
 class ReplayMismatchError(RuntimeError):
@@ -710,7 +728,7 @@ def replay(record: GameRecord, on_state=None, on_events=None) -> GameState:
             f"engine is {SPEC_VERSION!r} — the game a seed produces has "
             "changed, so the record cannot be replayed"
         )
-    game = new_game(record.seed, first_player=record.first_player)
+    game = new_game(record.replay_seed, first_player=record.first_player)
     log_position = 0
     trajectory = hashlib.sha256()
     for move in record.moves:
@@ -887,6 +905,10 @@ def to_json_line(record: GameRecord) -> str:
     }
     if record.restart_from is not None:
         payload["restart_from"] = record.restart_from
+    if record.deal_seed is not None:
+        payload["setup"]["deal_seed"] = record.deal_seed
+    if record.family is not None:
+        payload["family"] = list(record.family)
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
@@ -964,6 +986,8 @@ def from_json_line(line: str) -> GameRecord:
         final_digest=payload["final_digest"],
         trajectory_digest=payload["trajectory_digest"],
         restart_from=payload.get("restart_from"),
+        deal_seed=payload["setup"].get("deal_seed"),
+        family=tuple(payload["family"]) if payload.get("family") is not None else None,
     )
     object.__setattr__(
         record,
