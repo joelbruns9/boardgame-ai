@@ -1096,6 +1096,46 @@ certain-win rows. It is the A/B arm (G5). Training logs
 `sampled_certain_win_rows` per window. Validation is unchanged by the contract
 (proofs are off there and a certain row's exact target equals its realised one).
 
+### `--restart-fraction`
+
+**Default:** 0 (off). Final cloud run: 0.25 (owner, 2026-10-06).
+
+G12 (`MODEL_GROWTH_PLAN.md`, `restart_archive.py`). Share of each iteration's
+non-bot games that restart from an archived position: 0..`--restart-window`
+plies before a decisive position (a forced win, forced loss or must-block,
+`classify_actions`) in a recent game. The ancestor's moves are replayed from its
+seed, so the restart reuses its hidden deal; the restart position's move is
+drawn from the search's own target with every move already tried there
+excluded (the training target is untouched), so each restart explores the
+next-best branch. Records carry `restart_from`: derivation trains only the new
+moves, on move targets and search values but not the realised result
+(`Example.outcome_free`), and the end-of-game heads skip those rows. Rust
+generation only. Logged per iteration under `restarts`: games, `result_changed`
+(how often the forced branch ended differently from history), archive size,
+added, pruned, harvest seconds. Measured on run07 iter 100: harvest 23 ms/game,
+~1.1 entries per game, restart plies median 64 (decisive positions G4 can see
+are mostly late); merge 8 ms per restart game.
+
+### `--restart-window`
+
+**Default:** 8. G12: how many plies before a decisive position a restart may
+begin, drawn uniformly per decisive stretch (one restart per stretch, at most 2
+per game).
+
+### `--restart-max-restarts`
+
+**Default:** 3. G12: restarts per archived position, each excluding the moves
+already tried there; also retired once every legal move has been tried.
+
+### `--restart-max-age`
+
+**Default:** 10. G12: iterations an archived position stays restartable.
+
+### `--restart-harvest-games`
+
+**Default:** 400. G12: games of each iteration scanned for new archive entries
+(each is replayed and every position classified).
+
 ### `--tactic-labels`, `--no-tactic-labels`
 
 **Default:** on (offline A/B 2026-10-05: search blunders in must_block halved

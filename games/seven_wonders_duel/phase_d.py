@@ -697,6 +697,25 @@ class PhaseDConfig:
     derive_backend: str = "rust"
     """Replay/encoding implementation: production Rust or Python reference."""
 
+    restart_fraction: float = 0.0
+    """G12: share of each iteration's (non-bot) games that restart from an
+    archived position 0..`restart_window` plies before a decisive moment, with
+    the restart position's move forced off every move already tried there
+    (`restart_archive`). 0 disables it. Rust generation only."""
+
+    restart_window: int = 8
+    """G12: how many plies before a decisive position a restart may begin."""
+
+    restart_max_restarts: int = 3
+    """G12: restarts per archived position before it is retired."""
+
+    restart_max_age: int = 10
+    """G12: iterations an archived position stays restartable."""
+
+    restart_harvest_games: int = 400
+    """G12: games of each iteration scanned for new archive entries (the scan
+    replays each game and classifies every position)."""
+
     exact_tactics: bool = True
     """G4, as APPLIED (`configure_exact_tactics`): Rust search treats a node
     whose mover has a guaranteed win this turn as proven -- exact value, no
@@ -1400,6 +1419,10 @@ class PhaseDConfig:
             raise ValueError("search_mode must be closed or open")
         if self.gate_max_games <= 0 or self.gate_max_games % 2:
             raise ValueError("gate_max_games must be a positive even number")
+        if not 0.0 <= self.restart_fraction < 1.0:
+            raise ValueError("restart_fraction must lie in [0, 1)")
+        if self.restart_fraction > 0.0 and self.generation_backend != "rust":
+            raise ValueError("restart_fraction needs the Rust generation backend")
         if not 0.0 <= self.promotion_min_lcb <= 1.0:
             raise ValueError("promotion_min_lcb must lie in [0, 1]")
         if not 0.0 <= self.revert_max_ucb <= 1.0:
@@ -4494,10 +4517,23 @@ class PhaseDLoop:
         # neural and curriculum-bot games share one pool.
         seeds = [job.seed for job in jobs]
         first_players = [(job.index // 2) % 2 for job in jobs]
+        games = rust_games_for_self_play(seeds, first_players)
+        # G12: a share of the neural games restart from archived positions.
+        restarts = self._restart_plan(iteration, assignments)
+        first_move_excludes = None
+        if restarts:
+            from .restart_archive import restart_game
+
+            games = list(games)
+            first_move_excludes = [[] for _ in jobs]
+            for position, entry in restarts.items():
+                games[position] = restart_game(entry)
+                first_move_excludes[position] = list(entry.tried)
         raw_records, metrics = swr.self_play_many_flat_net(
             adapter=adapter,
-            games=rust_games_for_self_play(seeds, first_players),
+            games=games,
             game_seeds=seeds,
+            first_move_excludes=first_move_excludes,
             global_batch_cap=self.config.rust_global_batch_cap,
             # Generation is the shard-fragmented path the coalescer was built
             # for: 4 shards measured 1,558 requests at 1.91 rows against 1
@@ -4590,6 +4626,7 @@ class PhaseDLoop:
             ),
         )
         records = phase_d_records_from_rust(raw_records, validate=False)
+        restart_stats = self._merge_restarts(iteration, restarts, records)
         if league is not None:
             records = _tag_league_opponents(records, league)
         rust_metrics.append(metrics)
@@ -4622,7 +4659,87 @@ class PhaseDLoop:
             self.phase_seconds = {}
         self.phase_seconds["generation"] = elapsed
         _write_records(destination, records)
+        if self.config.restart_fraction > 0.0:
+            restart_stats.update(self._update_restart_archive(iteration, records))
+            self.last_generation_stats["restarts"] = restart_stats
+            print(f"iteration {iteration}: G12 restarts {restart_stats}", flush=True)
         return records
+
+    # --- G12 restart archive -------------------------------------------------
+
+    @property
+    def restart_archive_path(self) -> Path:
+        return self.run_dir / "restart_archive.json"
+
+    def _restart_archive(self):
+        from .restart_archive import Archive
+
+        if getattr(self, "_g12_archive", None) is None:
+            self._g12_archive = Archive.load(
+                self.restart_archive_path,
+                max_restarts=self.config.restart_max_restarts,
+                max_age=self.config.restart_max_age,
+            )
+        return self._g12_archive
+
+    def _restart_plan(self, iteration: int, assignments) -> dict:
+        """`{job position: archive entry}` for this iteration's restarts."""
+
+        if self.config.restart_fraction <= 0.0:
+            return {}
+        neural = [k for k, entry in enumerate(assignments) if entry is None]
+        wanted = int(round(self.config.restart_fraction * len(assignments)))
+        rng = random.Random(f"g12:{self.config.seed}:{iteration}")
+        entries = self._restart_archive().draw(min(wanted, len(neural)), rng)
+        positions = rng.sample(neural, len(entries))
+        return dict(zip(positions, entries))
+
+    def _merge_restarts(self, iteration: int, restarts: dict, records: list) -> dict:
+        """Replace each restart's continuation by its full, replayable record."""
+
+        from .restart_archive import merge_record
+
+        if not restarts:
+            return {"games": 0}
+        archive = self._restart_archive()
+        changed = 0
+        for position, entry in restarts.items():
+            continuation = records[position]
+            archive.note_played(entry, continuation.moves[0].action)
+            merged = merge_record(entry, continuation, iteration)
+            if entry.ancestor_winner is not None and merged.winner != entry.ancestor_winner:
+                changed += 1
+            records[position] = merged
+        return {
+            "games": len(restarts),
+            # How often the forced branch ended differently from history: the
+            # direct readout of whether restarts are exploring anything.
+            "result_changed": changed / len(restarts),
+        }
+
+    def _update_restart_archive(self, iteration: int, records: list) -> dict:
+        from .restart_archive import harvest
+
+        archive = self._restart_archive()
+        rng = random.Random(f"g12-harvest:{self.config.seed}:{iteration}")
+        sample = (
+            records
+            if len(records) <= self.config.restart_harvest_games
+            else rng.sample(records, self.config.restart_harvest_games)
+        )
+        started = time.monotonic()
+        added = archive.add(
+            harvest(sample, iteration, window=self.config.restart_window,
+                    seed=self.config.seed)
+        )
+        pruned = archive.prune(iteration)
+        archive.save(self.restart_archive_path)
+        return {
+            "archive": len(archive.entries),
+            "added": added,
+            "pruned": pruned,
+            "harvest_seconds": round(time.monotonic() - started, 1),
+        }
 
     def training_records(self, iteration: int) -> list[GameRecord]:
         selection = self.window_selection(iteration)
@@ -7804,6 +7921,22 @@ def build_parser() -> argparse.ArgumentParser:
         "objective, the A/B arm",
     )
     parser.add_argument(
+        "--restart-fraction",
+        type=float,
+        default=0.0,
+        help="G12: share of each iteration's games restarted from archived "
+        "positions shortly before decisive moments, forcing an untried move "
+        "there (0 = off)",
+    )
+    parser.add_argument("--restart-window", type=int, default=8,
+                        help="G12: plies before a decisive position a restart may begin")
+    parser.add_argument("--restart-max-restarts", type=int, default=3,
+                        help="G12: restarts per archived position")
+    parser.add_argument("--restart-max-age", type=int, default=10,
+                        help="G12: iterations an archived position stays restartable")
+    parser.add_argument("--restart-harvest-games", type=int, default=400,
+                        help="G12: games per iteration scanned for archive entries")
+    parser.add_argument(
         "--tactic-labels",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -8166,6 +8299,11 @@ def main(argv=None) -> int:
         record_fast_moves=args.record_fast_moves,
         retain_proofs_per_game=args.retain_proofs_per_game,
         tactic_labels=args.tactic_labels,
+        restart_fraction=args.restart_fraction,
+        restart_window=args.restart_window,
+        restart_max_restarts=args.restart_max_restarts,
+        restart_max_age=args.restart_max_age,
+        restart_harvest_games=args.restart_harvest_games,
         value_target_contract=args.value_target_contract,
         priority_sampling=args.priority_sampling,
         priority_uniform_share=args.priority_uniform_share,

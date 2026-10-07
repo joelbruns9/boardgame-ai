@@ -269,6 +269,7 @@ fn make_self_play_config(
         stop_after_moves: 0,
         // Set per job by the flat entry point, like `stop_after_moves`.
         exclude_parked_from_budget: false,
+        first_move_exclude: Vec::new(),
     }
 }
 
@@ -2770,7 +2771,7 @@ fn self_play_many_net(
     specialist_victory=None, specialist_symmetric=false,
     specialist_class_id=0, specialist_net=1, inference_wait_ms=0.0,
     inference_coalesce=true, stop_after_moves=0, double_reveal_offsets=0,
-    exclude_parked_from_budget=false))]
+    exclude_parked_from_budget=false, first_move_excludes=None))]
 fn self_play_many_flat_net(
     py: Python<'_>,
     adapter: Py<PyAny>,
@@ -2858,6 +2859,8 @@ fn self_play_many_flat_net(
     // Let a slot parked on an endgame solve release its budget token, so
     // another game searches in its place. Changes what max_active_slots MEANS.
     exclude_parked_from_budget: bool,
+    // G12 restarts: per game, actions its first move may not play.
+    first_move_excludes: Option<Vec<Vec<usize>>>,
 ) -> PyResult<(Vec<Py<PyDict>>, Py<PyDict>)> {
     if specialist_net > 1 {
         return Err(PyValueError::new_err("specialist_net must be 0 or 1"));
@@ -2954,6 +2957,15 @@ fn self_play_many_flat_net(
     // put every game in one call and let the scheduler interleave them. The
     // scalar form stays for callers that genuinely have one configuration for
     // the call (the curriculum seed buffer, the arena and evaluation paths).
+    if let Some(excludes) = &first_move_excludes {
+        if excludes.len() != games.len() {
+            return Err(PyValueError::new_err(format!(
+                "first_move_excludes ({}) must have one entry per game ({})",
+                excludes.len(),
+                games.len()
+            )));
+        }
+    }
     let per_game_bots = match (&bots_p0, &bots_p1) {
         (None, None) => None,
         (Some(p0), Some(p1)) => {
@@ -3039,6 +3051,9 @@ fn self_play_many_flat_net(
         cfg.stop_after_moves = stop_after_moves;
         cfg.double_reveal_offsets = double_reveal_offsets;
         cfg.exclude_parked_from_budget = exclude_parked_from_budget;
+        if let Some(excludes) = &first_move_excludes {
+            cfg.first_move_exclude = excludes[index].clone();
+        }
     }
     if specialist.is_some() && per_game_nets.is_none() && specialist_net != 0 {
         return Err(PyValueError::new_err(

@@ -154,6 +154,16 @@ def value_targets(
     value_class = batch["value_class"].long()
     hard = F.one_hot(value_class, num_classes=3).float()
     size = hard.shape[0]
+    # G12: a restarted game's realised result is not an independent sample
+    # (it reuses its ancestor's hidden deal), so its rows take the search's own
+    # value in place of the outcome wherever the search has one.
+    outcome_free = batch.get("outcome_free")
+    if outcome_free is not None and "value_soft" in batch:
+        hard = torch.where(
+            (outcome_free & batch["value_soft_valid"]).unsqueeze(1),
+            batch["value_soft"],
+            hard,
+        )
     solver_rows = batch.get("value_solver_valid") if solver_value_target else None
     if solver_rows is None:
         solver_rows = torch.zeros(size, dtype=torch.bool, device=hard.device)
@@ -222,6 +232,12 @@ def value_targets(
     if not hierarchical:
         return out
     joint_hard = F.one_hot(batch["joint7"].long(), num_classes=7).float()
+    if outcome_free is not None and "outlook_soft" in batch:
+        joint_hard = torch.where(
+            (outcome_free & batch["outlook_soft_valid"]).unsqueeze(1),
+            batch["outlook_soft"],
+            joint_hard,
+        )
     if outlook_bootstrap > 0.0 and "outlook_soft" in batch:
         # The value head's bootstrap, applied to the victory type: blend the
         # realised class with search's own seven-way outlook at this root. The
@@ -362,7 +378,23 @@ def compute_losses(
             per_value,
         )
     value_loss = (per_value * value_w).sum() / value_w.sum().clamp(min=1e-9)
-    joint7_loss = F.cross_entropy(outputs["joint7"], batch["joint7"])
+    # G12: the end-of-game heads read the realised game, which a restart row
+    # does not supply as an independent sample -- they skip those rows.
+    outcome_rows = batch.get("outcome_free")
+    outcome_rows = (
+        None if outcome_rows is None or not bool(outcome_rows.any()) else ~outcome_rows
+    )
+
+    def realised(per_row: torch.Tensor) -> torch.Tensor:
+        if outcome_rows is None:
+            return per_row.mean()
+        if not bool(outcome_rows.any()):
+            return per_row.new_zeros(())
+        return per_row[outcome_rows].mean()
+
+    joint7_loss = realised(
+        F.cross_entropy(outputs["joint7"], batch["joint7"], reduction="none")
+    )
     # The REPLACEMENT arm. `joint7` and W4's head fit the same per-game label,
     # so running both trains two heads on one observation and mostly re-weights
     # the outcome objective against policy -- which measures the weight, not the
@@ -377,14 +409,20 @@ def compute_losses(
     if hier_value_replaces_joint7:
         joint7_loss = joint7_loss.new_zeros(())
     margin_valid = batch["margin_valid"]
+    if outcome_rows is not None:
+        margin_valid = margin_valid & outcome_rows
     if margin_valid.any():
         margin_loss = F.mse_loss(
             outputs["margin"][margin_valid], batch["margin"][margin_valid]
         )
     else:
         margin_loss = outputs["margin"].new_zeros(())
-    military_loss = F.mse_loss(outputs["military"], batch["military_final"])
-    science_loss = F.mse_loss(outputs["science"], batch["sci_final"])
+    military_loss = realised(
+        F.mse_loss(outputs["military"], batch["military_final"], reduction="none")
+    )
+    science_loss = realised(
+        F.mse_loss(outputs["science"], batch["sci_final"], reduction="none").mean(dim=-1)
+    )
     hier_value_loss = outputs["policy"].new_zeros(())
     if "hier_joint7" in outputs:
         # The joint NLL, split into its two factors so each takes the target it

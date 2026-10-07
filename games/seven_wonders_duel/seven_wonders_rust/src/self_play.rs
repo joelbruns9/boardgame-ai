@@ -324,6 +324,27 @@ pub struct SelfPlayConfig {
     /// concurrent games to concurrent SEARCHING games, so a slot count measured
     /// under one is not comparable under the other.
     pub exclude_parked_from_budget: bool,
+    /// G12 restart: actions the job's FIRST move may not play. The search and
+    /// its training target are untouched; only the move actually played is
+    /// drawn from the search's own distribution with these removed, so a
+    /// restart explores the next-best branch instead of replaying history.
+    /// Empty for every ordinary game.
+    pub first_move_exclude: Vec<usize>,
+}
+
+/// G12: drop `exclude` from the played-move distribution (never from the
+/// training target). If the search put no mass anywhere else, the remaining
+/// legal moves are taken uniformly; if every legal move is excluded, the
+/// distribution is left alone.
+fn exclude_played(legal: &[usize], selection: &mut [f64], exclude: &[usize]) {
+    if exclude.is_empty() {
+        return;
+    }
+    let keep: Vec<bool> = legal.iter().map(|a| !exclude.contains(a)).collect();
+    if !keep.iter().any(|&k| k) {
+        return;
+    }
+    mask_and_renormalise(selection, &keep);
 }
 
 impl SelfPlayConfig {
@@ -1410,6 +1431,9 @@ pub fn run<E: Eval>(
         if let Some(keep) = overlay.as_ref().and_then(|o| o.keep.as_ref()) {
             mask_and_renormalise(&mut selection, keep);
             mask_and_renormalise(&mut training, keep);
+        }
+        if i == 0 {
+            exclude_played(&legal, &mut selection, &cfg.first_move_exclude);
         }
         let action = if cfg.deterministic_actions {
             best_policy_action(&legal, &selection)
@@ -3068,6 +3092,9 @@ impl GameSlot {
             mask_and_renormalise(&mut selection, keep);
             mask_and_renormalise(&mut training, keep);
         }
+        if i == 0 {
+            exclude_played(&meta.legal, &mut selection, &self.cfg.first_move_exclude);
+        }
         let action = if self.cfg.deterministic_actions {
             best_policy_action(&meta.legal, &selection)
         } else {
@@ -4167,6 +4194,7 @@ mod budget_tests {
             specialist_by_net: [None, None],
             stop_after_moves: 0,
             exclude_parked_from_budget: false,
+            first_move_exclude: Vec::new(),
             solve_endgames: true,
             solver_fallback_research: false,
             cheap_puct_root: None,

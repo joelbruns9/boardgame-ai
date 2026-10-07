@@ -212,6 +212,11 @@ class Example:
     #: G8.2: this row's move target and search value come from a targeted
     #: re-search (`targeted_reanalysis`), not from the search run07 recorded.
     reanalysed: bool = False
+    #: G12: the row comes from a RESTARTED game, which reuses its ancestor's
+    #: hidden deal -- its realised result is not an independent sample. Value
+    #: and W4 train on the search's own value/outlook instead, and the
+    #: end-of-game heads (joint7, margin, military, science) skip the row.
+    outcome_free: bool = False
 
     def __post_init__(self) -> None:
         """Make the arrays read-only as well as the fields.
@@ -1141,6 +1146,9 @@ def examples_from_record(
             legal_action_indices(game), dtype=np.int16
         )
         # Replay still steps through this move -- only the example is dropped.
+        # G12: a restart's ancestor prefix is replayed, not trained.
+        if record.restart_from is not None and move.i < record.restart_from:
+            return
         if not emits_example(move, record_fast_moves=record_fast_moves, retained=emitted):
             return
         kept_proof = move.i in retained
@@ -1312,6 +1320,8 @@ def examples_from_record(
         ]
     if reanalysed or tactic_labels:
         examples = sync_reply_targets(examples, before)
+    if record.restart_from is not None:
+        examples = [dataclasses.replace(e, outcome_free=True) for e in examples]
     return _with_short_term(examples, record)
 
 
@@ -1537,6 +1547,8 @@ def _examples_from_rust_payload(
         wonders_built=int(stats_payload["wonders_built"]),
         wonders_discarded=int(stats_payload["wonders_discarded"]),
     )
+    if record.restart_from is not None:
+        examples = [dataclasses.replace(e, outcome_free=True) for e in examples]
     return _with_short_term(examples, record), stats
 
 
@@ -1633,6 +1645,8 @@ def derive_records_rust(
                 emits_example(
                     move, record_fast_moves=record_fast_moves, retained=kept | set(extra)
                 )
+                # G12: a restart's ancestor prefix is replayed, not trained.
+                and (record.restart_from is None or move.i >= record.restart_from)
                 for move in record.moves
             ]
             for record, kept, extra in zip(batch, retained_by_game, reanalysed_by_game)
@@ -2020,6 +2034,12 @@ def collate(
         "military_final": military_final,
         "sci_final": sci_final,
     }
+    # G12, only when present: a batch without restart rows keeps its historical
+    # key set exactly.
+    if any(getattr(example, "outcome_free", False) for example in batch):
+        tensors["outcome_free"] = torch.tensor(
+            [bool(getattr(example, "outcome_free", False)) for example in batch]
+        )
     if contextual_actions:
         tensors.update(
             legal_action_tensors(

@@ -251,6 +251,15 @@ class GameRecord:
     spec_version: str = SPEC_VERSION
     target_version: int = TARGET_VERSION
     digest_version: str = LOGIC_DIGEST_VERSION
+    restart_from: int | None = None
+    """G12: the game was RESTARTED from an archived position at this move index.
+
+    Moves before it are the ancestor game's, replayed to reach the position (so
+    the record still replays from its seed); they are not training rows here.
+    Moves from it on were played fresh, and train move targets and search values
+    but not the final result -- a restart reuses the ancestor's hidden deal, so
+    its outcome is not an independent sample. None for an ordinary game, and
+    then absent from the JSON so existing records keep their exact bytes."""
     _source_digest: str | None = field(
         default=None, init=False, compare=False, repr=False
     )
@@ -761,6 +770,26 @@ def replay(record: GameRecord, on_state=None, on_events=None) -> GameState:
     return game
 
 
+def record_digests(
+    seed: int, first_player: int, actions, digest_version: str = LOGIC_DIGEST_VERSION
+) -> tuple[str, str]:
+    """`(final_digest, trajectory_digest)` of the game ``actions`` play from
+    ``(seed, first_player)`` -- exactly what `replay` checks. For records
+    assembled rather than recorded in one piece (G12 restarts: an ancestor's
+    prefix plus a fresh continuation)."""
+
+    game = new_game(seed, first_player=first_player)
+    trajectory = hashlib.sha256()
+    for index in actions:
+        _update_trajectory(trajectory, game, digest_version)
+        apply_action(game, decode_action(game, index))
+    if game.phase is not Phase.COMPLETE:
+        raise ReplayMismatchError("assembled game did not complete")
+    final = _final_digest(game, digest_version)
+    _update_trajectory(trajectory, game, digest_version)
+    return final, "sha256:" + trajectory.hexdigest()
+
+
 # --- JSONL serialization ----------------------------------------------------
 
 
@@ -856,6 +885,8 @@ def to_json_line(record: GameRecord) -> str:
         "final_digest": record.final_digest,
         "trajectory_digest": record.trajectory_digest,
     }
+    if record.restart_from is not None:
+        payload["restart_from"] = record.restart_from
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
@@ -932,6 +963,7 @@ def from_json_line(line: str) -> GameRecord:
         ),
         final_digest=payload["final_digest"],
         trajectory_digest=payload["trajectory_digest"],
+        restart_from=payload.get("restart_from"),
     )
     object.__setattr__(
         record,

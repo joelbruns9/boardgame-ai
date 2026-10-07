@@ -839,6 +839,25 @@ Policy targets are protected, value targets are not.
 
 ## G12 -- Restart archive from search states (Go-Exploit)
 
+**BUILT 2026-10-06 (v1, `restart_archive.py`, `--restart-fraction`).** Owner
+decisions: SAME DEAL (the ancestor's prefix is replayed from its seed -- no
+record-format change; a reshuffle would need `restart_from` + a portable-RNG
+re-deal in both languages, ~1-2 days, deferred); 25% of games; the restart
+position's move FORCED off every move already tried there, drawn from the
+search's own target (targeted exploration at decisive points; the training
+target is untouched); restart rows train move targets and search values but
+NOT the realised result, which reuses the ancestor's deal
+(`Example.outcome_free`: value/W4 take the search value/outlook, joint7 /
+margin / military / science skip the rows). Archive: positions 0..8 plies before
+a decisive position (`classify_actions` nonzero), one per decisive stretch, <= 2
+per game; <= 3 restarts each, retired after 10 iterations or when every legal
+move is tried. Not in v1: search-vs-network-correction and policy-surprise
+sources, priority sampling of entries, a drifting backward curriculum.
+Measured on run07 iter 100: 23 ms/game to harvest, ~1.1 entries/game, restart
+plies median 64 -- the archive is dominated by LATE positions because those are
+the ones G4 can prove. Rust `first_move_excludes` per game; merged records pass
+full replay (masks, chance log, both digests); derivation Python == Rust.
+
 Retaining recorded wins cannot recover positions neither self-play side
 reaches. Recipe to start from (Braun 4.2.1, Trudeau & Bowling 2023): half of
 games start from archived states with an unresolved plausible alternative
