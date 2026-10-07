@@ -75,7 +75,10 @@ from .rules import Resource, discard_income
 # moves on its own; the bump is the convention of §5.8 rather than a necessity.
 # Rust computes the same five channels as of the same day, so both languages
 # carry this version -- the schema is not Python-only.
-ENCODER_VERSION = "7wd-encoder-7"
+#
+# Bumped to -8 (2026-10-06): G10a consequence channels appended to
+# TABLEAU_FEATURES (`CONSEQUENCE_FEATURES`). Additive with new names.
+ENCODER_VERSION = "7wd-encoder-8"
 
 _RESOURCES = tuple(Resource)
 _SYMBOLS = tuple(ScienceSymbol)
@@ -260,6 +263,36 @@ CONTROL_FEATURES = tuple(
     for suffix in ("can_force", "turns_s")
 )
 
+#: G10a (`MODEL_GROWTH_PLAN.md`): what taking THIS card does to each player's
+#: route to a science or military win -- the per-move counterfactual the trunk
+#: otherwise has to assemble from several tokens. For each use of the card
+#: (build it, discard it, bury it under a Wonder) and each player: is a science
+#: win still reachable afterwards, is a military win, and did the move remove
+#: that player's last reachable source of a symbol they lack. Plus each
+#: player's reachability now, so "lost" is one subtraction away.
+#:
+#: "Reachable" is the encoder's existing loose bound (`reachable_cards`:
+#: obtainable cards plus the discard for a seat that can revive) -- who gets to
+#: a card first is not modelled. A discard stays reachable for whoever holds an
+#: unbuilt Mausoleum, mover included: discarding a science card you need while
+#: holding the Mausoleum keeps your science alive and takes it from them. A
+#: burial ignores the Wonder's own effects (its token carries them). Zero for a
+#: card that is face down or not accessible.
+_CONSEQUENCE_USES = ("build", "discard", "bury")
+_CONSEQUENCE_PER_SEAT = ("science_reachable", "military_reachable", "symbol_lost")
+CONSEQUENCE_FEATURES = (
+    "my_science_reachable_now",
+    "my_military_reachable_now",
+    "opp_science_reachable_now",
+    "opp_military_reachable_now",
+    *(
+        f"{use}_{who}_{name}"
+        for use in _CONSEQUENCE_USES
+        for who in ("my", "opp")
+        for name in _CONSEQUENCE_PER_SEAT
+    ),
+)
+
 TABLEAU_FEATURES = (
     "row",
     "row_s",
@@ -276,6 +309,8 @@ TABLEAU_FEATURES = (
     # new columns are at the end (train.py:616-638). Inserting mid-vector lands
     # every later column on the wrong feature.
     *REVEAL_FEATURES,
+    # G10a, after reveal for the same reason.
+    *CONSEQUENCE_FEATURES,
 )
 
 DRAFT_OFFER_FEATURES = ("second_round",)
@@ -584,6 +619,44 @@ class _Derived:
             )
         return total
 
+    def revives(self, seat: int) -> bool:
+        """``seat`` holds an unbuilt, unretired Mausoleum, so a card discarded
+        now stays in play for it (a live revival choice has fixed options)."""
+
+        pending = self.obs.pending_choice
+        if (
+            pending is not None
+            and pending.kind is PendingChoiceKind.BUILD_FROM_DISCARD_FREE
+            and pending.player == seat
+        ):
+            return False
+        city = self.obs.cities[seat]
+        return any(
+            name not in city.built_wonders
+            and name not in self.obs.retired_wonders
+            and any(
+                effect.kind is EffectKind.BUILD_FROM_DISCARD_FREE
+                for effect in WONDERS_BY_NAME[name].effects
+            )
+            for name in city.wonders
+        )
+
+    def consequence_base(self, seat: int) -> tuple[dict, bool, int, bool]:
+        """``(symbol source counts, law obtainable, military bound, strategy)``
+        over ``seat``'s reachable cards -- what G10a perturbs per card."""
+
+        counts: dict = {}
+        for name in self.reachable_cards(seat):
+            symbol = CARDS_BY_NAME[name].science
+            if symbol is not None:
+                counts[symbol] = counts.get(symbol, 0) + 1
+        return (
+            counts,
+            self.progress_obtainable(seat, "Law"),
+            self.military_bound(seat),
+            self.progress_obtainable(seat, "Strategy"),
+        )
+
     def science_missing_obtainable(self, seat: int) -> int:
         have = self.symbols[seat]
         obtainable: set[ScienceSymbol] = set()
@@ -833,6 +906,80 @@ def _tableau_card_per_player(derived: _Derived, seat: int, card_name: str) -> li
     ]
 
 
+_MILITARY_WIN = 9
+
+
+def _consequence_values(derived: _Derived):
+    """G10a: a per-card function returning ``CONSEQUENCE_FEATURES`` values,
+    with the per-seat bases computed once per encode."""
+
+    me = derived.actor
+    seats = (me, 1 - me)
+    base = {seat: derived.consequence_base(seat) for seat in seats}
+    revives = {seat: derived.revives(seat) for seat in seats}
+
+    def science_ok(seat, counts, law, have) -> bool:
+        found = sum(
+            1
+            for symbol in _SYMBOLS
+            if symbol in have
+            or counts.get(symbol, 0) > 0
+            or (symbol is ScienceSymbol.LAW and law)
+        )
+        return found >= 6
+
+    now = []
+    for seat in seats:
+        counts, law, bound, _strategy = base[seat]
+        now.append(1.0 if science_ok(seat, counts, law, derived.symbols[seat]) else 0.0)
+        now.append(
+            1.0 if derived.rel_position(seat) + bound >= _MILITARY_WIN else 0.0
+        )
+
+    def values(card_name: str) -> list[float]:
+        card = CARDS_BY_NAME[card_name]
+        out = list(now)
+        for use in _CONSEQUENCE_USES:
+            gain = derived.effective_shields(me, card_name) if use == "build" else 0
+            for seat in seats:
+                counts, law, bound, strategy = base[seat]
+                counts = dict(counts)
+                symbol = card.science
+                # The card leaves the board ...
+                if symbol is not None:
+                    counts[symbol] -= 1
+                bound -= card.shields + (
+                    1 if strategy and card.color is CardColor.RED else 0
+                )
+                # ... and a discard comes back for a seat that can revive it.
+                if use == "discard" and revives[seat]:
+                    if symbol is not None:
+                        counts[symbol] += 1
+                    bound += card.shields + (
+                        1 if strategy and card.color is CardColor.RED else 0
+                    )
+                have = derived.symbols[seat]
+                if use == "build" and seat == me and symbol is not None:
+                    have = have | {symbol}
+                position = derived.rel_position(seat) + (gain if seat == me else -gain)
+                lost = (
+                    symbol is not None
+                    and symbol not in have
+                    and base[seat][0].get(symbol, 0) > 0
+                    and counts.get(symbol, 0) == 0
+                )
+                out.extend(
+                    [
+                        1.0 if science_ok(seat, counts, law, have) else 0.0,
+                        1.0 if position + bound >= _MILITARY_WIN else 0.0,
+                        1.0 if lost else 0.0,
+                    ]
+                )
+        return out
+
+    return values
+
+
 def _tableau_tokens(derived: _Derived) -> list[Token]:
     obs = derived.obs
     if not obs.tableau:
@@ -843,6 +990,7 @@ def _tableau_tokens(derived: _Derived) -> list[Token]:
     present = {card.slot_id: card for card in obs.tableau if card.present}
     control = _control_maps(obs)
     reveal = reveal_values(derived)
+    consequences = _consequence_values(derived)
     tokens = []
     for slot_id in sorted(present):
         public = present[slot_id]
@@ -880,6 +1028,10 @@ def _tableau_tokens(derived: _Derived) -> list[Token]:
             values.extend([0.0] * (2 * len(_TABLEAU_PER_PLAYER)))
         values.extend(_control_values(control, slot_id))
         values.extend(reveal[slot_id])
+        if public.card_name is not None and public.accessible:
+            values.extend(consequences(public.card_name))
+        else:
+            values.extend([0.0] * len(CONSEQUENCE_FEATURES))
         tokens.append(_token(TokenType.TABLEAU, entity, values))
     return tokens
 

@@ -463,9 +463,18 @@ def test_encoder_signature_is_pinned():
     #     the tokens it should and nothing else;
     #   * the values were hand-checked on Example A (table 904750590 row 24):
     #     one nonzero slot, `reveal_n` 2, `reveal_opp_sixth` 0.429.
+    #
+    # 7wd-encoder-8 (2026-10-06): G10a's 22 consequence channels appended to
+    # TABLEAU_FEATURES. Evidence: Rust and Python agree bit-for-bit over the
+    # buffer corpus and 40 random games (`test_rust_engine_equiv`); stripping
+    # the 22 columns reproduces both -7 goldens literally
+    # (`test_stripping_consequences_reproduces_the_encoder_7_digests`); the
+    # draft golden is unchanged; on 5,674 accessible run07 card tokens the
+    # channels are live (burying kills a science route ~70 times per side,
+    # discarding keeps it alive through a Mausoleum ~25-30 times).
     assert (
         ENCODER_SIGNATURE
-        == "18bf9baf715f88d00043a9130e2a02cea4147afafafe64e040dd6e3bea28e83d"
+        == "41d7502e7445840e3736840ab6e43fd2f0a5fd89833e4ea12fbdce659be348b1"
     )
 
 
@@ -473,7 +482,7 @@ def test_golden_encoding_digest_is_stable():
     game = _playing_game(30)
     assert (
         _digest(encode(game.observation(0)))
-        == "d79f66b4077c6b5e4f20440af1423b78088108885a423513d3f304bf487d6e02"
+        == "8a8cd2561e5c870e49c3c1c1b7766270d72c68a17360f4d37dd3a35d87d33601"
     )
 
 
@@ -496,5 +505,43 @@ def test_golden_digests_cover_draft_and_pending_states():
     assert library.pending_choice is not None
     assert (
         _digest(encode(library.observation(0)))
+        == "08f0a2a1357f5a43eaf0e1e44d930aca1c67bb730c66c61528944cbe879df327"
+    )
+
+
+def _strip_consequences(encoding):
+    import dataclasses
+
+    from games.seven_wonders_duel.encoder import CONSEQUENCE_FEATURES
+
+    width = len(CONSEQUENCE_FEATURES)
+    return dataclasses.replace(
+        encoding,
+        tokens=tuple(
+            dataclasses.replace(token, features=token.features[:-width])
+            if token.type is TokenType.TABLEAU
+            else token
+            for token in encoding.tokens
+        ),
+    )
+
+
+def test_stripping_consequences_reproduces_the_encoder_7_digests():
+    """G10a is exactly an appended block: removing it gives back the literal
+    digests pinned under 7wd-encoder-7 (not re-derived -- that would be
+    circular)."""
+
+    game = _playing_game(30)
+    assert (
+        _digest(_strip_consequences(encode(game.observation(0))))
+        == "d79f66b4077c6b5e4f20440af1423b78088108885a423513d3f304bf487d6e02"
+    )
+    library = _playing_game(400)
+    _give_wonder(library, 0, "The Great Library")
+    library.cities[0].coins = 100
+    slot = library.tableau.accessible_slot_ids()[0]
+    apply_action(library, Action(slot, ActionUse.CONSTRUCT_WONDER, "The Great Library"))
+    assert (
+        _digest(_strip_consequences(encode(library.observation(0))))
         == "27f151f675560d3726e433ba00df144d4d786b41e403bd3551ede6f1baeac45f"
     )

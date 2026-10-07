@@ -774,6 +774,30 @@ corpus; hold to the W9 standard.
 
 ## G10 -- Action features and action-value supervision (W5b, owner decision)
 
+**G10a BUILT 2026-10-06 (encoder-8).** Carried on the TABLEAU token, not a new
+per-action boundary array: W5 reads each action's source card token, the
+existing parity gates cover it, and old checkpoints migrate additively (one
+grown tensor, `embedder.feature.tableau.weight`, new columns exactly zero).
+The token already had the per-player BUILD consequences (completes_pair,
+gives_sixth_symbol, would_win_military, ...); G10a adds 22 reachability
+channels (`encoder.CONSEQUENCE_FEATURES`): each player's science / military
+win reachable now, and for each use of the card (build, discard, bury) and
+each player: science reachable after, military reachable after, last source
+of a missing symbol lost. Owner decisions: a discard stays reachable for
+WHOEVER holds an unbuilt Mausoleum, mover included (discarding a needed
+science card keeps your own science alive and takes it from them); no
+control-flip channel; G4's wins_now / loses_by_force DROPPED -- measured
+`classify_actions` at 77 us mean (p99 1.3 ms, max 51 ms) per position vs 17 us
+for the per-node G4 check every search node already pays, needed at every
+evaluated leaf, for facts search computes exactly anyway. Parity: Rust ==
+Python bit-for-bit (buffer corpus + 40 random games); stripping the block
+reproduces the encoder-7 goldens. Live on run07 iter 95 (5,674 accessible card
+tokens): burying kills a science route ~70x per side, discarding keeps one
+alive via Mausoleum ~25-30x, symbol-lost 2-4% of tokens; military channels
+~90% on (the bound is loose -- little signal). `pretrain.py` migrates a
+previous-encoder base additively. Next: rerun the final pretrain so the net
+learns the channels.
+
 - **G10a (early, cheap, falsifiable):** engine-derived, route-consistent
   immediate-effect features -- wins now, completes a science pair / sixth symbol
   (tableau AND discard routes; the asymmetry is real), military zone, extra turn

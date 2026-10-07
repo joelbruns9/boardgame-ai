@@ -52,9 +52,9 @@ def test_every_init_runs_window_by_window(setup, init):
 def test_inits_differ_where_they_should(setup):
     _root, _buffers, base = setup
     stored = torch.load(base, map_location="cpu", weights_only=False)["model_state"]
-    kept, _ = pretrain.build_model(base, "checkpoint", 0)
-    fresh, _ = pretrain.build_model(base, "random", 123)
-    reset, _ = pretrain.build_model(base, "reset-value", 456)
+    kept, _ = pretrain.base_model(base, "checkpoint", 0)
+    fresh, _ = pretrain.base_model(base, "random", 123)
+    reset, _ = pretrain.base_model(base, "reset-value", 456)
     assert torch.equal(kept.state_dict()["heads.policy.weight"], stored["heads.policy.weight"])
     assert not torch.equal(fresh.state_dict()["heads.policy.weight"], stored["heads.policy.weight"])
     # reset-value: the trunk and policy kept, the value head redrawn.
@@ -133,7 +133,7 @@ def test_grown_layers_start_as_an_exact_no_op_and_still_learn(setup):
     stored = torch.load(base, map_location="cpu", weights_only=False)
     original = model_from_config(stored["config"])
     load_checkpoint(base, original, checkpoint=stored)
-    grown, config = pretrain.build_model(base, "checkpoint", 7, grow_to=3)
+    grown, config = pretrain.base_model(base, "checkpoint", 7, grow_to=3)
     assert config["layers"] == 3 and len(grown.encoder.layers) == 3
     rows = examples_from_record(fresh_bot_records(1, seed=99)[0])[:16]
     batch = collate(rows)
@@ -150,7 +150,7 @@ def test_grown_layers_start_as_an_exact_no_op_and_still_learn(setup):
         grad = dict(grown.named_parameters())[name].grad
         assert grad is not None and grad.abs().sum() > 0, name
     with pytest.raises(ValueError):
-        pretrain.build_model(base, "random", 0, grow_to=3)
+        pretrain.base_model(base, "random", 0, grow_to=3)
 
 
 def test_a_grown_pretrain_saves_a_checkpoint_that_rebuilds(setup):
@@ -167,3 +167,28 @@ def test_a_grown_pretrain_saves_a_checkpoint_that_rebuilds(setup):
     # And a resume rebuilds the same grown architecture.
     pretrain.run(_args(root, buffers, base, "checkpoint", "out_grow",
                        ("--grow-layers", "2", "--resume")))
+
+
+def test_a_base_from_the_previous_encoder_migrates_additively(setup):
+    """G10a appended tableau channels: an encoder-7 base loads with the grown
+    input columns at exactly zero, and nothing else changed."""
+
+    from .encoder import CONSEQUENCE_FEATURES
+
+    root, _buffers, base = setup
+    stored = torch.load(base, map_location="cpu", weights_only=False)
+    old = dict(stored)
+    old["model_state"] = dict(stored["model_state"])
+    key = "embedder.feature.tableau.weight"
+    width = old["model_state"][key].shape[1] - len(CONSEQUENCE_FEATURES)
+    old["model_state"][key] = old["model_state"][key][:, :width].clone()
+    old["encoder_signature"] = "encoder-7"
+    path = root / "encoder7_base.pt"
+    torch.save(old, path)
+    model, _config = pretrain.base_model(path, "checkpoint", 0)
+    state = model.state_dict()
+    assert torch.equal(state[key][:, :width], old["model_state"][key])
+    assert torch.count_nonzero(state[key][:, width:]) == 0
+    for name, tensor in stored["model_state"].items():
+        if name != key:
+            assert torch.equal(state[name], tensor), name

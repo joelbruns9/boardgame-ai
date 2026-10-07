@@ -21,6 +21,7 @@ from .codec import legal_actions
 from .control_table import control_key_from_observation
 from .reveal_risk import REVEAL_FEATURES
 from .encoder import (
+    CONSEQUENCE_FEATURES,
     CONTROL_FEATURES,
     GLOBAL_FEATURES,
     TABLEAU_FEATURES,
@@ -54,9 +55,12 @@ def _strip_control(encoding):
             # channels that follow it. The claim under test is "the pre-W3
             # digest survives removing everything W3 added", so a later
             # appended block has to come off too.
+            # G10a's consequence block (encoder-8) follows reveal and comes
+            # off with it.
+            tail = len(REVEAL_FEATURES) + len(CONSEQUENCE_FEATURES)
             features = (
                 features[:_FIRST]
-                + features[_FIRST + len(CONTROL_FEATURES):-len(REVEAL_FEATURES)]
+                + features[_FIRST + len(CONTROL_FEATURES):-tail]
             )
         tokens.append(dataclasses.replace(token, features=features))
     return dataclasses.replace(encoding, tokens=tuple(tokens))

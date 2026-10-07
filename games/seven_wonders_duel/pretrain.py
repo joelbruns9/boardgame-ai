@@ -51,8 +51,6 @@ from .action_alpha import format_alpha_fit, refit_alpha
 from .g3_offline_ab import RUN07, derive_window
 from .targeted_reanalysis import load_overlay
 from .train import (
-    ENCODER_SIGNATURE,
-    _check_control_table,
     load_checkpoint,
     make_checkpoint,
     model_from_config,
@@ -100,21 +98,33 @@ def grow_layers(model_config: dict, state: dict, layers: int, seed: int):
     return model, config
 
 
-def build_model(base: Path, init: str, seed: int, grow_to: int | None = None):
+def base_model(base: Path, init: str, seed: int, grow_to: int | None = None):
     checkpoint = torch.load(base, map_location="cpu", weights_only=False)
     torch.manual_seed(seed)
+    model = model_from_config(checkpoint["config"])
+    if init == "random":
+        if grow_to is not None:
+            raise ValueError("--grow-layers grows a trained base; use --init checkpoint")
+        return model, checkpoint["config"]
+    # An encoder-schema change since the base was trained (G10a appended 22
+    # tableau channels) is migrated ADDITIVELY: the grown input columns load as
+    # exact zeros, so the net computes what it did until training uses them.
+    # Anything else the migration would have to zero means a partly fresh net,
+    # which is refused here rather than trained on.
+    load_checkpoint(base, model, checkpoint=checkpoint, migrate=True)
+    migration = checkpoint.get("migration")
+    if migration is not None:
+        if migration["zeroed"]:
+            raise ValueError(
+                f"{base}: migrating would zero {migration['zeroed'][:5]}; not an "
+                "additive warm start"
+            )
+        print(f"[pretrain] migrated {base}: grown {migration['grown']}", flush=True)
+    config = checkpoint["config"]
     if grow_to is not None:
         if init != "checkpoint":
             raise ValueError("--grow-layers grows a trained base; use --init checkpoint")
-        # The checks an ordinary load makes, before the partial state load below.
-        if checkpoint["encoder_signature"] != ENCODER_SIGNATURE:
-            raise ValueError(f"{base}: encoder signature changed; migrate it first")
-        _check_control_table(checkpoint, migrating=False)
-        return grow_layers(checkpoint["config"], checkpoint["model_state"], grow_to, seed)
-    model = model_from_config(checkpoint["config"])
-    if init == "random":
-        return model, checkpoint["config"]
-    load_checkpoint(base, model, checkpoint=checkpoint)
+        return grow_layers(config, model.state_dict(), grow_to, seed)
     if init == "reset-value":
         reset = 0
         for name, module in model.named_modules():
@@ -124,7 +134,7 @@ def build_model(base: Path, init: str, seed: int, grow_to: int | None = None):
                     reset += 1
         if reset == 0:
             raise RuntimeError("--init reset-value found no value modules to reset")
-    return model, checkpoint["config"]
+    return model, config
 
 
 def run(args) -> dict:
@@ -136,7 +146,7 @@ def run(args) -> dict:
     progress = json.loads(state_path.read_text()) if args.resume and state_path.exists() else {
         "completed_windows": [], "history": [],
     }
-    model, config = build_model(args.base, args.init, args.seed, args.grow_layers)
+    model, config = base_model(args.base, args.init, args.seed, args.grow_layers)
     optimizer_state = None
     if progress["completed_windows"]:
         last = out_dir / f"window_{progress['completed_windows'][-1]}.pt"

@@ -29,12 +29,12 @@ const NUM_RESOURCES: usize = 5;
 /// boundary compares a checkpoint's stored signature against this to reject a
 /// net trained on a different feature schema.
 pub const ENCODER_SIGNATURE: &str =
-    "18bf9baf715f88d00043a9130e2a02cea4147afafafe64e040dd6e3bea28e83d";
+    "41d7502e7445840e3736840ab6e43fd2f0a5fd89833e4ea12fbdce659be348b1";
 
 /// Feature-vector length per token type, in `TokenType` order. The encoder
 /// asserts every emitted token matches (debug builds + `cargo test`); the
 /// bit-exact gate enforces it in release via the value comparison.
-pub const FEATURE_COUNTS: [usize; 9] = [133, 1, 37, 1, 8, 4, 1, 79, 14];
+pub const FEATURE_COUNTS: [usize; 9] = [133, 1, 59, 1, 8, 4, 1, 79, 14];
 
 /// Widest token feature vector — the padded row width every packed batch uses.
 ///
@@ -340,6 +340,81 @@ fn progress_obtainable(g: &GameState, seat: usize, token_name: &str) -> bool {
         && !g.retired_wonders.contains(&gl)
 }
 
+/// G10a (`encoder.py::_consequence_values`): what taking a card does to each
+/// player's route to a science or military win, per use (build, discard,
+/// bury). Mirror of the Python reference; the encoder parity gates check it.
+const CONSEQUENCE_WIDTH: usize = 22;
+const MILITARY_WIN: i32 = 9;
+
+struct Consequences {
+    me: usize,
+    base: [([i32; NUM_SYMBOLS], bool, i32, bool); 2],
+    revives: [bool; 2],
+    now: [f64; 4],
+}
+
+impl Consequences {
+    fn new(e: &Enc<'_>) -> Self {
+        let me = e.actor;
+        let base = [e.consequence_base(0), e.consequence_base(1)];
+        let revives = [e.revives(0), e.revives(1)];
+        let mut now = [0.0; 4];
+        for (k, seat) in [me, 1 - me].into_iter().enumerate() {
+            let (counts, law, bound, _) = base[seat];
+            now[2 * k] = Self::science_ok(&counts, law, &e.symbols[seat]) as u8 as f64;
+            now[2 * k + 1] = (rel_position(e.g, seat) + bound >= MILITARY_WIN) as u8 as f64;
+        }
+        Self { me, base, revives, now }
+    }
+
+    fn science_ok(counts: &[i32; NUM_SYMBOLS], law: bool, have: &[bool; NUM_SYMBOLS]) -> bool {
+        (0..NUM_SYMBOLS)
+            .filter(|&k| {
+                have[k] || counts[k] > 0 || (k == ScienceSymbol::Law as usize && law)
+            })
+            .count()
+            >= 6
+    }
+
+    fn extend_values(&self, e: &Enc<'_>, cid: usize, v: &mut Vec<f64>) {
+        let c = card(cid);
+        let me = self.me;
+        v.extend_from_slice(&self.now);
+        for use_kind in 0..3 {
+            // 0 build, 1 discard, 2 bury -- `_CONSEQUENCE_USES`.
+            let gain = if use_kind == 0 { effective_shields(e.g, me, cid) } else { 0 };
+            for seat in [me, 1 - me] {
+                let (mut counts, law, mut bound, strategy) = self.base[seat];
+                let red_bonus = if strategy && c.color == CardColor::Red { 1 } else { 0 };
+                if let Some(s) = c.science {
+                    counts[s as usize] -= 1;
+                }
+                bound -= c.shields + red_bonus;
+                if use_kind == 1 && self.revives[seat] {
+                    if let Some(s) = c.science {
+                        counts[s as usize] += 1;
+                    }
+                    bound += c.shields + red_bonus;
+                }
+                let mut have = e.symbols[seat];
+                if use_kind == 0 && seat == me {
+                    if let Some(s) = c.science {
+                        have[s as usize] = true;
+                    }
+                }
+                let position = rel_position(e.g, seat) + if seat == me { gain } else { -gain };
+                let lost = c.science.map_or(false, |s| {
+                    let k = s as usize;
+                    !have[k] && self.base[seat].0[k] > 0 && counts[k] == 0
+                });
+                v.push(Self::science_ok(&counts, law, &have) as u8 as f64);
+                v.push((position + bound >= MILITARY_WIN) as u8 as f64);
+                v.push(lost as u8 as f64);
+            }
+        }
+    }
+}
+
 impl Enc<'_> {
     /// Every card `seat` can still get into play: the shared obtainable set
     /// plus whatever that seat can revive out of the discard.
@@ -365,6 +440,42 @@ impl Enc<'_> {
                 .count() as i32;
         }
         total
+    }
+
+    /// `seat` holds an unbuilt, unretired Mausoleum, so a card discarded now
+    /// stays in play for it (`encoder.py::_Derived.revives`).
+    fn revives(&self, seat: usize) -> bool {
+        let g = self.g;
+        if let Some(p) = &g.pending_choice {
+            if p.kind == PendingChoiceKind::BuildFromDiscardFree && p.player == seat {
+                return false;
+            }
+        }
+        g.cities[seat].wonders.iter().any(|&wid| {
+            !g.cities[seat].built_wonders.contains(&wid)
+                && !g.retired_wonders.contains(&wid)
+                && wonder(wid)
+                    .effects
+                    .iter()
+                    .any(|e| e.kind == EffectKind::BuildFromDiscardFree)
+        })
+    }
+
+    /// G10a per-seat base: `(symbol source counts, law obtainable, military
+    /// bound, strategy obtainable)` (`encoder.py::_Derived.consequence_base`).
+    fn consequence_base(&self, seat: usize) -> ([i32; NUM_SYMBOLS], bool, i32, bool) {
+        let mut counts = [0i32; NUM_SYMBOLS];
+        for cid in self.reachable_cards(seat) {
+            if let Some(s) = card(cid).science {
+                counts[s as usize] += 1;
+            }
+        }
+        (
+            counts,
+            progress_obtainable(self.g, seat, "Law"),
+            self.military_bound(seat),
+            progress_obtainable(self.g, seat, "Strategy"),
+        )
     }
 
     fn science_missing_obtainable(&self, seat: usize) -> i32 {
@@ -596,6 +707,7 @@ impl Enc<'_> {
         let control = crate::control::control_maps(g);
         // Likewise once, not per slot: the counts are local geometry and the
         // pool fractions are one pass per seat, both shared by every token.
+        let consequences = Consequences::new(self);
         let reveal = crate::reveal::reveal_values(
             g,
             &present,
@@ -663,6 +775,12 @@ impl Enc<'_> {
             }
             // Reveal risk, appended after control to match TABLEAU_FEATURES.
             v.extend_from_slice(&reveal[i]);
+            // G10a consequences, last.
+            if slot_card.revealed && accessible {
+                consequences.extend_values(self, slot_card.card_id, v);
+            } else {
+                v.extend(std::iter::repeat(0.0).take(CONSEQUENCE_WIDTH));
+            }
             out.set_entity(entity);
         }
     }

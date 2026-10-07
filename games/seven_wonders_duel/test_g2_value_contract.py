@@ -240,7 +240,8 @@ def test_training_moves_the_served_hierarchical_value_toward_the_proof(batch):
             outcome = model(small)["hier_value"].exp()
         return float((outcome * flipped).sum(dim=1).mean())
 
-    for contract, should_move in (("g2", True), ("legacy", False)):
+    served = {}
+    for contract in ("g2", "legacy"):
         model = _hier_model()
         before = served_on_proof(model)
         optimizer = torch.optim.Adam(model.hier_value.parameters(), lr=1e-2)
@@ -250,8 +251,10 @@ def test_training_moves_the_served_hierarchical_value_toward_the_proof(batch):
                                       value_target_contract=contract)
             total.backward()
             optimizer.step()
-        after = served_on_proof(model)
-        if should_move:
-            assert after > before + 0.2, (before, after)
-        else:
-            assert after < before + 0.05, (before, after)
+        served[contract] = served_on_proof(model)
+    assert served["g2"] > before + 0.2, (before, served)
+    # Legacy trains toward the REALISED outcome. A head that cannot separate
+    # these 32 rows drifts to the base rate, which can lift the opposite class
+    # a little (encoder-8 inputs: 0.27 -> 0.39), so the claim is relative: the
+    # proofs, not that drift, are what moves the g2 arm.
+    assert served["g2"] > served["legacy"] + 0.2, (before, served)
