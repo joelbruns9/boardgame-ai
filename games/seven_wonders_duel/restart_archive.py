@@ -63,6 +63,9 @@ class Entry:
     #: The ancestor game's winner, so a restart can report whether its forced
     #: branch ended differently.
     ancestor_winner: int | None = None
+    #: Preloaded from an earlier run (`mausoleum_seeds`), not harvested: never
+    #: ages out, and `draw` caps how many are restarted per iteration.
+    seeded: bool = False
 
     @property
     def ply(self) -> int:
@@ -158,6 +161,9 @@ class Archive:
     entries: dict = field(default_factory=dict)
     max_restarts: int = DEFAULT_MAX_RESTARTS
     max_age: int = DEFAULT_MAX_AGE
+    #: Where the seeded entries came from (`mausoleum_seeds`), once preloaded:
+    #: a resume does not seed again.
+    seed_source: str | None = None
 
     def add(self, entries) -> int:
         added = 0
@@ -169,23 +175,35 @@ class Archive:
 
     def prune(self, iteration: int) -> int:
         """Drop entries that are spent: restarted ``max_restarts`` times, every
-        legal move tried, or older than ``max_age`` iterations."""
+        legal move tried, or older than ``max_age`` iterations (seeded entries
+        do not age)."""
 
         stale = [
             key for key, entry in self.entries.items()
             if entry.restarts >= self.max_restarts
             or (entry.legal_count and len(entry.tried) >= entry.legal_count)
-            or iteration - entry.born > self.max_age
+            or (not entry.seeded and iteration - entry.born > self.max_age)
         ]
         for key in stale:
             del self.entries[key]
         return len(stale)
 
-    def draw(self, count: int, rng: random.Random) -> list[Entry]:
-        """Up to ``count`` distinct entries, uniformly; each is charged one restart."""
+    def draw(self, count: int, rng: random.Random, seeded_cap: int | None = None) -> list[Entry]:
+        """Up to ``count`` distinct entries, each charged one restart. Uniform
+        when ``seeded_cap`` is None; otherwise exactly ``seeded_cap`` seeded
+        entries (while any remain) plus harvested ones for the rest, so a
+        preloaded pool is spent at a fixed pace over the run instead of in its
+        first iterations, when it is nearly the whole archive."""
 
         pool = sorted(self.entries)
-        chosen = rng.sample(pool, min(count, len(pool)))
+        if seeded_cap is None:
+            chosen = rng.sample(pool, min(count, len(pool)))
+        else:
+            seeded = [key for key in pool if self.entries[key].seeded]
+            harvested = [key for key in pool if not self.entries[key].seeded]
+            take = min(seeded_cap, len(seeded), count)
+            chosen = rng.sample(seeded, take)
+            chosen += rng.sample(harvested, min(count - take, len(harvested)))
         out = []
         for key in chosen:
             entry = self.entries[key]
@@ -203,6 +221,7 @@ class Archive:
         payload = {
             "max_restarts": self.max_restarts,
             "max_age": self.max_age,
+            "seed_source": self.seed_source,
             "entries": [asdict(entry) for entry in self.entries.values()],
         }
         tmp = Path(path).with_suffix(".tmp")
@@ -215,7 +234,10 @@ class Archive:
         if not path.exists():
             return cls(**defaults)
         payload = json.loads(path.read_text(encoding="utf-8"))
-        archive = cls(max_restarts=payload["max_restarts"], max_age=payload["max_age"])
+        archive = cls(
+            max_restarts=payload["max_restarts"], max_age=payload["max_age"],
+            seed_source=payload.get("seed_source"),
+        )
         for raw in payload["entries"]:
             entry = Entry(**raw)
             archive.entries[entry.key] = entry

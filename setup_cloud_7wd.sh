@@ -55,6 +55,10 @@
 #   LEAGUE_SCHEDULE=random  `cycle` fixes each iteration's specialist class
 #                   (S M S M S for science 0.15 / military 0.10) instead of a draw
 #   RESTART_FRACTION=0  G12: share of games restarted from archived search states
+#   RESTART_SEED_ARCHIVE=  G12 seeded archive (`mausoleum_seeds`), relative to
+#                   the repo or absolute; added to a NEW run's archive once.
+#                   Needs RESTART_FRACTION > 0.
+#   RESTART_SEED_PER_ITERATION=30  seeded entries restarted per iteration
 #   EXACT_TACTICS=1 TACTIC_LABELS=1  G4 exact tactics in every Rust search and
 #                   G2b tactic relabelling at derivation. Both default on in
 #                   phase_d; passed explicitly so the launch line records them.
@@ -333,6 +337,8 @@ PROMOTION_EVERY="${PROMOTION_EVERY:-10}"
 GENERATOR_MODE="${GENERATOR_MODE:-soft_gate}"
 LEAGUE_SCHEDULE="${LEAGUE_SCHEDULE:-random}"
 RESTART_FRACTION="${RESTART_FRACTION:-0}"
+RESTART_SEED_ARCHIVE="${RESTART_SEED_ARCHIVE:-}"
+RESTART_SEED_PER_ITERATION="${RESTART_SEED_PER_ITERATION:-30}"
 EXACT_TACTICS="${EXACT_TACTICS:-1}"
 TACTIC_LABELS="${TACTIC_LABELS:-1}"
 TACTIC_FLAGS=()
@@ -1322,6 +1328,21 @@ if [ -n "${INIT_CHECKPOINT:-}" ]; then
 else
   warn "INIT_CHECKPOINT unset: a new run starts from RANDOM weights."
 fi
+# G12 seeds: a committed file, so it is checked here (after the clone), not
+# with the uploaded operator files.
+RESTART_SEED_FLAGS=()
+if [ -n "$RESTART_SEED_ARCHIVE" ]; then
+  case "$RESTART_SEED_ARCHIVE" in
+    /*) ;;
+    *) RESTART_SEED_ARCHIVE="$REPO_DIR/$RESTART_SEED_ARCHIVE" ;;
+  esac
+  [ -r "$RESTART_SEED_ARCHIVE" ] || die "RESTART_SEED_ARCHIVE $RESTART_SEED_ARCHIVE is not readable."
+  awk -v f="$RESTART_FRACTION" 'BEGIN { exit !(f > 0) }' \
+    || die "RESTART_SEED_ARCHIVE needs RESTART_FRACTION > 0 (got $RESTART_FRACTION)."
+  RESTART_SEED_FLAGS=(--restart-seed-archive "$RESTART_SEED_ARCHIVE"
+    --restart-seed-per-iteration "$RESTART_SEED_PER_ITERATION")
+  ok "G12 seeds: $RESTART_SEED_ARCHIVE, $RESTART_SEED_PER_ITERATION restarted per iteration (added once, at a new run's first archive load)."
+fi
 if [ -n "${WARM_BUFFER:-}" ]; then
   INIT_FLAGS+=(--warm-buffer "$WARM_BUFFER")
   ok "Warm buffer: a new run imports replay games from $WARM_BUFFER."
@@ -1391,6 +1412,7 @@ TRAIN_CMD=(
   --hof-opponent-fraction "$HOF_FRACTION" --hof-start-games "$HOF_START_GAMES"
   --selfplay-generator-mode "$GENERATOR_MODE"
   --restart-fraction "$RESTART_FRACTION"
+  ${RESTART_SEED_FLAGS[@]+"${RESTART_SEED_FLAGS[@]}"}
   "${TACTIC_FLAGS[@]}"
   --bootstrap-policy "$BOOTSTRAP_POLICY"
   --promotion-every "$PROMOTION_EVERY"

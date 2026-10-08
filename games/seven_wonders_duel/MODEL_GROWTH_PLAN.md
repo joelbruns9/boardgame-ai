@@ -896,6 +896,22 @@ identities never enter policy input or pre-reveal selection). Deduplicate
 families, cap per ancestor, keep ordinary starts. Compare against the same
 compute spent on ordinary games. Infrastructure partly exists (BGA log restarts).
 
+**Mausoleum seeding -- BUILT 2026-10-08 (owner: "a key gap identified in the
+model"; decision 1's "then seed").** Inventory of ALL run07 buffers (101k
+games, `runs/seven_wonders_duel/mausoleum_inventory/`): 320 Mausoleum science
+wins (3.2/1k, flat iter 0-100: 69/67/67/47/70 per 20 iterations; science
+specialist games 3.8/1k vs general 3.0), 343 immediate retrieval-win
+positions (258 were 100-sim moves -- why only ~20 survived run07's window),
+610 SETUP games (Mausoleum unbuilt + five symbols + sixth in the discard,
+either player), 1,384 setup positions; half the setups converted. 23 immediate
+wins were declined, every one by a player who won anyway (equal winning
+lines). Matches the 44-60 audit exactly (54). `mausoleum_seeds.py` builds one
+seeded entry per setup game (609), 0..8 plies before its first setup;
+`--restart-seed-archive` preloads them once, `--restart-seed-per-iteration 30`
+spends them at a fixed pace (~60 iterations at 3 restarts each), and they
+never age out. Restart rows keep G12's contract (same deal, outcome-free).
+Monitor: rerun the inventory script on run08 buffers.
+
 ## G13 -- Exploiters
 
 Distinct from science/military specialists: maximize actual wins against a

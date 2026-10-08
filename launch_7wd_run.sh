@@ -266,6 +266,14 @@ export FULL_SEARCH_FRACTION="${FULL_SEARCH_FRACTION:-1.0}"
 # G12 restart archive: a quarter of games replay a decisive position from an
 # earlier game's deal with an untried first move.
 export RESTART_FRACTION="${RESTART_FRACTION:-0.25}"
+# Seeded with run07's Mausoleum science setups (owner, 2026-10-08): 609
+# positions 0..8 plies before a player holds The Mausoleum unbuilt with five
+# symbols and the sixth in the discard. run07 reached these in 0.6% of games,
+# flat over 100 iterations, and kept ~1/3 of the immediate wins (the rest were
+# 100-sim moves). 30 per iteration x 3 restarts each spreads them over ~60
+# iterations; they never age out.
+export RESTART_SEED_ARCHIVE="${RESTART_SEED_ARCHIVE:-games/seven_wonders_duel/seeds/mausoleum_run07.json}"
+export RESTART_SEED_PER_ITERATION="${RESTART_SEED_PER_ITERATION:-30}"
 
 # Train steps, RE-DERIVED for every-move-full search (laptop dry run
 # 2026-10-07, run08 settings, 64 sims): ~51 general policy rows per game with

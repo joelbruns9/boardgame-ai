@@ -727,6 +727,15 @@ class PhaseDConfig:
     restart_max_age: int = 10
     """G12: iterations an archived position stays restartable."""
 
+    restart_seed_archive: str | None = None
+    """G12: a seeded archive file (`mausoleum_seeds`) whose entries are added
+    to the run's archive once, at the first load. Seeded entries never age out
+    (they still retire after `restart_max_restarts`)."""
+
+    restart_seed_per_iteration: int = 30
+    """G12: seeded entries restarted per iteration (the rest of the restarts
+    come from the harvested archive), so the seeded pool lasts the run."""
+
     restart_harvest_games: int = 400
     """G12: games of each iteration scanned for new archive entries (the scan
     replays each game and classifies every position)."""
@@ -1455,6 +1464,15 @@ class PhaseDConfig:
             raise ValueError("restart_fraction must lie in [0, 1)")
         if self.restart_fraction > 0.0 and self.generation_backend != "rust":
             raise ValueError("restart_fraction needs the Rust generation backend")
+        if self.restart_seed_archive is not None:
+            if self.restart_fraction <= 0.0:
+                raise ValueError("restart_seed_archive needs restart_fraction > 0")
+            if not Path(self.restart_seed_archive).is_file():
+                raise ValueError(
+                    f"restart_seed_archive {self.restart_seed_archive} does not exist"
+                )
+        if self.restart_seed_per_iteration < 0:
+            raise ValueError("restart_seed_per_iteration must be >= 0")
         if not 0.0 <= self.promotion_min_lcb <= 1.0:
             raise ValueError("promotion_min_lcb must lie in [0, 1]")
         if not 0.0 <= self.revert_max_ucb <= 1.0:
@@ -4738,11 +4756,22 @@ class PhaseDLoop:
         from .restart_archive import Archive
 
         if getattr(self, "_g12_archive", None) is None:
-            self._g12_archive = Archive.load(
+            archive = Archive.load(
                 self.restart_archive_path,
                 max_restarts=self.config.restart_max_restarts,
                 max_age=self.config.restart_max_age,
             )
+            source = self.config.restart_seed_archive
+            if source is not None and archive.seed_source is None:
+                seeds = Archive.load(Path(source))
+                for entry in seeds.entries.values():
+                    entry.seeded = True
+                added = archive.add(seeds.entries.values())
+                archive.seed_source = seeds.seed_source or Path(source).name
+                self.restart_archive_path.parent.mkdir(parents=True, exist_ok=True)
+                archive.save(self.restart_archive_path)
+                print(f"G12: seeded {added} restart entries from {source}", flush=True)
+            self._g12_archive = archive
         return self._g12_archive
 
     def _restart_plan(self, iteration: int, assignments) -> dict:
@@ -4753,7 +4782,13 @@ class PhaseDLoop:
         neural = [k for k, entry in enumerate(assignments) if entry is None]
         wanted = int(round(self.config.restart_fraction * len(assignments)))
         rng = random.Random(f"g12:{self.config.seed}:{iteration}")
-        entries = self._restart_archive().draw(min(wanted, len(neural)), rng)
+        entries = self._restart_archive().draw(
+            min(wanted, len(neural)), rng,
+            seeded_cap=(
+                self.config.restart_seed_per_iteration
+                if self.config.restart_seed_archive is not None else None
+            ),
+        )
         positions = rng.sample(neural, len(entries))
         return dict(zip(positions, entries))
 
@@ -4775,6 +4810,7 @@ class PhaseDLoop:
             records[position] = merged
         return {
             "games": len(restarts),
+            "seeded": sum(entry.seeded for entry in restarts.values()),
             # How often the forced branch ended differently from history: the
             # direct readout of whether restarts are exploring anything.
             "result_changed": changed / len(restarts),
@@ -4799,6 +4835,7 @@ class PhaseDLoop:
         archive.save(self.restart_archive_path)
         return {
             "archive": len(archive.entries),
+            "seeded_left": sum(entry.seeded for entry in archive.entries.values()),
             "added": added,
             "pruned": pruned,
             "harvest_seconds": round(time.monotonic() - started, 1),
@@ -8028,6 +8065,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="G12: restarts per archived position")
     parser.add_argument("--restart-max-age", type=int, default=10,
                         help="G12: iterations an archived position stays restartable")
+    parser.add_argument("--restart-seed-archive", default=None,
+                        help="G12: seeded archive file (mausoleum_seeds) added "
+                        "to the run's archive once")
+    parser.add_argument("--restart-seed-per-iteration", type=int, default=30,
+                        help="G12: seeded entries restarted per iteration")
     parser.add_argument("--restart-harvest-games", type=int, default=400,
                         help="G12: games per iteration scanned for archive entries")
     parser.add_argument(
@@ -8400,6 +8442,8 @@ def main(argv=None) -> int:
         restart_window=args.restart_window,
         restart_max_restarts=args.restart_max_restarts,
         restart_max_age=args.restart_max_age,
+        restart_seed_archive=args.restart_seed_archive,
+        restart_seed_per_iteration=args.restart_seed_per_iteration,
         restart_harvest_games=args.restart_harvest_games,
         value_target_contract=args.value_target_contract,
         priority_sampling=args.priority_sampling,

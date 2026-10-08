@@ -1172,6 +1172,23 @@ already tried there; also retired once every legal move has been tried.
 
 **Default:** 10. G12: iterations an archived position stays restartable.
 
+### `--restart-seed-archive`, `--restart-seed-per-iteration`
+
+**Default:** none / 30. G12 seeding (owner 2026-10-08): an archive file built
+by `mausoleum_seeds.py` from an earlier run's buffers is added to the run's
+archive once, at the first load (a resume does not re-seed). Seeded entries
+never age out; they retire after `--restart-max-restarts` like any other.
+Each iteration restarts exactly `--restart-seed-per-iteration` seeded entries
+(while any remain); the rest of the restart share comes from the harvested
+archive. Needs `--restart-fraction > 0`.
+
+The committed `seeds/mausoleum_run07.json` holds 609 positions from all
+101,000 run07 games, 0..8 plies before the first point where a player holds
+The Mausoleum unbuilt, five distinct science symbols and the sixth in the
+discard. run07 reached that in 0.6% of games, flat over its 100 iterations;
+Mausoleum science wins were 3.2 per 1,000 games (specialists 3.8). At 30 per
+iteration and 3 restarts each, the pool lasts about 60 iterations.
+
 ### `--restart-harvest-games`
 
 **Default:** 400. G12: games of each iteration scanned for new archive entries
