@@ -133,6 +133,7 @@ two is visible.
   --gate-slots 256 --gate-global-batch-cap 2048 `
   --gate-sims 800 `
   --weight-decay 0.5 --value-bootstrap 0.5 --short-term-value-weight 0.25 `
+  --outcome-share-decay 0 --outcome-share-floor 0 `
   --min-buffer-positions 200000 `
   --replay-window-coefficient 1000 --replay-window-exponent 0.6 `
   --temperature-floor 0.35 --temperature-anneal-moves 30 `
@@ -1083,6 +1084,31 @@ game in one step instead of over many iterations. KataGo uses the same signal
 through separate heads; it is blended into the main target here so a running
 model adopts it without a shape change. Applies to cached examples at the next
 derivation (it is computed from the record, not stored in it).
+
+### `--outcome-share-decay` / `--outcome-share-floor`
+
+**Default:** `0.0` / `0.0` (off: the flat `--value-bootstrap` blend). **Value:**
+decay in [0, 1); floor in [0, 1 - value_bootstrap]
+
+Makes the realised result's share of the value blend depend on how far the row
+is from the end of its game. The share is `1 - value_bootstrap` at the last
+recorded move and is multiplied by the decay per move further back, never below
+the floor; the rest of the blend is the row's own search value. The
+`--short-term-value-weight` mix and proofs apply on top, unchanged.
+
+Why: the outcome is one label shared by every row of a game. Near the end the
+position nearly determines it, so fitting it teaches evaluation. Early it does
+not, and the cheapest fit is recognising the game -- AlphaGo's value-network
+overfit, and cloud3's tripled held-out value loss. With every move searched
+(run08: ~51-59 rows per game against run07's ~15.5) each outcome is presented
+about 3x as often. The floor keeps the result reaching the opening and the
+wonder draft, which no later value can correct directly.
+
+Example, `--value-bootstrap 0.5 --outcome-share-decay 0.97
+--outcome-share-floor 0.2`: share 0.5 at the last move, 0.37 ten moves out,
+0.27 twenty out, 0.2 from about thirty moves out (games run ~70 moves). Rows
+with no source move take the floor. Restart rows (G12) never use the outcome.
+Offline A/B: `value_target_ab.py`.
 
 ### `--value-target-contract`
 

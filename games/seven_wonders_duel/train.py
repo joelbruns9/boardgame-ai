@@ -128,6 +128,8 @@ def value_targets(
     solver_value_target: bool = True,
     contract: str = VALUE_TARGET_CONTRACT_DEFAULT,
     hierarchical: bool = False,
+    outcome_share_decay: float = 0.0,
+    outcome_share_floor: float = 0.0,
 ) -> dict[str, torch.Tensor | None]:
     """The effective value targets of one batch, per head (G2 contract).
 
@@ -216,7 +218,36 @@ def value_targets(
             target = torch.where(certain.unsqueeze(1), hard, target)
         return target
 
-    if value_bootstrap > 0.0 and "value_soft" in batch:
+    scheduled = outcome_share_decay > 0.0 and "value_soft" in batch
+    if scheduled:
+        # Distance-scaled outcome share: the realised result's weight in the
+        # blend is (1 - value_bootstrap) at the last move, decays by
+        # `outcome_share_decay` per move further from the end, and never falls
+        # below `outcome_share_floor`. Near the end the position nearly
+        # determines the result, so sharing it teaches evaluation; early, it
+        # does not, and the cheapest fit is recognising the game (AlphaGo's
+        # value overfit). The floor keeps the result reaching the opening and
+        # the draft, which nothing else grounds. Rows of unknown distance
+        # take the floor.
+        if "plies_to_end" not in batch:
+            raise ValueError("outcome_share_decay needs plies_to_end in the batch")
+        plies = batch["plies_to_end"]
+        known = plies >= 0
+        decayed = (1.0 - value_bootstrap) * torch.pow(
+            torch.full_like(plies, outcome_share_decay, dtype=torch.float32),
+            plies.clamp(min=0).float(),
+        )
+        share = torch.where(
+            known,
+            decayed.clamp(min=outcome_share_floor),
+            torch.full_like(decayed, outcome_share_floor),
+        ).unsqueeze(1)
+        flat = torch.where(
+            batch["value_soft_valid"].unsqueeze(1),
+            share * hard + (1.0 - share) * batch["value_soft"],
+            hard,
+        )
+    elif value_bootstrap > 0.0 and "value_soft" in batch:
         # Blend the realised outcome with the search's own estimate. The outcome
         # is one sample of a probability; fitting it hard produces a head that is
         # confidently wrong off-distribution (cloud3: holdout value loss tripled
@@ -343,6 +374,8 @@ def compute_losses(
     hier_value_replaces_joint7: bool = False,
     outlook_bootstrap: float = 0.0,
     value_target_contract: str = VALUE_TARGET_CONTRACT_DEFAULT,
+    outcome_share_decay: float = 0.0,
+    outcome_share_floor: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     log_policy = masked_policy_log_softmax(outputs["policy"], batch["legal_mask"])
     # Targets are zero on illegal actions where log_policy is -inf; read only
@@ -408,6 +441,8 @@ def compute_losses(
         solver_value_target=solver_value_target,
         contract=value_target_contract,
         hierarchical="hier_joint7" in outputs,
+        outcome_share_decay=outcome_share_decay,
+        outcome_share_floor=outcome_share_floor,
     )
     if targets["flat"] is None:
         per_value = F.cross_entropy(
@@ -1543,6 +1578,8 @@ def train_steps(
     value_target_contract: str = VALUE_TARGET_CONTRACT_DEFAULT,
     sample_weights=None,
     log=print,
+    outcome_share_decay: float = 0.0,
+    outcome_share_floor: float = 0.0,
 ) -> tuple[list[dict], dict]:
     """Fixed-budget training on uniform random minibatches from the replay.
 
@@ -1676,6 +1713,8 @@ def train_steps(
                 outlook_bootstrap=outlook_bootstrap,
                 short_term_value_weight=short_term_value_weight,
                 value_target_contract=value_target_contract,
+                outcome_share_decay=outcome_share_decay,
+                outcome_share_floor=outcome_share_floor,
             )
         scaler.scale(total).backward()
         scaler.unscale_(optimizer)

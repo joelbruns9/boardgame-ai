@@ -255,6 +255,32 @@ with `losing_mass` on bot games, on/off switch.
 Self-play cost (laptop, final_41_100 net, 32 games x 200 sims, tactics on,
 3 alternating pairs): -4.6 / -3.5 / -5.3% moves/s with strata on.
 
+**Value target outcome share -- DECIDED 2026-10-07: `VALUE_BOOTSTRAP=0.75`.**
+Every move searched means ~51-59 rows share each game's outcome (run07 ~15.5),
+so at ~5.5 passes per row each outcome is presented ~3x as often. Offline A/B
+(`value_target_ab.py`: run07 91-100 from `candidate_0080`, 5,000 steps,
+~358 presentations per game, 855 held-out games), three arms:
+
+| | flat 0.5 | distance-floored | flat 0.75 |
+|---|---|---|---|
+| held-out outcome log loss (start 0.458) | 0.475 | 0.469 | 0.468 |
+| train/held-out gap | 0.113 | 0.082 | 0.083 |
+| proof abs error | 0.168 | 0.166 | 0.166 |
+
+- Memorisation grows MOST late (gap +0.11 in the last 30 moves, +0.05 in the
+  opening): late positions fingerprint the game; early ones look alike. The
+  premise "early positions memorise" was wrong for 7WD.
+- The floored schedule (`--outcome-share-decay 0.97 --outcome-share-floor
+  0.2`, built and tested, off by default) tied flat 0.75 on everything, and
+  neither closed the late gap. The existing flag ships.
+- G0: tactics unchanged. Its absolute-error columns favour flat 0.5 by ~0.01
+  on realised-result classes, but absolute error rewards sharpness; rescored
+  with log loss / Brier the arms are level, leaning to 0.75 on unseen games.
+- Caveat: rows were reused ~17x (run08 ~5.5x), so absolute overfit is
+  exaggerated; the arm comparison is fair. `OUTLOOK_BOOTSTRAP` stays 0.5
+  (untested). Watch run08's game-split gap; re-dealt restarts are the parked
+  remedy if the late gap stays open.
+
 ## Execution order
 
 Steps 1-4 are laptop work and can overlap; 5+ need a box.

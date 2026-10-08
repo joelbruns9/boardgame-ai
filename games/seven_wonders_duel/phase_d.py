@@ -606,6 +606,14 @@ class PhaseDConfig:
     recorded later in the same game (`dataset.short_term_values`, decay
     `SHORT_TERM_DECAY`). Carries endgame proofs and closer-to-the-end search
     values back to earlier positions. 0 = off (unchanged targets)."""
+    outcome_share_decay: float = 0.0
+    """Distance-scaled outcome share: the realised result's weight in the
+    value blend is ``1 - value_bootstrap`` at the last move and is multiplied
+    by this per move further from the end (`train.value_targets`). 0 = off,
+    the flat ``value_bootstrap`` blend."""
+    outcome_share_floor: float = 0.0
+    """The smallest outcome share any row gets under ``outcome_share_decay``,
+    so the result still reaches the opening and the wonder draft."""
     validate_every: int = 100
     restore_best_val: bool = False
     val_fraction: float = 0.05
@@ -1334,6 +1342,16 @@ class PhaseDConfig:
     def validate(self) -> None:
         if not 0.0 <= self.short_term_value_weight < 1.0:
             raise ValueError("short_term_value_weight must be in [0, 1)")
+        if not 0.0 <= self.outcome_share_decay < 1.0:
+            raise ValueError("outcome_share_decay must be in [0, 1)")
+        if self.outcome_share_decay > 0.0:
+            if not 0.0 <= self.outcome_share_floor <= 1.0 - self.value_bootstrap:
+                raise ValueError(
+                    "outcome_share_floor must lie in [0, 1 - value_bootstrap], "
+                    "the share at the last move"
+                )
+        elif self.outcome_share_floor != 0.0:
+            raise ValueError("outcome_share_floor needs outcome_share_decay > 0")
         if not 0.0 <= self.priority_uniform_share <= 1.0:
             raise ValueError("priority_uniform_share must be in [0, 1]")
         if self.priority_cap < 1.0:
@@ -5276,6 +5294,8 @@ class PhaseDLoop:
             value_weight=self.config.value_weight,
             value_bootstrap=self.config.value_bootstrap,
             short_term_value_weight=self.config.short_term_value_weight,
+            outcome_share_decay=self.config.outcome_share_decay,
+            outcome_share_floor=self.config.outcome_share_floor,
             value_target_contract=self.config.value_target_contract,
             action_policy_weight=self.config.action_policy_weight,
             hier_value_weight=self.config.hier_value_weight,
@@ -5764,6 +5784,8 @@ class PhaseDLoop:
             value_weight=self.config.value_weight,
             value_bootstrap=self.config.value_bootstrap,
             short_term_value_weight=self.config.short_term_value_weight,
+            outcome_share_decay=self.config.outcome_share_decay,
+            outcome_share_floor=self.config.outcome_share_floor,
             value_target_contract=self.config.value_target_contract,
             action_policy_weight=self.config.action_policy_weight,
             hier_value_weight=self.config.hier_value_weight,
@@ -7702,6 +7724,24 @@ def build_parser() -> argparse.ArgumentParser:
         "constraining the head at all.",
     )
     parser.add_argument(
+        "--outcome-share-decay",
+        type=float,
+        default=0.0,
+        help="distance-scaled outcome share: the realised result's weight in "
+        "the --value-bootstrap blend is (1 - value_bootstrap) at the last move "
+        "and is multiplied by this per move further from the end. Near the end "
+        "the position nearly determines the result; early it does not, and "
+        "fitting it there teaches the network to recognise games. 0 = off "
+        "(flat blend).",
+    )
+    parser.add_argument(
+        "--outcome-share-floor",
+        type=float,
+        default=0.0,
+        help="smallest outcome share under --outcome-share-decay, so the "
+        "result still reaches the opening and the wonder draft",
+    )
+    parser.add_argument(
         "--value-weight",
         type=float,
         default=1.0,
@@ -8340,6 +8380,8 @@ def main(argv=None) -> int:
         value_weight=args.value_weight,
         value_bootstrap=args.value_bootstrap,
         short_term_value_weight=args.short_term_value_weight,
+        outcome_share_decay=args.outcome_share_decay,
+        outcome_share_floor=args.outcome_share_floor,
         validate_every=args.validate_every,
         restore_best_val=args.restore_best_val,
         val_fraction=args.val_fraction,

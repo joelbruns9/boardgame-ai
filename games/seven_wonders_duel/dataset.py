@@ -220,6 +220,11 @@ class Example:
     #: G12: the holdout identity of a restart's FAMILY, `(iteration, seed)` of
     #: its root ancestor; None means the row's own `(iteration, game_key)`.
     split_family: tuple | None = None
+    #: Recorded moves left in the game after this row's move (0 = the last
+    #: move), or None for a row with no source move. Drives the distance-scaled
+    #: outcome share of the value target (`train.value_targets`,
+    #: `outcome_share_decay`).
+    plies_to_end: int | None = None
 
     def __post_init__(self) -> None:
         """Make the arrays read-only as well as the fields.
@@ -1080,9 +1085,22 @@ def _with_short_term(examples: list, record) -> list:
     if not examples:
         return examples
     targets = short_term_values(record)
+    position = {move.i: n for n, move in enumerate(record.moves)}
+    last = len(record.moves) - 1
+
+    def remaining(example) -> int | None:
+        at = position.get(example.move_index)
+        return None if at is None else last - at
+
     return [
-        dataclasses.replace(example, short_term_value=targets.get(example.move_index))
+        dataclasses.replace(
+            example,
+            short_term_value=targets.get(example.move_index),
+            plies_to_end=remaining(example),
+        )
         if example.move_index is not None and not example.reanalysis
+        else dataclasses.replace(example, plies_to_end=remaining(example))
+        if example.move_index is not None
         else example
         for example in examples
     ]
@@ -1931,6 +1949,8 @@ def collate(
     # as `value_soft`; blended in by `compute_losses(short_term_value_weight=)`.
     value_short = torch.zeros((size, 3), dtype=torch.float32)
     value_short_valid = torch.zeros(size, dtype=torch.bool)
+    # Moves left after this row's move; -1 where unknown (no source move).
+    plies_to_end = torch.full((size,), -1, dtype=torch.long)
     # The PROVEN value of the position, over the same (win, draw, loss) axis.
     # Kept separate from `value_soft` because the two mean different things: one
     # is the search's opinion, to be blended with the outcome in whatever
@@ -1994,6 +2014,8 @@ def collate(
             value_short[row, 0] = short
             value_short[row, 2] = 1.0 - short
             value_short_valid[row] = True
+        if getattr(example, "plies_to_end", None) is not None:
+            plies_to_end[row] = int(example.plies_to_end)
         proven = solver_value_distribution(example)
         if proven is not None:
             value_solver[row] = torch.tensor(proven)
@@ -2030,6 +2052,7 @@ def collate(
         "value_soft_valid": value_soft_valid,
         "value_short": value_short,
         "value_short_valid": value_short_valid,
+        "plies_to_end": plies_to_end,
         "value_solver": value_solver,
         "value_solver_valid": value_solver_valid,
         "value_solver_exact": value_solver_exact,
