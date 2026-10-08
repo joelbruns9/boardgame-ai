@@ -52,7 +52,9 @@ pub struct Edge {
 /// child gets) and the rest. The proven part is counted analytically and only
 /// the open worlds are sampled, so the edge's Q is
 ///
-///     Q = sum_{proven k} p_k v_k + (1 - mass) * E[v | open]
+/// ```text
+/// Q = sum_{proven k} p_k v_k + (1 - mass) * E[v | open]
+/// ```
 ///
 /// with every backed-up value mapped through `v -> value_p0 + (1 - mass) v`
 /// (`backup`): unbiased, and a world where the mover loses on the spot counts

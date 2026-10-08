@@ -231,6 +231,7 @@ def _pack_examples(examples, val_fraction: float, split_salt: str) -> dict:
         "value_soft_valid": torch.zeros(rows, dtype=torch.bool),
         "value_short": torch.zeros(rows, 3, dtype=torch.float32),
         "value_short_valid": torch.zeros(rows, dtype=torch.bool),
+        "plies_to_end": torch.full((rows,), -1, dtype=torch.long),
         "value_solver": torch.zeros(rows, 3, dtype=torch.float32),
         "value_solver_valid": torch.zeros(rows, dtype=torch.bool),
         "value_solver_exact": torch.zeros(rows, dtype=torch.bool),
@@ -283,6 +284,8 @@ def _pack_examples(examples, val_fraction: float, split_salt: str) -> dict:
             storage["value_short"][row, 0] = short
             storage["value_short"][row, 2] = 1.0 - short
             storage["value_short_valid"][row] = True
+        if getattr(example, "plies_to_end", None) is not None:
+            storage["plies_to_end"][row] = int(example.plies_to_end)
         proven = solver_value_distribution(example)
         if proven is not None:
             storage["value_solver"][row] = torch.tensor(proven)

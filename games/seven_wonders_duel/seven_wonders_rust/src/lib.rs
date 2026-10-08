@@ -3956,6 +3956,11 @@ mod tests {
     #[test]
     fn encoder_feature_counts_match_schema() {
         use crate::encoder::{encode, FEATURE_COUNTS};
+        // W3 control channels default ON and need the table Python installs
+        // (`control::control_maps` panics without it, by design). A pure-Rust
+        // test has no table; with the channels off they stay in the schema as
+        // zeros, so the counts checked here are the same.
+        crate::control::set_enabled(false);
         let mut g = GameState::from_setup(sample_setup(), VecDeque::new());
         let mut steps = 0;
         while g.phase != Phase::Complete && steps < 14 {
