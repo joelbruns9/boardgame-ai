@@ -292,3 +292,41 @@ def test_an_unsized_run_makes_no_disk_claim():
 
     _report, failures = evaluate(_args(memory_budget_gb=64.0), _device(24), _disk(1))
     assert not failures
+
+
+def test_the_window_examples_count_when_they_exceed_the_cache():
+    """Training holds every window example at once; the cache's are the same
+    objects, so the peak is the larger of the two, never their sum."""
+
+    from .cloud_preflight import WINDOW_EXAMPLE_BYTES
+
+    cache_only = host_sizing(
+        max_window_games=20_000, example_cache_bytes=4 * GIB,
+        memory_budget_bytes=0, headroom_bytes=0,
+    )
+    run08 = host_sizing(
+        max_window_games=20_000, example_cache_bytes=4 * GIB,
+        memory_budget_bytes=0, headroom_bytes=0, examples_per_game=55,
+    )
+    window = 20_000 * 55 * WINDOW_EXAMPLE_BYTES
+    assert run08.window_examples_bytes == window
+    assert run08.required_bytes - cache_only.required_bytes == window - 4 * GIB
+    big_cache = host_sizing(
+        max_window_games=20_000, example_cache_bytes=30 * GIB,
+        memory_budget_bytes=0, headroom_bytes=0, examples_per_game=55,
+    )
+    assert big_cache.required_bytes - cache_only.required_bytes == 26 * GIB
+
+
+def test_run08_refuses_a_run07_sized_box():
+    # run07's box had 30 GB of RAM: 85% is ~25.5 GiB, short of ~27 GiB.
+    _report, failures = evaluate(
+        _args(memory_budget_gb=25.5, example_cache_gb=24.0, examples_per_game=55),
+        _device(32),
+    )
+    assert any("host memory" in failure for failure in failures)
+    _report, failures = evaluate(
+        _args(memory_budget_gb=54.0, example_cache_gb=24.0, examples_per_game=55),
+        _device(32),
+    )
+    assert not any("host memory" in failure for failure in failures)

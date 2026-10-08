@@ -279,6 +279,20 @@ export RESTART_FRACTION="${RESTART_FRACTION:-0.25}"
 # ebc70c0). 550 at the planned 1,000.
 export TRAIN_STEPS="${TRAIN_STEPS:-$(( (GAMES_PER_ITERATION * 55 + 99) / 100 ))}"
 
+# ── Example cache: hold the WHOLE replay window ─────────────────────────────
+#
+# run07 ran on the default cache, 250k examples (4.45 GB), against a 20k-game
+# window of ~353k examples, so ~6.8k games were re-derived every iteration
+# (~30 s). run08 searches every move: ~55 derived rows/game (dry run), 18.6 KiB
+# each, so the 20k-game window is ~20 GiB of examples and the default cache
+# would hold ~4k games -- ~16k re-derived per iteration (~3-4 min). Training
+# materialises every window example at once anyway, so a cache this size adds
+# little to the peak; it stops the rebuild. EXAMPLES_PER_GAME tells stage 6's
+# preflight to count that peak (it used to count only the cache): it now needs
+# ~27 GiB of RSS at the cap, i.e. a box with >= 32 GiB, and refuses a smaller one.
+export EXAMPLE_CACHE_GB="${EXAMPLE_CACHE_GB:-24}"
+export EXAMPLES_PER_GAME="${EXAMPLES_PER_GAME:-55}"
+
 # Exact tactics (G4, incl. 2b reveal strata) and G2b tactic relabelling: both
 # phase_d defaults, PINNED here so a default flipped before launch cannot
 # silently change the run (review of ebc70c0). G2b comes off only on the

@@ -617,6 +617,9 @@ INTERVENTION_LADDER="${INTERVENTION_LADDER:-0}"
 INTERVENTION_WINDOW_GAMES="${INTERVENTION_WINDOW_GAMES:-20000}"
 REPLAY_WINDOW_CAP_GAMES="${REPLAY_WINDOW_CAP_GAMES:-20000}"
 EXAMPLE_CACHE_GB="${EXAMPLE_CACHE_GB:-0}"
+# Derived rows per game, for the preflight's window term (training holds every
+# window example at once). 0 = the old cache-only memory model.
+EXAMPLES_PER_GAME="${EXAMPLES_PER_GAME:-0}"
 MEMORY_BUDGET_GB="${MEMORY_BUDGET_GB:-0}"
 VRAM_BUDGET_GB="${VRAM_BUDGET_GB:-0}"
 MEMORY_HEADROOM_GB="${MEMORY_HEADROOM_GB:-2}"
@@ -1027,6 +1030,7 @@ stage 6 "Launch preflight (host memory at the window cap, VRAM floor, disk)"
   --disk-headroom-gb "${DISK_HEADROOM_GB:-5}" \
   --replay-window-cap-games "$REPLAY_WINDOW_CAP_GAMES" \
   --example-cache-gb "$EXAMPLE_CACHE_GB" \
+  --examples-per-game "$EXAMPLES_PER_GAME" \
   --memory-budget-gb "$MEMORY_BUDGET_GB" \
   --memory-headroom-gb "$MEMORY_HEADROOM_GB" \
   --output "$REPO_DIR/$RUN_DIR_REL/preflight.json" \

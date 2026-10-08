@@ -41,6 +41,11 @@ RECORD_BYTES = 122 * 1024
 EXAMPLE_BYTES = 17_800
 """Retained bytes per ``Example``; ``nbytes`` says 13.1 KB and is wrong."""
 
+WINDOW_EXAMPLE_BYTES = 19_100
+"""Retained bytes per ``Example`` for the WINDOW term: 18.6 KiB, measured
+2026-10-07 on run08's encoder (G10a, W3 control) through the cache's own
+estimate (array ``nbytes`` x the A1 calibration factor), dry-run buffers."""
+
 PROCESS_OVERHEAD_BYTES = 2 * GIB
 """Interpreter, torch, CUDA context, and the Rust engine's own arenas.
 
@@ -89,6 +94,7 @@ LOG_ROW_BYTES = 457 * 1024
 class HostSizing:
     max_window_games: int
     window_bytes: int
+    window_examples_bytes: int
     cache_bytes: int
     overhead_bytes: int
     headroom_bytes: int
@@ -103,6 +109,7 @@ class HostSizing:
         return {
             "max_window_games": self.max_window_games,
             "window_bytes": self.window_bytes,
+            "window_examples_bytes": self.window_examples_bytes,
             "cache_bytes": self.cache_bytes,
             "overhead_bytes": self.overhead_bytes,
             "headroom_bytes": self.headroom_bytes,
@@ -118,19 +125,32 @@ def host_sizing(
     example_cache_bytes: int,
     memory_budget_bytes: int,
     headroom_bytes: int,
+    examples_per_game: float = 0.0,
 ) -> HostSizing:
-    """Peak host RSS the run will reach once every schedule is at its cap."""
+    """Peak host RSS the run will reach once every schedule is at its cap.
+
+    Training materialises EVERY window example at once (`_cached_examples`
+    returns the whole window, cached or re-derived), so the peak holds the
+    larger of the cache and the window's examples -- the cache's examples are
+    the same objects, not a second copy. ``examples_per_game`` 0 keeps the old
+    cache-only model. run07 (~18 rows/game) never noticed; run08 searches
+    every move (~55 rows/game) and a 20k-game window is ~20 GiB of examples.
+    """
 
     window_bytes = int(max_window_games) * RECORD_BYTES
+    window_examples = int(
+        int(max_window_games) * float(examples_per_game) * WINDOW_EXAMPLE_BYTES
+    )
     required = (
         window_bytes
-        + int(example_cache_bytes)
+        + max(int(example_cache_bytes), window_examples)
         + PROCESS_OVERHEAD_BYTES
         + int(headroom_bytes)
     )
     return HostSizing(
         max_window_games=int(max_window_games),
         window_bytes=window_bytes,
+        window_examples_bytes=window_examples,
         cache_bytes=int(example_cache_bytes),
         overhead_bytes=PROCESS_OVERHEAD_BYTES,
         headroom_bytes=int(headroom_bytes),
@@ -553,6 +573,7 @@ def evaluate(
         example_cache_bytes=cache_bytes,
         memory_budget_bytes=budget_bytes,
         headroom_bytes=int(args.memory_headroom_gb * GIB),
+        examples_per_game=float(getattr(args, "examples_per_game", 0.0) or 0.0),
     )
     device = device_info if device_info is not None else device_report(args.device)
     disk = (
@@ -614,7 +635,9 @@ def evaluate(
             f"{sizing.required_bytes / GIB:.1f} GiB at its maximum scheduled "
             f"window of {sizing.max_window_games:,} games "
             f"({sizing.window_bytes / GIB:.1f} GiB of records + "
-            f"{sizing.cache_bytes / GIB:.1f} GiB of example cache + "
+            f"{max(sizing.cache_bytes, sizing.window_examples_bytes) / GIB:.1f} GiB "
+            f"of examples (cache {sizing.cache_bytes / GIB:.1f}, window "
+            f"{sizing.window_examples_bytes / GIB:.1f}) + "
             f"{sizing.overhead_bytes / GIB:.1f} GiB process + "
             f"{sizing.headroom_bytes / GIB:.1f} GiB headroom) but the budget is "
             f"{sizing.budget_bytes / GIB:.1f} GiB. Lower "
@@ -695,6 +718,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--replay-window-cap-games", type=int, default=20_000)
     parser.add_argument("--example-cache-gb", type=float, default=0.0)
     parser.add_argument("--example-cache-examples", type=int, default=250_000)
+    parser.add_argument(
+        "--examples-per-game",
+        type=float,
+        default=0.0,
+        help="derived rows per game in the replay window; sizes the window's "
+        "examples, which training holds all at once (0 = count the cache only)",
+    )
     parser.add_argument("--memory-budget-gb", type=float, default=0.0)
     parser.add_argument("--memory-headroom-gb", type=float, default=2.0)
     parser.add_argument(
