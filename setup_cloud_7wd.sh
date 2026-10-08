@@ -769,6 +769,107 @@ require_operator_files \
   "SWEEP_CHECKPOINT=${SWEEP_CHECKPOINT:-}" \
   "LAUNCH_FLAGS_JSON=${LAUNCH_FLAGS_JSON:-}"
 
+# ── STAGE 0: is this box what the listing says? ─────────────────────────────
+# run07 rented two bad boxes in a row before one worked (sevenwd run07 box
+# findings): box 1 listed 24 CPUs but its cgroup quota was 3.84
+# (`cpu.max` = `384000 100000`; 24 processes ran 7.3x slower than one), and
+# box 2 clocked 400-800 MHz under load. Both pass every later stage -- they are
+# just slow -- so the run would have been paid for at a fraction of its speed.
+# These checks cost ~20 s and run before anything is built. Defined here, not
+# in common, for the stage-2 reason above. BOX_VET=0 skips them.
+BOX_VET="${BOX_VET:-1}"
+BOX_MIN_CPUS="${BOX_MIN_CPUS:-16}"            # effective CPUs (quota-limited)
+BOX_MIN_QUOTA_SHARE="${BOX_MIN_QUOTA_SHARE:-0.75}"  # quota / nproc
+BOX_MAX_PARALLEL_SLOWDOWN="${BOX_MAX_PARALLEL_SLOWDOWN:-3.0}"  # healthy: ~1.2-2 (turbo drop); run07 bad box: 7.3
+BOX_MIN_MHZ="${BOX_MIN_MHZ:-2000}"            # mean cpu MHz while all cores load
+
+box_quota_cpus() {
+  # Effective CPUs from the cgroup quota, or "" when unlimited / unreadable.
+  local q p
+  if [ -r /sys/fs/cgroup/cpu.max ]; then
+    read -r q p < /sys/fs/cgroup/cpu.max || return 0
+  elif [ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us ]; then
+    q="$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us)"
+    p="$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)"
+  else
+    return 0
+  fi
+  case "$q" in max|-1|"") return 0 ;; esac
+  awk -v q="$q" -v p="$p" 'BEGIN { if (p > 0) printf "%.2f", q / p }'
+}
+
+box_spin() {
+  # A fixed CPU-bound job: ~1-3 s on one modern core.
+  awk 'BEGIN { s = 0; for (i = 0; i < 30000000; i++) s += i % 7; print s > "/dev/null" }'
+}
+
+box_now() { date +%s.%N; }
+
+box_physical_cores() {
+  # One spinner per PHYSICAL core: two on one core's hyperthreads would halve
+  # each other and fail a healthy box (stage 6b counts the same way).
+  local c
+  c="$(lscpu -p=CORE,SOCKET 2>/dev/null | grep -v '^#' | sort -u | wc -l || true)"
+  if [ -z "$c" ] || [ "$c" -lt 1 ] 2>/dev/null; then c="$(nproc)"; fi
+  echo "$c"
+}
+
+vet_box() {
+  local n quota t0 t1 single parallel slowdown mhz pids spin bad=0
+  n="$(nproc)"
+  quota="$(box_quota_cpus)"
+  if [ -n "$quota" ]; then
+    log "nproc $n, cgroup quota $quota CPUs"
+    if awk -v q="$quota" -v n="$n" -v s="$BOX_MIN_QUOTA_SHARE" 'BEGIN { exit !(q < s * n) }'; then
+      warn "cgroup quota $quota CPUs is below ${BOX_MIN_QUOTA_SHARE} x nproc ($n):"
+      warn "the listing's core count is not what this container may use."
+      bad=1
+    fi
+  else
+    log "nproc $n, no cgroup CPU quota"
+    quota="$n"
+  fi
+  if awk -v q="$quota" -v m="$BOX_MIN_CPUS" 'BEGIN { exit !(q < m) }'; then
+    warn "only $quota effective CPUs; this run wants at least $BOX_MIN_CPUS."
+    bad=1
+  fi
+
+  t0="$(box_now)"; box_spin; t1="$(box_now)"
+  single="$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.2f", b - a }')"
+  spin="${BOX_SPINNERS:-$(box_physical_cores)}"
+  pids=()
+  t0="$(box_now)"
+  for _ in $(seq 1 "$spin"); do box_spin & pids+=("$!"); done
+  sleep 1
+  # Sampled while every core is busy: an idle reading says nothing.
+  mhz="$(awk -F: '/^cpu MHz/ { s += $2; c++ } END { if (c) printf "%.0f", s / c }' /proc/cpuinfo 2>/dev/null || true)"
+  wait "${pids[@]}"
+  t1="$(box_now)"
+  parallel="$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.2f", b - a }')"
+  slowdown="$(awk -v s="$single" -v p="$parallel" 'BEGIN { printf "%.2f", (s > 0 ? p / s : 0) }')"
+  log "spin: 1 process ${single}s, $spin processes (one per physical core) ${parallel}s (x$slowdown); mean MHz under load: ${mhz:-unreported}"
+  if awk -v x="$slowdown" -v m="$BOX_MAX_PARALLEL_SLOWDOWN" 'BEGIN { exit !(x > m) }'; then
+    warn "$spin parallel copies ran x$slowdown slower than one: the cores are shared,"
+    warn "throttled or quota-limited."
+    bad=1
+  fi
+  if [ -n "$mhz" ] && awk -v x="$mhz" -v m="$BOX_MIN_MHZ" 'BEGIN { exit !(x < m) }'; then
+    warn "cores average $mhz MHz under load (floor $BOX_MIN_MHZ): throttled."
+    bad=1
+  fi
+  [ "$bad" -eq 0 ] || die "This box failed vetting (above). Rent another, or set
+BOX_VET=0 to proceed knowingly. Nothing has been built yet."
+  ok "box vetting passed"
+}
+
+stage 0 "Box vetting (CPU quota, parallel speed, clock under load)"
+if [ "$BOX_VET" = "1" ]; then
+  vet_box
+else
+  warn "BOX_VET=0; skipping box vetting."
+fi
+stage_done 0
+
 stage 1 "Rust toolchain (rustup)"
 common::rust_toolchain
 stage_done 1
@@ -1839,6 +1940,58 @@ if [ "$ALLOW_RESUME_CODE_DRIFT" = "1" ]; then
 fi
 cd "$REPO_DIR"
 common::launch_detached "$LOG_FILE" "${TRAIN_CMD[@]}"
+
+# The stage-9 smoke is two process workers on a toy loop; run07's capture
+# failures appeared only under the real run's concurrent shards. So read the
+# REAL run's first iterations too, detached, into graph_check.log.
+# GRAPH_GUARD=stop also ends the run (SIGTERM) when graphs are not replaying;
+# the default only reports, since eager is slower but trains identically.
+GRAPH_GUARD="${GRAPH_GUARD:-warn}"
+if [ "$CUDA_GRAPHS" = "1" ]; then
+  nohup "$PY" - "$RUN_DIR/training_log.jsonl" "$LAUNCHED_PID" "$GRAPH_GUARD" \
+    > "$RUN_DIR/graph_check.log" 2>&1 <<'PYEOF' &
+import json, os, signal, sys, time
+from pathlib import Path
+
+log, pid, guard = Path(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+checked, deadline = 0, time.time() + 24 * 3600
+
+def alive():
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+while checked < 3 and time.time() < deadline and alive():
+    rows = [json.loads(l) for l in log.read_text().splitlines() if l.strip()] if log.is_file() else []
+    for row in rows[checked:3]:
+        b = (row.get("generation_performance") or {}).get("rust_boundary") or {}
+        replays = int(b.get("graph_replays", 0))
+        eager = int(b.get("graph_eager_calls", 0))
+        captures = int(b.get("graph_captures", 0))
+        failures = int(b.get("graph_capture_failures", 0))
+        share = eager / max(replays + eager, 1)
+        verdict = "OK"
+        if failures or replays == 0 or share > 0.05:
+            verdict = "NOT REPLAYING"
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} iteration {row.get('iteration')}: "
+              f"{verdict} replays={replays} eager={eager} ({share:.1%}) "
+              f"captures={captures} capture_failures={failures}", flush=True)
+        checked += 1
+        if verdict != "OK":
+            print("WARNING: CUDA graphs are not replaying on the real run; generation "
+                  "runs eager (slower, same training).", flush=True)
+            if guard == "stop":
+                print(f"GRAPH_GUARD=stop: sending SIGTERM to pid {pid}", flush=True)
+                os.kill(pid, signal.SIGTERM)
+                sys.exit(1)
+    time.sleep(60)
+print(f"graph check finished after {checked} iteration(s)", flush=True)
+PYEOF
+  disown "$!" 2>/dev/null || true
+  ok "CUDA-graph check of the first 3 iterations: $RUN_DIR/graph_check.log (GRAPH_GUARD=$GRAPH_GUARD)"
+fi
 stage_done 10
 
 cat <<EOF
@@ -1846,6 +1999,7 @@ cat <<EOF
 Monitor:
   tail -f "$LOG_FILE"
   tail -f "$RUN_DIR/heartbeat.log"      # one line per iteration (W6.6)
+  cat "$RUN_DIR/graph_check.log"        # CUDA graphs replaying? (first 3 iterations)
   python -m tools.az_report "$RUN_DIR"  # full report, any time
 
 Snapshot for download (waits for an iteration boundary, W6.7):

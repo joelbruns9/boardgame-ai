@@ -1807,22 +1807,34 @@ def test_the_preflight_is_told_which_league_the_run_will_play(setup_text):
 
 
 @pytest.mark.skipif(not RUN_FILE.is_file(), reason="run file not present")
-def test_the_run_file_sets_no_scheduler_geometry():
-    """The decision file is portable; the geometry belongs to one rented box.
+def test_scheduler_geometry_is_pinned_only_with_the_sweep_skipped():
+    """Geometry belongs to the box that measured it.
 
-    Baking a slot count into the run file would silently carry a dead box's
-    measurement onto a live one.
+    run08 deliberately reuses run07's measurement (owner, 2026-10-07: the
+    run07 sweep was flat, a re-sweep costs hours). That is allowed only as an
+    explicit decision: pinned values must come with SKIP_SWEEPS defaulting to 1
+    and a named source, so a sweep never runs only to be overridden and the
+    origin of the numbers is on the page. Stage 10 still reports them as "NOT
+    measured on this box".
     """
 
     text = RUN_FILE.read_text(encoding="utf-8")
-    for measured in (
-        "export RUST_SLOTS=",
-        "export RUST_GLOBAL_BATCH_CAP=",
-        "export RUST_MAX_INFLIGHT_BATCHES=",
-        "export GATE_SLOTS=",
-        "export SOLVER_THREADS=",
-    ):
-        assert measured not in text, f"{measured} pins a per-box measurement"
+    pinned = [
+        measured
+        for measured in (
+            "export RUST_SLOTS=",
+            "export RUST_GLOBAL_BATCH_CAP=",
+            "export RUST_MAX_INFLIGHT_BATCHES=",
+            "export GATE_SLOTS=",
+            "export SOLVER_THREADS=",
+        )
+        if measured in text
+    ]
+    if pinned:
+        assert 'export SKIP_SWEEPS="${SKIP_SWEEPS:-1}"' in text, (
+            f"{pinned} pin a per-box measurement while the sweep would still run"
+        )
+        assert "measured_env.sh" in text, "pinned geometry must name its source"
 
 
 @pytest.mark.skipif(not RUN_FILE.is_file(), reason="run file not present")

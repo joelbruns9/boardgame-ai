@@ -199,19 +199,15 @@ export OUTLOOK_BOOTSTRAP_GAMES="${OUTLOOK_BOOTSTRAP_GAMES:-0}"
 # 0.15 HOF + 0.15 science + 0.10 military is 40% league play, 60% pure
 # self-play, and one class is drawn per iteration.
 #
-# ⚠ LAMBDA IS UNMEASURED. S0a (`specialist_probe.py`) has never been run against
-# a trained checkpoint, and on an untrained net the bias moved the root value by
-# exactly lambda x outlook while changing ZERO moves -- a constant bonus does
-# not move an argmax. If a trained net behaves the same way, these games are
-# played against an opponent identical to the general and nothing in the run
-# says so. Run the probe first:
-#
-#   python -m games.seven_wonders_duel.specialist_probe \
-#     --checkpoint <current_best.pt> --buffer <iter_NNNN.jsonl> \
-#     --lambda 0.5 --victory scientific --positions 200 --sims 256
-#
-# and read `moved_fraction` and `credible_fraction_of_moved` before trusting
-# the value below.
+# Lambda 3 PROBED ON THE RUN08 START (2026-10-07, `specialist_probe`, G10a
+# pretrain, run07 iter_0100, 200 positions, 1,200 sims, puct): science moved
+# 14% of decisions, 57% credible, +6.1% own-type outlook -- the cloud2
+# calibration reproduced. Military moved 8%, 69% credible, -2% outlook: no
+# single-ply pursuit, as on cloud2 at every lambda. Kept anyway: run07's
+# replay window shows military-specialist games ending military 21% vs 16%
+# against HOF (science 25% vs 18.6%) -- the pursuit comes from training over
+# whole games, which this probe cannot see. Results:
+# runs/seven_wonders_duel/probe_lambda/*.json (laptop).
 # name:share:LAMBDA. Lambda 3, measured -- see COALESCER-era probe results in
 # SPECIALIST_LEAGUE_REVIEW_REQUEST.md 10. On a cloud2-trained net the pursuit
 # gain peaks at lambda ~= 3 and DECLINES above it, while credibility falls
@@ -290,11 +286,38 @@ export TRAIN_STEPS="${TRAIN_STEPS:-$(( (GAMES_PER_ITERATION * 55 + 99) / 100 ))}
 export EXACT_TACTICS="${EXACT_TACTICS:-1}"
 export TACTIC_LABELS="${TACTIC_LABELS:-1}"
 
-# ── Scheduler geometry ──────────────────────────────────────────────────────
+# ── Scheduler geometry: run07's measurement, NO sweep (owner, 2026-10-07) ────
 #
-# Deliberately NOT set here. Pass 1 measures them and writes measured_env.sh;
-# pass 2 sources it. The one exception is the sweep grid itself, which says what
-# to measure rather than what to use.
+# run07's box sweep (`run07_bundle/sweeps/measured_env.sh`: 5090 + 7945HX,
+# 2026-09-26) ranked geometry on a near-identical network (G10a adds 22 input
+# columns), and every point landed within ~10%: one Python thread caps
+# generation, not geometry. Re-sweeping costs hours for no expected change, so
+# the run launches on those numbers and stage 8b is skipped. Stage 10 will say
+# they were "NOT measured on this box" -- true, and deliberate. The first
+# iteration's heartbeat is the iteration-time measurement. Override any of these
+# (or SKIP_SWEEPS=0 with SWEEP_CHECKPOINT) on a box unlike run07's.
+export SKIP_SWEEPS="${SKIP_SWEEPS:-1}"
+export RUST_SLOTS="${RUST_SLOTS:-512}"
+export RUST_GLOBAL_BATCH_CAP="${RUST_GLOBAL_BATCH_CAP:-2048}"
+export RUST_MAX_INFLIGHT_BATCHES="${RUST_MAX_INFLIGHT_BATCHES:-2}"
+export RUST_SCHEDULER_WORKERS="${RUST_SCHEDULER_WORKERS:-4}"
+export SOLVER_THREADS="${SOLVER_THREADS:-2}"     # per shard: 8 total, measured
+export RUST_INFERENCE_WAIT_MS="${RUST_INFERENCE_WAIT_MS:-0.0}"
+export GATE_SLOTS="${GATE_SLOTS:-144}"
+export GATE_GLOBAL_BATCH_CAP="${GATE_GLOBAL_BATCH_CAP:-1024}"
+
+# ── Endgame solver: 4x run07's timeout (owner, 2026-10-07) ───────────────────
+#
+# The attempt bar stays 40M (the widest the cost model can price); only the
+# timeout rises, 320M -> 1280M. Priced on solver_corpus.json (setup_cloud_7wd.sh
+# table): +12 proofs per ~7.8k attempted -- the hardest positions run07 gave up
+# on -- for ~+12% solver nodes, wasted nodes 14.6% -> 4.0%, and a worst-case
+# single-solve stall of ~1,500 s (was ~370 s). Every move is searched at 1,200
+# sims, so an iteration runs ~2 h and solver threads have the slack. Stage 6b
+# derives the seconds safety clock from this number.
+export ENDGAME_SOLVER_MAX_NODES="${ENDGAME_SOLVER_MAX_NODES:-1280000000}"
+
+# The sweep grid, kept for SKIP_SWEEPS=0: what to measure, not what to use.
 export SWEEP_SLOTS_CSV="${SWEEP_SLOTS_CSV:-128,256,512}"
 export SWEEP_CAPS_CSV="${SWEEP_CAPS_CSV:-1024,2048}"
 export SWEEP_INFLIGHT_CSV="${SWEEP_INFLIGHT_CSV:-1,2}"
