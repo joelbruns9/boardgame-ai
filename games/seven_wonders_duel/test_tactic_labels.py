@@ -261,3 +261,34 @@ def test_the_census_counts_an_exactness_change_at_an_unchanged_value(records, mo
     result = g2b_census.census([record], retain=0)
     assert result["value_changed"] == 1
     assert result["value_changed_effective"] == 0
+
+
+def test_the_census_does_not_count_a_scalar_change_on_a_certain_win(records, monkeypatch):
+    """Review of d8aa2e3, #5: the certain-win override replaces the value
+    target whatever the solver scalar is, so changing it supervises nothing."""
+
+    from . import g2b_census
+
+    record = _as_searched(records[0])
+    base = [
+        replace(row, tactic=TACTIC_NONE, solver_value=None, solver_exact=False,
+                certain_win=True)
+        for row in examples_from_record(record)
+    ]
+    labelled = list(base)
+    labelled[3] = replace(base[3], solver_value=1.0, solver_exact=True, tactic=TACTIC_WIN)
+    monkeypatch.setattr(
+        g2b_census, "_derive",
+        lambda records, *, tactic_labels, retain: [labelled if tactic_labels else base],
+    )
+    result = g2b_census.census([record], retain=0)
+    assert result["value_changed"] == 1
+    assert result["value_exactness_only"] == 0
+    assert result["value_changed_effective"] == 0
+
+    # The same scalar change on an uncertain row does change the target.
+    base = [replace(row, certain_win=False) for row in base]
+    labelled = list(base)
+    labelled[3] = replace(base[3], solver_value=1.0, solver_exact=True, tactic=TACTIC_WIN)
+    result = g2b_census.census([record], retain=0)
+    assert result["value_changed_effective"] == 1

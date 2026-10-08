@@ -186,3 +186,59 @@ science-class games ended scientific 25% (HOF 18.6%). Kept at 3 (owner).
 3. The graph watcher is safe to leave running beside the run.
 4. Skipping the sweep loses nothing the run reads.
 5. The 4x solver timeout at 8 solver threads.
+
+## Review of d8aa2e3: response (`reviews/sevenwd-run08-final-d8aa2e3-review.md`)
+
+All five findings verified against the code and fixed. Two descriptions above
+were wrong and are retracted here:
+
+- **§3 "Stage 10 watcher" and the stage-9 smoke both read the wrong path.**
+  Every launch uses the soft-gate controller, which nests the loop's stats:
+  the counters are at `generation_performance.performance.rust_boundary`, not
+  `generation_performance.rust_boundary` (Focus 7's own wording carried the
+  error). Confirmed on a REAL local smoke (`--plumbing-smoke --cuda-graphs`,
+  3070): 167 replays, 31 captures, 0 failures at the nested path, none at the
+  flat one. So the stage-9 check had never confirmed anything -- it fell
+  through to "cannot confirm" and passed -- and `GRAPH_GUARD=stop` would have
+  killed a healthy run. Both readers now live in `graph_check.py` (one
+  definition, reads both nestings); missing counters are UNAVAILABLE and never
+  stop a run, but DO fail the smoke (the Rust generator with `--cuda-graphs`
+  must report them). That smoke log is the test fixture.
+- **Finding 3 (resume).** The launcher records the log's byte size before
+  launch; the watcher reads only rows after it, and also skips rows whose
+  iteration is not past the old maximum (the startup `_sync_training_log`
+  backfill can append those).
+- **Finding 4 (partial append).** Only newline-terminated bytes are consumed;
+  the remainder is retried. A complete malformed row is reported and skipped;
+  read errors retry.
+- **Finding 2 (box vetting).** §3's "one spinner per PHYSICAL core
+  (`lscpu`, fallback `nproc`)" counted the HOST. Now: physical cores among
+  `Cpus_allowed_list` (lscpu, then sysfs topology, then nproc/2 -- an
+  under-count only weakens the test), spinners capped at
+  min(nproc, quota); the quota is the tightest over the process's cgroup and
+  every ancestor (v2 and v1, walking to the mount root without a namespace);
+  MHz is averaged over allowed CPUs only. Stage 6b's solver split uses the
+  same counter (it had the same host-topology blind spot). Fixture tests in
+  `test_box_vetting.py`; laptop run: 8 spinners via the nproc/2 fallback
+  (Git Bash has no lscpu), x1.94, pass.
+- **Finding 5 (census).** Certain-win rows are excluded from the effective
+  count for scalar changes too. Dry-run buffers: 98 -> **64** effective
+  changes (of 111 raw), exactly the reviewer's 34.
+
+**Pushed back:**
+
+- *MHz refusal conditional on corroborating evidence.* Kept as a hard
+  refusal. Uniform throttling (run07's box 2, 400-800 MHz) slows the single
+  spinner as much as the parallel ones, so the ratio test reads ~x1 and MHz
+  is the only signal that catches it. A static virtualised reading is
+  typically the nominal clock (>= 2 GHz) and passes; `BOX_MIN_MHZ` overrides.
+- *`quota / nproc` when nproc already reflects the quota.* Not changed: then
+  nproc itself is small and the >= 16 effective-CPU check refuses the box.
+- *Boundary stop instead of SIGTERM.* The watcher signals only immediately
+  after a committed row appears, i.e. at a boundary; the work lost is the
+  next iteration's first minutes. No stop mechanism built.
+
+The stale "solver runs SYNCHRONOUSLY inside a shard" launcher comment is
+corrected (per-shard background pool; FIFO; no cross-shard stealing). Sign-off
+answers accepted as given: 1, 4 pass; 5 conditional on stage 6b's measured
+rate and the unmeasured work mix.

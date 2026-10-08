@@ -783,19 +783,88 @@ BOX_MIN_QUOTA_SHARE="${BOX_MIN_QUOTA_SHARE:-0.75}"  # quota / nproc
 BOX_MAX_PARALLEL_SLOWDOWN="${BOX_MAX_PARALLEL_SLOWDOWN:-3.0}"  # healthy: ~1.2-2 (turbo drop); run07 bad box: 7.3
 BOX_MIN_MHZ="${BOX_MIN_MHZ:-2000}"            # mean cpu MHz while all cores load
 
+# Overridable so the tests can point these at fixture trees.
+BOX_PROC="${BOX_PROC:-/proc}"
+BOX_SYS="${BOX_SYS:-/sys}"
+BOX_LSCPU="${BOX_LSCPU:-lscpu}"
+
+box_allowed_cpus() {
+  # The CPU ids this process may run on (its affinity), one per line; nothing
+  # when unreadable. A container can be pinned to 16 CPUs of a 64-core host,
+  # and lscpu describes the HOST (review of d8aa2e3, #2).
+  local list
+  list="$(awk '/^Cpus_allowed_list:/ { print $2 }' "$BOX_PROC/self/status" 2>/dev/null || true)"
+  [ -n "$list" ] || return 0
+  printf '%s\n' "$list" | tr ',' '\n' \
+    | awk -F- 'NF == 2 { for (i = $1; i <= $2; i++) print i; next } $1 != "" { print $1 }'
+}
+
+_box_walk() {
+  # base rel name: base/rel/name and the same file in every ancestor of rel.
+  local base="$1" rel="$2" name="$3"
+  while :; do
+    [ -r "$base$rel/$name" ] && printf '%s\n' "$base$rel/$name"
+    if [ -z "$rel" ] || [ "$rel" = "/" ]; then break; fi
+    rel="${rel%/*}"
+  done
+}
+
+box_cpu_limit_files() {
+  # Every CPU-limit file from this process's cgroup up to the root, v2 and v1.
+  # A limit can sit on any ancestor, and without a cgroup namespace the
+  # process's path does not exist under the mount, so the walk reaches root.
+  local cg="$BOX_SYS/fs/cgroup" rel mount
+  rel="$(awk -F: '$1 == "0" && $2 == "" { print $3 }' "$BOX_PROC/self/cgroup" 2>/dev/null || true)"
+  _box_walk "$cg" "$rel" cpu.max
+  rel="$(awk -F: '$2 ~ /(^|,)cpu(,|$)/ { print $3 }' "$BOX_PROC/self/cgroup" 2>/dev/null || true)"
+  for mount in "$cg/cpu" "$cg/cpu,cpuacct" "$cg/cpuacct,cpu"; do
+    _box_walk "$mount" "$rel" cpu.cfs_quota_us
+  done
+}
+
 box_quota_cpus() {
-  # Effective CPUs from the cgroup quota, or "" when unlimited / unreadable.
-  local q p
-  if [ -r /sys/fs/cgroup/cpu.max ]; then
-    read -r q p < /sys/fs/cgroup/cpu.max || return 0
-  elif [ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us ]; then
-    q="$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us)"
-    p="$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)"
-  else
-    return 0
+  # The tightest cgroup CPU quota, in CPUs; "" when no limit is visible. That
+  # means none was FOUND, not that none exists -- the timing test below is the
+  # check that does not depend on what the container exposes.
+  local f q p best=""
+  while IFS= read -r f; do
+    case "$f" in
+      */cpu.max) read -r q p < "$f" || continue ;;
+      *) q="$(cat "$f" 2>/dev/null || true)"
+         p="$(cat "${f%/*}/cpu.cfs_period_us" 2>/dev/null || true)" ;;
+    esac
+    case "$q" in max|-1|"") continue ;; esac
+    best="$(awk -v q="$q" -v p="$p" -v b="$best" \
+      'BEGIN { if (p > 0 && (b == "" || q / p < b)) b = q / p; if (b != "") printf "%.2f", b }')"
+  done < <(box_cpu_limit_files)
+  printf '%s' "$best"
+}
+
+box_physical_cores() {
+  # "<count> <source>": the PHYSICAL cores among the CPUs this process may use.
+  # Two spinners (or solver threads) on one core's hyperthreads halve each
+  # other, so a logical count fails a healthy box and oversizes the solver.
+  local allowed c cpu topo
+  allowed="$(box_allowed_cpus | tr '\n' ' ')"
+  c="$("$BOX_LSCPU" -p=CPU,CORE,SOCKET 2>/dev/null | awk -F, -v allowed="$allowed" '
+      BEGIN { n = split(allowed, a, " "); for (i = 1; i <= n; i++) ok[a[i]] = 1 }
+      /^#/ { next }
+      NF >= 3 && (n == 0 || ($1 in ok)) { seen[$2 "," $3] = 1 }
+      END { c = 0; for (k in seen) c++; print c }' || true)"
+  if [ -n "$c" ] && [ "$c" -ge 1 ] 2>/dev/null; then echo "$c lscpu"; return; fi
+  if [ -z "$allowed" ]; then
+    allowed="$(ls "$BOX_SYS/devices/system/cpu" 2>/dev/null | sed -n 's/^cpu\([0-9][0-9]*\)$/\1/p' | tr '\n' ' ' || true)"
   fi
-  case "$q" in max|-1|"") return 0 ;; esac
-  awk -v q="$q" -v p="$p" 'BEGIN { if (p > 0) printf "%.2f", q / p }'
+  c="$(for cpu in $allowed; do
+        topo="$BOX_SYS/devices/system/cpu/cpu$cpu/topology"
+        [ -r "$topo/core_id" ] && echo "$(cat "$topo/physical_package_id" 2>/dev/null),$(cat "$topo/core_id")"
+      done | sort -u | wc -l || true)"
+  c="${c//[[:space:]]/}"
+  if [ -n "$c" ] && [ "$c" -ge 1 ] 2>/dev/null; then echo "$c sysfs"; return; fi
+  # No topology anywhere. Assume SMT pairs: under-counting only weakens the
+  # timing test, while over-counting fails healthy boxes.
+  c=$(( ($(nproc) + 1) / 2 ))
+  echo "$c assumed-smt"
 }
 
 box_spin() {
@@ -805,17 +874,8 @@ box_spin() {
 
 box_now() { date +%s.%N; }
 
-box_physical_cores() {
-  # One spinner per PHYSICAL core: two on one core's hyperthreads would halve
-  # each other and fail a healthy box (stage 6b counts the same way).
-  local c
-  c="$(lscpu -p=CORE,SOCKET 2>/dev/null | grep -v '^#' | sort -u | wc -l || true)"
-  if [ -z "$c" ] || [ "$c" -lt 1 ] 2>/dev/null; then c="$(nproc)"; fi
-  echo "$c"
-}
-
 vet_box() {
-  local n quota t0 t1 single parallel slowdown mhz pids spin bad=0
+  local n quota effective t0 t1 single parallel slowdown mhz pids spin phys topo allowed bad=0
   n="$(nproc)"
   quota="$(box_quota_cpus)"
   if [ -n "$quota" ]; then
@@ -826,28 +886,40 @@ vet_box() {
       bad=1
     fi
   else
-    log "nproc $n, no cgroup CPU quota"
-    quota="$n"
+    log "nproc $n, no cgroup CPU quota found (the timing test still checks)"
   fi
-  if awk -v q="$quota" -v m="$BOX_MIN_CPUS" 'BEGIN { exit !(q < m) }'; then
-    warn "only $quota effective CPUs; this run wants at least $BOX_MIN_CPUS."
+  # Affinity (nproc) and quota both bound what may run; the smaller one binds.
+  effective="$(awk -v q="${quota:-}" -v n="$n" 'BEGIN { e = n; if (q != "" && q < e) e = q; printf "%.2f", e }')"
+  if awk -v q="$effective" -v m="$BOX_MIN_CPUS" 'BEGIN { exit !(q < m) }'; then
+    warn "only $effective effective CPUs; this run wants at least $BOX_MIN_CPUS."
     bad=1
   fi
 
   t0="$(box_now)"; box_spin; t1="$(box_now)"
   single="$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.2f", b - a }')"
-  spin="${BOX_SPINNERS:-$(box_physical_cores)}"
+  read -r phys topo <<< "$(box_physical_cores)"
+  # Never more spinners than CPUs may run at once: the excess would queue and
+  # read as a slow box (review of d8aa2e3, #2).
+  spin="$(awk -v p="$phys" -v e="$effective" 'BEGIN { c = int(e); if (c < 1) c = 1; print (p < c ? p : c) }')"
+  spin="${BOX_SPINNERS:-$spin}"
+  log "spinners: $spin ($phys physical cores via $topo, $effective effective CPUs)"
   pids=()
   t0="$(box_now)"
   for _ in $(seq 1 "$spin"); do box_spin & pids+=("$!"); done
   sleep 1
   # Sampled while every core is busy: an idle reading says nothing.
-  mhz="$(awk -F: '/^cpu MHz/ { s += $2; c++ } END { if (c) printf "%.0f", s / c }' /proc/cpuinfo 2>/dev/null || true)"
+  # Over this container's CPUs only: idle host CPUs would dilute it.
+  allowed="$(box_allowed_cpus | tr '\n' ' ')"
+  mhz="$(awk -F: -v allowed="$allowed" '
+      BEGIN { n = split(allowed, a, " "); for (i = 1; i <= n; i++) ok[a[i] + 0] = 1 }
+      /^processor/ { cpu = $2 + 0 }
+      /^cpu MHz/ { if (n == 0 || (cpu in ok)) { s += $2; c++ } }
+      END { if (c) printf "%.0f", s / c }' "$BOX_PROC/cpuinfo" 2>/dev/null || true)"
   wait "${pids[@]}"
   t1="$(box_now)"
   parallel="$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.2f", b - a }')"
   slowdown="$(awk -v s="$single" -v p="$parallel" 'BEGIN { printf "%.2f", (s > 0 ? p / s : 0) }')"
-  log "spin: 1 process ${single}s, $spin processes (one per physical core) ${parallel}s (x$slowdown); mean MHz under load: ${mhz:-unreported}"
+  log "spin: 1 process ${single}s, $spin processes ${parallel}s (x$slowdown); mean MHz under load: ${mhz:-unreported}"
   if awk -v x="$slowdown" -v m="$BOX_MAX_PARALLEL_SLOWDOWN" 'BEGIN { exit !(x > m) }'; then
     warn "$spin parallel copies ran x$slowdown slower than one: the cores are shared,"
     warn "throttled or quota-limited."
@@ -984,16 +1056,9 @@ stage 6b "Solver sizing (node rate, safety clock, thread split)"
 # 32-thread part it would put 28 solver threads on 16 cores AND stay silent,
 # since the oversubscription check compares against the same inflated number.
 _physical_cores() {
-  local n=""
-  if command -v lscpu >/dev/null 2>&1; then
-    n="$(lscpu -p=Core,Socket 2>/dev/null | grep -v '^#' | sort -u | wc -l)"
-  fi
-  if [ -z "$n" ] || [ "$n" -lt 1 ] 2>/dev/null; then
-    n="$(awk -F: '/^core id/{ids[$2]=1} /^physical id/{pk[$2]=1}
-          END{c=0; for (i in ids) c++; p=0; for (i in pk) p++;
-              print (c>0 && p>0) ? c*p : 0}' /proc/cpuinfo 2>/dev/null)"
-  fi
-  if [ -z "$n" ] || [ "$n" -lt 1 ] 2>/dev/null; then n="$(nproc)"; fi
+  # Shared with stage 0: physical cores among the CPUs this container may use.
+  local n _src
+  read -r n _src <<< "$(box_physical_cores)"
   echo "$n"
 }
 CORES="$(_physical_cores)"
@@ -1437,9 +1502,11 @@ Fix the knobs above; nothing was measured and nothing was launched."
 
   # The generation/solver CORE SPLIT, as an axis rather than a constant.
   #
-  # Generation and the endgame solver compete for the same physical cores, and
-  # the solver runs SYNCHRONOUSLY inside a scheduler shard -- so a thread given
-  # to it is a thread taken from leaf production, and the best split is a
+  # Generation and the endgame solver compete for the same physical cores. The
+  # solver runs on a per-shard background pool (`self_play.rs`: a solve parks
+  # only its own game; jobs queue FIFO behind busy workers, and an idle worker
+  # in another shard cannot take them) -- but its threads still take cores
+  # from leaf production, so the best split is a
   # property of this box's core count, not of the algorithm. Until now this
   # stage passed a single fixed --solver-threads, which measures one split and
   # reports it as the answer.
@@ -1808,23 +1875,8 @@ else
   # without a trace in the training log. The adapter now records graph_* counts
   # in rust_boundary; read them back here, before money is spent.
   if [ "$CUDA_GRAPHS" = "1" ]; then
-    "$PY" - "$SMOKE_DIR/training_log.jsonl" <<'PYEOF' || die "CUDA graphs are not replaying on this box (see above) — do not launch."
-import json, sys
-from pathlib import Path
-log = Path(sys.argv[1])
-rows = [json.loads(l) for l in log.read_text().splitlines() if l.strip()] if log.is_file() else []
-totals = {"graph_replays": 0, "graph_eager_calls": 0, "graph_capture_failures": 0}
-for row in rows:
-    boundary = (row.get("generation_performance") or {}).get("rust_boundary") or {}
-    for key in totals:
-        totals[key] += int(boundary.get(key, 0))
-print(f"smoke graph counters: {totals}")
-if totals["graph_replays"] == 0 and totals["graph_eager_calls"] == 0:
-    print("WARNING: no graph counters in the smoke log; cannot confirm replay")
-    sys.exit(0)
-if totals["graph_capture_failures"] or totals["graph_replays"] == 0:
-    sys.exit(1)
-PYEOF
+    "$PY" -m games.seven_wonders_duel.graph_check smoke "$SMOKE_DIR/training_log.jsonl" \
+      || die "CUDA graphs are not replaying on this box (see above) — do not launch."
   fi
 fi
 stage_done 9
@@ -1939,6 +1991,10 @@ if [ "$ALLOW_RESUME_CODE_DRIFT" = "1" ]; then
   warn "targets from two different algorithms."
 fi
 cd "$REPO_DIR"
+# The graph check reads only rows this launch commits: on a resume the log
+# already holds an earlier process's iterations (review of d8aa2e3, #3).
+GRAPH_LOG_OFFSET="$(wc -c < "$RUN_DIR/training_log.jsonl" 2>/dev/null || echo 0)"
+GRAPH_LOG_OFFSET="${GRAPH_LOG_OFFSET//[[:space:]]/}"
 common::launch_detached "$LOG_FILE" "${TRAIN_CMD[@]}"
 
 # The stage-9 smoke is two process workers on a toy loop; run07's capture
@@ -1948,47 +2004,9 @@ common::launch_detached "$LOG_FILE" "${TRAIN_CMD[@]}"
 # the default only reports, since eager is slower but trains identically.
 GRAPH_GUARD="${GRAPH_GUARD:-warn}"
 if [ "$CUDA_GRAPHS" = "1" ]; then
-  nohup "$PY" - "$RUN_DIR/training_log.jsonl" "$LAUNCHED_PID" "$GRAPH_GUARD" \
-    > "$RUN_DIR/graph_check.log" 2>&1 <<'PYEOF' &
-import json, os, signal, sys, time
-from pathlib import Path
-
-log, pid, guard = Path(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
-checked, deadline = 0, time.time() + 24 * 3600
-
-def alive():
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
-
-while checked < 3 and time.time() < deadline and alive():
-    rows = [json.loads(l) for l in log.read_text().splitlines() if l.strip()] if log.is_file() else []
-    for row in rows[checked:3]:
-        b = (row.get("generation_performance") or {}).get("rust_boundary") or {}
-        replays = int(b.get("graph_replays", 0))
-        eager = int(b.get("graph_eager_calls", 0))
-        captures = int(b.get("graph_captures", 0))
-        failures = int(b.get("graph_capture_failures", 0))
-        share = eager / max(replays + eager, 1)
-        verdict = "OK"
-        if failures or replays == 0 or share > 0.05:
-            verdict = "NOT REPLAYING"
-        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} iteration {row.get('iteration')}: "
-              f"{verdict} replays={replays} eager={eager} ({share:.1%}) "
-              f"captures={captures} capture_failures={failures}", flush=True)
-        checked += 1
-        if verdict != "OK":
-            print("WARNING: CUDA graphs are not replaying on the real run; generation "
-                  "runs eager (slower, same training).", flush=True)
-            if guard == "stop":
-                print(f"GRAPH_GUARD=stop: sending SIGTERM to pid {pid}", flush=True)
-                os.kill(pid, signal.SIGTERM)
-                sys.exit(1)
-    time.sleep(60)
-print(f"graph check finished after {checked} iteration(s)", flush=True)
-PYEOF
+  nohup "$PY" -m games.seven_wonders_duel.graph_check watch \
+    "$RUN_DIR/training_log.jsonl" "$LAUNCHED_PID" "$GRAPH_GUARD" "${GRAPH_LOG_OFFSET:-0}" \
+    > "$RUN_DIR/graph_check.log" 2>&1 < /dev/null &
   disown "$!" 2>/dev/null || true
   ok "CUDA-graph check of the first 3 iterations: $RUN_DIR/graph_check.log (GRAPH_GUARD=$GRAPH_GUARD)"
 fi

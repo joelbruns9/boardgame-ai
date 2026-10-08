@@ -132,8 +132,14 @@ def census(records, *, retain: int = 4, tv: float = 0.01) -> dict:
                 if not scalar:
                     counts["value_exactness_only"] += 1
                 # A certain-win row's value target is the exact win whatever
-                # the solver fields say, so exactness alone changes nothing.
-                if scalar or not getattr(after, "certain_win", False):
+                # the solver fields say (`train.value_targets`: the override
+                # is applied last, and its rows leave the utility loss), so
+                # NEITHER field changes what is supervised there. Review of
+                # d8aa2e3, #5: scalar changes were still counted.
+                certain = getattr(after, "certain_win", False) and getattr(
+                    before, "certain_win", False
+                )
+                if not certain:
                     counts["value_changed_effective"] += 1
         for route, tally in counts["routes"].items():
             before_view = _keyed(project_examples(before_rows, record, route))
