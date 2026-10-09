@@ -791,6 +791,7 @@ def cap_reanalysis(
     selected_per_record: list[list[int]],
     general_inflow: int,
     cap: float,
+    rng: random.Random | None = None,
 ) -> list[list[int]]:
     """Trim the selection so reanalysis cannot dominate the general's buffer.
 
@@ -798,6 +799,15 @@ def cap_reanalysis(
     reanalysis rows compete for -- not on the buffer, most of which is value
     rows the reanalysis does not touch. Trimming is round-robin across games so
     a single long game cannot consume the whole allowance.
+
+    ``rng`` draws WHICH of a game's candidates it keeps (and which games get
+    the last, partial round). Without it the round-robin takes candidates in
+    move order, and with every move searched at full budget a game has ~27
+    candidates against an allowance of 3-6: measured on run07's buffers, 99.8%
+    of a full 20-iteration window's budget then landed on the wonder draft
+    (plies 0-7) and nothing past ply 30 was ever re-searched
+    (`reviews/s2b_move_index_probe.py`). Production passes a seeded rng so a
+    resume re-derives the same selection; kept indices come back sorted.
     """
 
     # A count allowance across the WHOLE cap range. `cap >= 1.0` used to short
@@ -811,12 +821,18 @@ def cap_reanalysis(
     total = sum(len(entry) for entry in selected_per_record)
     if total <= budget:
         return selected_per_record
+    order = list(range(len(selected_per_record)))
+    candidates = selected_per_record
+    if rng is not None:
+        candidates = [rng.sample(entry, len(entry)) for entry in selected_per_record]
+        rng.shuffle(order)
     kept: list[list[int]] = [[] for _ in selected_per_record]
     cursor = 0
     remaining = budget
     while remaining > 0:
         progressed = False
-        for index, entry in enumerate(selected_per_record):
+        for index in order:
+            entry = candidates[index]
             if cursor < len(entry):
                 kept[index].append(entry[cursor])
                 remaining -= 1
@@ -826,6 +842,8 @@ def cap_reanalysis(
         if not progressed:
             break
         cursor += 1
+    if rng is not None:
+        kept = [sorted(entry) for entry in kept]
     return kept
 
 

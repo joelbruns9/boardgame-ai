@@ -655,6 +655,33 @@ def test_the_reanalysis_share_is_capped_and_trimmed_round_robin():
     assert cap_reanalysis(selected, 10, 0.01) == [[], [], []]
 
 
+def test_the_seeded_cap_spreads_over_the_whole_game():
+    """In move order a binding cap only ever reached the draft (run07 probe:
+    99.8% of the budget on plies 0-7); the seeded draw must reach late plies."""
+
+    import random
+
+    selected = [list(range(70)) for _ in range(200)]
+    capped = cap_reanalysis(selected, 600, 1.0, rng=random.Random(7))
+    kept = [index for entry in capped for index in entry]
+    assert len(kept) == 600
+    assert all(entry == sorted(entry) for entry in capped)
+    assert all(set(entry) <= set(range(70)) for entry in capped)
+    # Round-robin still holds: no game gets a 4th row before every game has 3.
+    assert sorted(len(entry) for entry in capped) == [3] * 200
+    # Uniform over 70 plies puts ~57% of 600 draws at ply >= 30; move order
+    # put none there.
+    assert sum(index >= 30 for index in kept) > 250
+    assert not any(
+        index >= 30 for entry in cap_reanalysis(selected, 600, 1.0) for index in entry
+    )
+    # Deterministic for a seed (resume), different across seeds (rotation).
+    assert cap_reanalysis(selected, 600, 1.0, rng=random.Random(7)) == capped
+    assert cap_reanalysis(selected, 600, 1.0, rng=random.Random(8)) != capped
+    # An uncapped call stays the identity with an rng too.
+    assert cap_reanalysis(selected, 10**6, 1.0, rng=random.Random(7)) == selected
+
+
 # --------------------------------------------------------------------------
 # End to end: a specialist really does search biased, and its targets really
 # are routed

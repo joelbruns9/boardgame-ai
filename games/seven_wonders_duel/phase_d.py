@@ -5459,7 +5459,15 @@ class PhaseDLoop:
             (config.reanalysis_share_cap for config in self.specialist_configs),
             default=0.0,
         )
-        selected = cap_reanalysis(selected, general_inflow, cap)
+        # Seeded per (run, iteration): a resume draws the same positions, and
+        # the draw changes each iteration so the window's candidates rotate. A
+        # string seed hashes the same under every PYTHONHASHSEED.
+        selected = cap_reanalysis(
+            selected,
+            general_inflow,
+            cap,
+            rng=random.Random(f"s2b-cap:{self.config.seed}:{iteration}"),
+        )
         positions = sum(len(entry) for entry in selected)
         if positions == 0:
             return [], {"examples": 0, "positions": 0, "share": 0.0, "seconds": 0.0}
